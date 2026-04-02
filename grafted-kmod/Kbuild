@@ -1,0 +1,4 @@
+# Kbuild file for grafted kernel module
+
+obj-m := grafted.o
+grafted-y := c/grafted_main.o c/grafted_chardev.o

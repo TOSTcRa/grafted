@@ -1,0 +1,12 @@
+[package]
+name = "grafted-dyld"
+description = "dyld emulation — shared cache parsing, image loading, dylib resolution"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grafted-loader.workspace = true
+goblin.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+log.workspace = true

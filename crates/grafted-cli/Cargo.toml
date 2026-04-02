@@ -1,0 +1,19 @@
+[package]
+name = "grafted-cli"
+description = "CLI entry point — run Darwin binaries on Linux via grafted"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "grafted"
+path = "src/main.rs"
+
+[dependencies]
+grafted-loader.workspace = true
+grafted-kernel.workspace = true
+grafted-dyld.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+libc = "0.2"

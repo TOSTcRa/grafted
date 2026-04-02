@@ -1,0 +1,10 @@
+[package]
+name = "grafted-frameworks"
+description = "Darwin framework shims — CoreFoundation, Foundation, CoreGraphics, AppKit, UIKit, Metal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grafted-objc.workspace = true
+thiserror.workspace = true
+log.workspace = true

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/grafted-loader",
+    "crates/grafted-kernel",
+    "crates/grafted-dyld",
+    "crates/grafted-objc",
+    "crates/grafted-frameworks",
+    "crates/grafted-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/grafted"
+
+[workspace.dependencies]
+# Mach-O parsing
+goblin = "0.10"
+# Memory-mapped I/O
+memmap2 = "0.9"
+# Linux syscall interface
+nix = { version = "0.30", features = ["fs", "ioctl", "mman", "signal", "process"] }
+# Error handling
+thiserror = "2"
+anyhow = "1"
+# Logging
+log = "0.4"
+env_logger = "0.11"
+# Serialization (for ioctl structures)
+bitflags = "2"
+# CLI
+clap = { version = "4", features = ["derive"] }
+# Internal crates
+grafted-loader = { path = "crates/grafted-loader" }
+grafted-kernel = { path = "crates/grafted-kernel" }
+grafted-dyld = { path = "crates/grafted-dyld" }
+grafted-objc = { path = "crates/grafted-objc" }
+grafted-frameworks = { path = "crates/grafted-frameworks" }
