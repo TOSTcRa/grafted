@@ -4,6 +4,12 @@ use goblin::mach::MachO;
 
 use crate::shims;
 
+unsafe extern "C" fn shim_unresolved_trap() -> ! {
+    let msg = b"grafted: called unresolved symbol\n";
+    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+    unsafe { libc::_exit(127) };
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {
     #[error("parse error: {0}")]
@@ -41,9 +47,14 @@ impl Linker {
             let dylib = import.dylib;
             let symbol = import.name;
 
-            let addr = self.resolve(dylib, symbol, import.is_weak)?;
+            let addr = match self.resolve(dylib, symbol, import.is_weak) {
+                Ok(a) => a,
+                Err(_) => {
+                    log::warn!("unresolved symbol {symbol}, binding to trap");
+                    shim_unresolved_trap as *const () as u64
+                }
+            };
 
-            // import.address is the VM address of the GOT/la_symbol_ptr slot
             let target_ptr = import.address as *mut u64;
             unsafe { target_ptr.write(addr) };
 

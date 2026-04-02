@@ -9,3 +9,4 @@ goblin.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true
 log.workspace = true
+libc = "0.2"

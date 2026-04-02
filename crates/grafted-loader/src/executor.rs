@@ -58,31 +58,26 @@ fn alloc_stack() -> Result<usize, LoaderError> {
 
 /// Allocate an executable page containing a trampoline that:
 ///   1. Sets SELECTOR = BLOCK
-///   2. Jumps to the address stored in r15 (which we set in the signal handler)
+///   2. Returns to the real RIP (pushed on stack by the signal handler)
 ///
-/// We store the real return RIP in r15 (callee-saved, Darwin code shouldn't use it
-/// between syscalls since it's our register now).
+/// The signal handler pushes the real resume RIP onto the Darwin stack
+/// and sets RIP to this trampoline. The trampoline re-arms SUD then `ret`s back.
+/// This avoids clobbering any callee-saved registers.
 fn alloc_trampoline() -> Result<u64, LoaderError> {
     let selector_ptr = (&raw mut SELECTOR) as u64;
 
-    // Machine code for the trampoline:
     //   movabs rax, <selector_ptr>      ; 10 bytes
-    //   mov byte ptr [rax], 1           ; 3 bytes  (BLOCK = 1)
-    //   jmp r15                         ; 3 bytes
-    // Total: 16 bytes
-    let mut code = [0u8; 16];
-    // movabs rax, imm64
+    //   mov byte ptr [rax], 1           ; 3 bytes
+    //   ret                             ; 1 byte
+    // Total: 14 bytes
+    let mut code = [0u8; 14];
     code[0] = 0x48;
     code[1] = 0xb8;
     code[2..10].copy_from_slice(&selector_ptr.to_le_bytes());
-    // mov byte ptr [rax], 1
     code[10] = 0xc6;
     code[11] = 0x00;
     code[12] = SYSCALL_DISPATCH_FILTER_BLOCK;
-    // jmp r15
-    code[13] = 0x41;
-    code[14] = 0xff;
-    code[15] = 0xe7;
+    code[13] = 0xc3; // ret
 
     let size = NonZeroUsize::new(4096).unwrap();
     let page = unsafe {
@@ -178,13 +173,14 @@ unsafe extern "C" fn sigsys_handler(
 
     gregs[libc::REG_RAX as usize] = result;
 
-    // Redirect return to the trampoline:
-    // Save the real resume RIP in r15, set RIP to trampoline.
-    // The trampoline will set SELECTOR=BLOCK then jmp r15.
-    // This way sigreturn runs with ALLOW (works), and the trampoline
-    // re-arms interception before Darwin code resumes.
-    let real_rip = gregs[libc::REG_RIP as usize];
-    gregs[libc::REG_R15 as usize] = real_rip;
+    // Push the real resume RIP onto the Darwin stack, then redirect to trampoline.
+    // The trampoline sets SELECTOR=BLOCK then `ret` pops the real RIP.
+    // This avoids clobbering any registers the Darwin code uses.
+    let real_rip = gregs[libc::REG_RIP as usize] as u64;
+    let rsp = gregs[libc::REG_RSP as usize] as u64;
+    let new_rsp = rsp - 8;
+    unsafe { (new_rsp as *mut u64).write(real_rip) };
+    gregs[libc::REG_RSP as usize] = new_rsp as i64;
     gregs[libc::REG_RIP as usize] = unsafe { TRAMPOLINE_ADDR } as i64;
 
     // Leave selector as ALLOW — sigreturn needs it to work.

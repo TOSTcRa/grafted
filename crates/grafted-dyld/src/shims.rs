@@ -84,10 +84,30 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     // stdio-like
     reg!("_puts", shim_puts);
 
-    // dyld
+    // CRT globals — these are data symbols, not functions
+    s.insert("_environ".into(), (&raw const ENVIRON_PTR) as u64);
+    s.insert("___progname".into(), (&raw const PROGNAME_PTR) as u64);
+    s.insert("___stack_chk_guard".into(), (&raw const STACK_CHK_GUARD) as u64);
+    s.insert("_NXArgc".into(), (&raw const NXARGC) as u64);
+    s.insert("_NXArgv".into(), (&raw const NXARGV) as u64);
+
+    // TLS / CRT stubs
+    reg!("__tlv_bootstrap", shim_noop);
+    reg!("__tlv_atexit", shim_noop);
+    reg!("_atexit", shim_noop);
+    reg!("___cxa_atexit", shim_noop);
+    reg!("_abort", shim_abort);
+    reg!("_signal", shim_noop);
+    reg!("___error", shim_errno_location);
+    reg!("_sysctl", shim_noop);
+    reg!("_sysconf", shim_noop);
+    reg!("_pthread_self", shim_noop);
+    reg!("_pthread_mutex_lock", shim_noop);
+    reg!("_pthread_mutex_unlock", shim_noop);
+
+    // dyld / security
     reg!("dyld_stub_binder", shim_dyld_stub_binder);
     reg!("___stack_chk_fail", shim_stack_chk_fail);
-    reg!("___stack_chk_guard", shim_stack_chk_guard_addr);
 
     for name in [
         "/usr/lib/libSystem.B.dylib",
@@ -403,6 +423,25 @@ unsafe extern "C" fn shim_puts(s: u64) -> i64 {
 
 // ---- dyld / security ----
 
+unsafe extern "C" fn shim_noop() -> i64 { 0 }
+
+unsafe extern "C" fn shim_abort() -> ! {
+    selector_allow();
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") 231_i64,
+            in("rdi") 134_u64, // 128 + SIGABRT(6)
+            options(noreturn, nostack),
+        );
+    }
+}
+
+static mut ERRNO_VALUE: i32 = 0;
+unsafe extern "C" fn shim_errno_location() -> *mut i32 {
+    (&raw mut ERRNO_VALUE) as *mut i32
+}
+
 unsafe extern "C" fn shim_dyld_stub_binder() -> i64 { 0 }
 
 unsafe extern "C" fn shim_stack_chk_fail() -> ! {
@@ -428,8 +467,8 @@ unsafe extern "C" fn shim_stack_chk_fail() -> ! {
     }
 }
 
-// Stack canary value — just needs to be non-zero and consistent
 static STACK_CHK_GUARD: u64 = 0x00000aff0a0d0000;
-unsafe extern "C" fn shim_stack_chk_guard_addr() -> u64 {
-    (&raw const STACK_CHK_GUARD) as u64
-}
+static ENVIRON_PTR: u64 = 0; // NULL — no environment forwarding yet
+static PROGNAME_PTR: u64 = 0; // NULL
+static NXARGC: u64 = 0;
+static NXARGV: u64 = 0;

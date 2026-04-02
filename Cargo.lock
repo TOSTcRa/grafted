@@ -184,6 +184,7 @@ name = "grafted-dyld"
 version = "0.1.0"
 dependencies = [
  "goblin",
+ "libc",
  "log",
  "memmap2",
  "thiserror",
