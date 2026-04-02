@@ -30,6 +30,10 @@ const SYS_USER_DISPATCH: i32 = 2;
 static mut SELECTOR: u8 = SYSCALL_DISPATCH_FILTER_ALLOW;
 static mut TRAMPOLINE_ADDR: u64 = 0;
 
+pub fn selector_ptr() -> *mut u8 {
+    (&raw mut SELECTOR) as *mut u8
+}
+
 // ---- Stack allocation ----
 
 const STACK_SIZE: usize = 8 * 1024 * 1024;

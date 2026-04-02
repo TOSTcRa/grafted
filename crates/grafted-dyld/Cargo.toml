@@ -5,7 +5,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-grafted-loader.workspace = true
 goblin.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true

@@ -28,7 +28,6 @@ struct Args {
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    // Init logging based on verbosity
     let log_level = match args.verbose {
         0 => "warn",
         1 => "info",
@@ -58,7 +57,19 @@ fn main() -> ExitCode {
         }
     };
 
-    // Execute — this does not return (the binary's exit() terminates the process)
+    grafted_dyld::shims::set_selector_ptr(grafted_loader::executor::selector_ptr());
+
+    if !binary.dylib_deps.is_empty() {
+        let linker = grafted_dyld::Linker::new();
+        match linker.bind(&binary.data) {
+            Ok(n) => log::info!("resolved {n} dynamic imports"),
+            Err(e) => {
+                eprintln!("grafted: link error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     grafted_loader::executor::execute(entry_point)
 }
 
