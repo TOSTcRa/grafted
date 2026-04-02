@@ -208,9 +208,9 @@ dylib_cmd = dylib_cmd.ljust(dylib_cmd_size, b'\x00')
 # LC_DYLD_INFO_ONLY
 dyld_info = struct.pack('<II', LC_DYLD_INFO_ONLY, DYLD_INFO_CMD_SIZE)
 dyld_info += struct.pack('<II', 0, 0)              # rebase_off, rebase_size
-dyld_info += struct.pack('<II', BIND_FILEOFF, bind_size)  # bind_off, bind_size
+dyld_info += struct.pack('<II', 0, 0)              # bind_off, bind_size (non-lazy)
 dyld_info += struct.pack('<II', 0, 0)              # weak_bind_off, weak_bind_size
-dyld_info += struct.pack('<II', 0, 0)              # lazy_bind_off, lazy_bind_size
+dyld_info += struct.pack('<II', BIND_FILEOFF, bind_size)  # lazy_bind_off, lazy_bind_size
 dyld_info += struct.pack('<II', 0, 0)              # export_off, export_size
 
 # LC_MAIN

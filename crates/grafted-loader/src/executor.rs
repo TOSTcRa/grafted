@@ -230,18 +230,109 @@ fn install_sigsys_handler() -> Result<(), LoaderError> {
     Ok(())
 }
 
+// ---- Stack layout for LC_MAIN ----
+
+/// Build a Darwin-compatible process stack with argc/argv/envp/apple[].
+/// Returns the address of argc (where rsp should point on entry).
+///
+/// Layout (high to low):
+///   string data (argv[i], envp[i], apple[i] C strings)
+///   NULL
+///   apple[0..n] pointers
+///   NULL
+///   envp[0..n] pointers
+///   NULL
+///   argv[0..n] pointers
+///   argc (u64)          ← returned address
+fn build_stack(
+    stack_top: usize,
+    argv: &[String],
+    binary_path: &str,
+) -> usize {
+    let mut sp = stack_top;
+
+    // Collect envp from host
+    let envp: Vec<String> = std::env::vars()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+
+    // apple[] entries (Darwin-specific metadata)
+    let apple = vec![
+        format!("executable_path={binary_path}"),
+    ];
+
+    // Helper: push a C string onto the stack, return its address
+    let push_string = |sp: &mut usize, s: &str| -> u64 {
+        let bytes = s.as_bytes();
+        let len = bytes.len() + 1; // include null terminator
+        *sp -= len;
+        *sp &= !0x7; // align to 8 bytes
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), *sp as *mut u8, bytes.len());
+            (*sp as *mut u8).add(bytes.len()).write(0); // null terminator
+        }
+        *sp as u64
+    };
+
+    // Push all strings first (they go at the top of the stack)
+    let apple_ptrs: Vec<u64> = apple.iter().map(|s| push_string(&mut sp, s)).collect();
+    let envp_ptrs: Vec<u64> = envp.iter().map(|s| push_string(&mut sp, s)).collect();
+    let argv_ptrs: Vec<u64> = argv.iter().map(|s| push_string(&mut sp, s)).collect();
+
+    // Now push the pointer arrays and argc (growing downward)
+    // Align to 16 bytes before the pointer block
+    sp &= !0xF;
+
+    // Calculate total entries to ensure 16-byte alignment of final rsp
+    // argc(1) + argv(n+1) + envp(n+1) + apple(n+1) = entries
+    let total_entries = 1 + (argv.len() + 1) + (envp.len() + 1) + (apple.len() + 1);
+    // If total_entries is odd, the stack won't be 16-byte aligned; add padding
+    if total_entries % 2 != 0 {
+        sp -= 8; // padding for alignment
+    }
+
+    let push_u64 = |sp: &mut usize, val: u64| {
+        *sp -= 8;
+        unsafe { (*sp as *mut u64).write(val) };
+    };
+
+    // Push apple[] (NULL terminated, reverse order)
+    push_u64(&mut sp, 0); // NULL terminator
+    for ptr in apple_ptrs.iter().rev() {
+        push_u64(&mut sp, *ptr);
+    }
+
+    // Push envp[] (NULL terminated, reverse order)
+    push_u64(&mut sp, 0);
+    for ptr in envp_ptrs.iter().rev() {
+        push_u64(&mut sp, *ptr);
+    }
+
+    // Push argv[] (NULL terminated, reverse order)
+    push_u64(&mut sp, 0);
+    for ptr in argv_ptrs.iter().rev() {
+        push_u64(&mut sp, *ptr);
+    }
+
+    // Push argc
+    push_u64(&mut sp, argv.len() as u64);
+
+    sp
+}
+
 // ---- Entry ----
 
-pub fn execute(entry_point: u64) -> ! {
+pub fn execute(entry_point: u64, argv: &[String], binary_path: &str) -> ! {
     let stack_top = alloc_stack().expect("failed to allocate stack");
     let trampoline = alloc_trampoline().expect("failed to allocate trampoline");
+    let stack_ptr = build_stack(stack_top, argv, binary_path);
 
     unsafe { TRAMPOLINE_ADDR = trampoline };
 
     install_sigsys_handler().expect("failed to install SIGSYS handler");
     enable_sud().expect("failed to enable SUD");
 
-    log::info!("jumping to entry point {entry_point:#x}");
+    log::info!("jumping to entry point {entry_point:#x}, argc={}", argv.len());
 
     let selector_ptr = (&raw mut SELECTOR) as *mut u8;
 
@@ -249,7 +340,6 @@ pub fn execute(entry_point: u64) -> ! {
         asm!(
             "mov byte ptr [{selector}], {block}",
             "mov rsp, {stack}",
-            "push 0",
             "xor rbp, rbp",
             "xor rbx, rbx",
             "xor r12, r12",
@@ -259,7 +349,7 @@ pub fn execute(entry_point: u64) -> ! {
             "jmp {entry}",
             selector = in(reg) selector_ptr,
             block = const SYSCALL_DISPATCH_FILTER_BLOCK,
-            stack = in(reg) stack_top,
+            stack = in(reg) stack_ptr,
             entry = in(reg) entry_point,
             options(noreturn),
         );

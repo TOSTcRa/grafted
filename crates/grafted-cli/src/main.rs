@@ -70,7 +70,9 @@ fn main() -> ExitCode {
         }
     }
 
-    grafted_loader::executor::execute(entry_point)
+    let mut argv = vec![args.binary.display().to_string()];
+    argv.extend(args.args.iter().cloned());
+    grafted_loader::executor::execute(entry_point, &argv, &argv[0])
 }
 
 fn print_info(binary: &MachOBinary) {
