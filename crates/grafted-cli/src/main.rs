@@ -59,14 +59,39 @@ fn main() -> ExitCode {
 
     grafted_dyld::shims::set_selector_ptr(grafted_loader::executor::selector_ptr());
 
-    if !binary.dylib_deps.is_empty() {
-        let linker = grafted_dyld::Linker::new();
+    let mut linker = grafted_dyld::Linker::new();
+    
+    if let Err(e) = linker.load_dependencies(&binary) {
+        eprintln!("grafted: failed to load dependencies: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    if binary.file_type == 0x2 { // MH_EXECUTE
+        log::debug!("binary is MH_EXECUTE, running linker");
         match linker.bind(&binary.data) {
-            Ok(n) => log::info!("resolved {n} dynamic imports"),
+            Ok(n) => {
+                if n > 0 {
+                    log::info!("resolved {n} dynamic imports");
+                }
+            }
             Err(e) => {
                 eprintln!("grafted: link error: {e}");
                 return ExitCode::FAILURE;
             }
+        }
+
+        if binary.chained_fixups.is_some() {
+            if let Err(e) = grafted_loader::chained_fixups::apply_fixups(&binary, |dylib, name| {
+                linker.resolve_external(dylib, name)
+            }) {
+                eprintln!("grafted: fixup error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+
+        if let Err(e) = linker.run_all_initializers(&binary) {
+            eprintln!("grafted: failed to run initializers: {e}");
+            return ExitCode::FAILURE;
         }
     }
 

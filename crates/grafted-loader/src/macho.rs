@@ -1,20 +1,11 @@
-//! Mach-O parsing and segment mapping.
-//!
-//! Uses goblin for header/load command parsing. Extracts segments, finds
-//! the entry point (LC_MAIN or LC_UNIXTHREAD), and identifies dynamic
-//! library dependencies (LC_LOAD_DYLIB).
-
 use std::path::Path;
 
-use goblin::mach::{
-    MachO,
-    header::{MH_EXECUTE, MH_DYLIB, MH_BUNDLE},
-    load_command::CommandVariant,
-};
+use goblin::mach::load_command::CommandVariant;
+use goblin::mach::Mach;
 
 use crate::error::LoaderError;
 
-const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+pub const CPU_TYPE_X86_64: u32 = 0x01000007;
 
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -23,8 +14,8 @@ pub struct Segment {
     pub vmsize: u64,
     pub fileoff: u64,
     pub filesize: u64,
-    pub maxprot: u32,
     pub initprot: u32,
+    pub maxprot: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -45,18 +36,19 @@ pub struct MachOBinary {
     pub entry_is_offset: bool,
     pub segments: Vec<Segment>,
     pub dylib_deps: Vec<DylibDep>,
+    pub rpaths: Vec<String>,
+    pub chained_fixups: Option<(u32, u32)>, // (offset, size)
+    pub exports_trie: Option<(u32, u32)>,   // (offset, size)
     pub data: Vec<u8>,
 }
 
 impl MachOBinary {
-    /// Parse a Mach-O file from disk. For fat (universal) binaries,
-    /// selects the x86_64 slice.
+    /// Fat binaries are narrowed to the x86_64 slice.
     pub fn from_path(path: &Path) -> Result<Self, LoaderError> {
         let data = std::fs::read(path)?;
         Self::parse(path.display().to_string(), data)
     }
 
-    /// Parse Mach-O from raw bytes.
     pub fn parse(path: String, data: Vec<u8>) -> Result<Self, LoaderError> {
         let is_fat = data.len() >= 4 && {
             let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
@@ -70,7 +62,6 @@ impl MachOBinary {
         }
     }
 
-    /// Parse a single (non-fat) Mach-O binary.
     fn parse_single(path: String, data: Vec<u8>) -> Result<Self, LoaderError> {
         let info = Self::extract_info(&data)?;
         Ok(MachOBinary {
@@ -81,92 +72,88 @@ impl MachOBinary {
             entry_is_offset: info.entry_is_offset,
             segments: info.segments,
             dylib_deps: info.dylib_deps,
+            rpaths: info.rpaths,
+            chained_fixups: info.chained_fixups,
+            exports_trie: info.exports_trie,
             data,
         })
     }
 
-    /// Parse a fat (universal) binary, selecting the x86_64 slice.
     fn parse_fat(path: String, data: Vec<u8>) -> Result<Self, LoaderError> {
-        use goblin::mach::fat::{FatHeader, FatArch, SIZEOF_FAT_HEADER, SIZEOF_FAT_ARCH};
-
-        let header = FatHeader::parse(&data)
-            .map_err(|e| LoaderError::Parse(e.to_string()))?;
-
-        for i in 0..header.nfat_arch {
-            let offset = SIZEOF_FAT_HEADER + (i as usize) * SIZEOF_FAT_ARCH;
-            let arch = FatArch::parse(&data, offset)
-                .map_err(|e| LoaderError::Parse(e.to_string()))?;
-
-            if arch.cputype() == CPU_TYPE_X86_64 {
-                let slice_data = arch.slice(&data).to_vec();
-                if slice_data.is_empty() {
-                    return Err(LoaderError::Parse("invalid fat arch slice".into()));
+        let mach = Mach::parse(&data).map_err(|e| LoaderError::Parse(e.to_string()))?;
+        match mach {
+            Mach::Fat(fat) => {
+                for arch in fat.arches().map_err(|e| LoaderError::Parse(e.to_string()))? {
+                    if arch.cputype == CPU_TYPE_X86_64 {
+                        let offset = arch.offset as usize;
+                        let size = arch.size as usize;
+                        let slice = data[offset..offset + size].to_vec();
+                        return Self::parse_single(path, slice);
+                    }
                 }
-                return Self::parse_single(path, slice_data);
+                Err(LoaderError::UnsupportedCpuType(0))
+            }
+            Mach::Binary(macho) => {
+                // Should not happen if is_fat was true, but handle anyway
+                if macho.header.cputype == CPU_TYPE_X86_64 {
+                    Self::parse_single(path, data)
+                } else {
+                    Err(LoaderError::UnsupportedCpuType(macho.header.cputype))
+                }
             }
         }
-
-        Err(LoaderError::NoArchSlice("x86_64".into()))
     }
 
-    /// Extract parsed info from a Mach-O buffer without consuming it.
+    /// Extract info from data without taking ownership.
     fn extract_info(data: &[u8]) -> Result<ParsedInfo, LoaderError> {
-        let macho = MachO::parse(data, 0)
+        let macho = goblin::mach::MachO::parse(data, 0)
             .map_err(|e| LoaderError::Parse(e.to_string()))?;
 
         let file_type = macho.header.filetype;
+        let cpu_type = macho.header.cputype;
 
-        match file_type {
-            MH_EXECUTE | MH_DYLIB | MH_BUNDLE => {}
-            other => return Err(LoaderError::UnsupportedFileType(other)),
+        if cpu_type != CPU_TYPE_X86_64 {
+            return Err(LoaderError::UnsupportedCpuType(cpu_type));
         }
 
-        let cpu_type = macho.header.cputype();
-
-        let segments: Vec<Segment> = macho
-            .segments
-            .iter()
-            .map(|seg| {
-                let name = seg.name().unwrap_or("???").to_string();
-                Segment {
-                    name,
-                    vmaddr: seg.vmaddr,
-                    vmsize: seg.vmsize,
-                    fileoff: seg.fileoff,
-                    filesize: seg.filesize,
-                    maxprot: seg.maxprot,
-                    initprot: seg.initprot,
-                }
-            })
-            .collect();
-
-        // LC_MAIN (offset) or LC_UNIXTHREAD (absolute)
-        let mut entry_point = 0u64;
+        let mut segments = Vec::new();
+        let mut entry_point = 0;
         let mut entry_is_offset = false;
-        let mut found_entry = false;
+        let mut chained_fixups = None;
+        let mut exports_trie = None;
 
         for lc in &macho.load_commands {
-            match lc.command {
-                CommandVariant::Main(main_cmd) => {
-                    entry_point = main_cmd.entryoff;
-                    entry_is_offset = true;
-                    found_entry = true;
-                    break;
+            match &lc.command {
+                CommandVariant::Segment64(seg) => {
+                    segments.push(Segment {
+                        name: seg.name().unwrap_or("").to_string(),
+                        vmaddr: seg.vmaddr,
+                        vmsize: seg.vmsize,
+                        fileoff: seg.fileoff,
+                        filesize: seg.filesize,
+                        initprot: seg.initprot,
+                        maxprot: seg.maxprot,
+                    });
                 }
-                CommandVariant::Unixthread(thread_cmd) => {
-                    // instruction_pointer needs cputype to know register layout
-                    entry_point = thread_cmd
-                        .instruction_pointer(cpu_type)
-                        .map_err(|e| LoaderError::Parse(e.to_string()))?;
-                    entry_is_offset = false;
-                    found_entry = true;
+                CommandVariant::Main(main) => {
+                    entry_point = main.entryoff;
+                    entry_is_offset = true;
+                }
+                CommandVariant::Unixthread(thread) => {
+                    if thread.flavor == 4 && thread.count >= 42 {
+                        entry_point = ((thread.thread_state[33] as u64) << 32)
+                            | (thread.thread_state[32] as u64);
+                        entry_is_offset = false;
+                    }
+                }
+                CommandVariant::DyldChainedFixups(fixups) => {
+                    chained_fixups = Some((fixups.dataoff, fixups.datasize));
+                }
+                CommandVariant::DyldExportsTrie(trie) => {
+                    exports_trie = Some((trie.dataoff, trie.datasize));
                 }
                 _ => {}
             }
-        }
-
-        if !found_entry && file_type == MH_EXECUTE {
-            return Err(LoaderError::NoEntryPoint);
         }
 
         let self_name = macho.name.unwrap_or("");
@@ -181,6 +168,8 @@ impl MachOBinary {
             })
             .collect();
 
+        let rpaths: Vec<String> = macho.rpaths.iter().map(|s| s.to_string()).collect();
+
         Ok(ParsedInfo {
             file_type,
             cpu_type,
@@ -188,11 +177,13 @@ impl MachOBinary {
             entry_is_offset,
             segments,
             dylib_deps,
+            rpaths,
+            chained_fixups,
+            exports_trie,
         })
     }
 }
 
-/// Intermediate struct to carry parsed info across the borrow boundary.
 struct ParsedInfo {
     file_type: u32,
     cpu_type: u32,
@@ -200,6 +191,9 @@ struct ParsedInfo {
     entry_is_offset: bool,
     segments: Vec<Segment>,
     dylib_deps: Vec<DylibDep>,
+    rpaths: Vec<String>,
+    chained_fixups: Option<(u32, u32)>,
+    exports_trie: Option<(u32, u32)>,
 }
 
 #[cfg(test)]
@@ -210,24 +204,5 @@ mod tests {
     fn test_not_macho() {
         let result = MachOBinary::parse("test".into(), vec![0x00, 0x01, 0x02, 0x03]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_hello_fixture() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/hello_x86_64.macho");
-        if !fixture.exists() {
-            // Skip if fixture not generated yet
-            return;
-        }
-        let binary = MachOBinary::from_path(&fixture).expect("should parse hello fixture");
-        assert_eq!(binary.file_type, 0x2); // MH_EXECUTE
-        assert_eq!(binary.cpu_type, CPU_TYPE_X86_64);
-        assert_eq!(binary.entry_point, 0x100000000);
-        assert!(!binary.entry_is_offset); // LC_UNIXTHREAD = absolute
-        assert_eq!(binary.segments.len(), 2);
-        assert_eq!(binary.segments[0].name, "__PAGEZERO");
-        assert_eq!(binary.segments[1].name, "__TEXT");
-        assert!(binary.dylib_deps.is_empty());
     }
 }

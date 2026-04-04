@@ -1,0 +1,242 @@
+#![allow(non_snake_case)]
+
+use std::arch::global_asm;
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+use crate::types::{id, SEL, IMP, Class, class_t};
+
+lazy_static::lazy_static! {
+    static ref METHOD_REGISTRY: RwLock<HashMap<(usize, usize), IMP>> = RwLock::new(HashMap::new());
+    static ref CLASS_REGISTRY: RwLock<HashMap<String, usize>> = RwLock::new(HashMap::new());
+    static ref SELECTOR_REGISTRY: RwLock<HashMap<String, usize>> = RwLock::new(HashMap::new());
+}
+
+pub fn class_addMethod(cls: Class, name: SEL, imp: IMP, _types: *const std::ffi::c_char) -> bool {
+    let mut reg = METHOD_REGISTRY.write().unwrap();
+    let key = (cls as usize, name as usize);
+    if reg.contains_key(&key) {
+        return false;
+    }
+    reg.insert(key, imp);
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn objc_registerClassPair(cls: Class) {
+    if cls.is_null() { return; }
+    unsafe {
+        let class_t_ptr = cls as *mut class_t;
+        let data_ptr = (*class_t_ptr).data;
+        if data_ptr.is_null() { return; }
+        
+        let name_ptr = (*data_ptr).name;
+        if !name_ptr.is_null() {
+            let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+            let mut reg = CLASS_REGISTRY.write().unwrap();
+            reg.insert(name, cls as usize);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn objc_getClass(name: *const std::ffi::c_char) -> Class {
+    if name.is_null() { return std::ptr::null_mut(); }
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
+    let reg = CLASS_REGISTRY.read().unwrap();
+    let ptr = reg.get(&name_str).copied().unwrap_or(0);
+    ptr as Class
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sel_registerName(name: *const std::ffi::c_char) -> SEL {
+    if name.is_null() { return std::ptr::null(); }
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
+    
+    let mut reg = SELECTOR_REGISTRY.write().unwrap();
+    if let Some(&sel) = reg.get(&name_str) {
+        return sel as SEL;
+    }
+    
+    let b = name_str.into_bytes().into_boxed_slice();
+    let ptr = Box::into_raw(b) as *const u8 as SEL;
+    reg.insert(unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned(), ptr as usize);
+    ptr
+}
+
+// Built-in methods for root objects
+#[unsafe(no_mangle)]
+extern "C" fn grafted_alloc(cls: id, _cmd: SEL) -> id {
+    if cls.is_null() { return std::ptr::null_mut(); }
+    unsafe {
+        let class_t_ptr = cls as *mut class_t;
+        let data_ptr = (*class_t_ptr).data;
+        let size = if !data_ptr.is_null() {
+            (*data_ptr).instance_size as usize
+        } else {
+            8 // minimal size
+        };
+        
+        let ptr = libc::calloc(1, size) as id;
+        if !ptr.is_null() {
+            (*ptr).isa = cls as Class;
+        }
+        ptr
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn grafted_init(obj: id, _cmd: SEL) -> id {
+    obj
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn grafted_lookup_method(receiver: id, selector: SEL) -> IMP {
+    if receiver.is_null() {
+        return None;
+    }
+
+    let cls = unsafe { (*receiver).isa };
+    
+    let mut current_cls = cls;
+    for _ in 0..10 {
+        if current_cls.is_null() { break; }
+        
+        let key = (current_cls as usize, selector as usize);
+        {
+            let reg = METHOD_REGISTRY.read().unwrap();
+            if let Some(&imp) = reg.get(&key) {
+                return imp;
+            }
+        }
+        
+        unsafe {
+            let class_t_ptr = current_cls as *mut class_t;
+            current_cls = (*class_t_ptr).superclass as Class;
+        }
+    }
+
+    let sel_name = unsafe { std::ffi::CStr::from_ptr(selector as *const i8).to_string_lossy() };
+    if sel_name == "alloc" {
+        return Some(unsafe { std::mem::transmute(grafted_alloc as *const ()) });
+    }
+    if sel_name == "init" {
+        return Some(unsafe { std::mem::transmute(grafted_init as *const ()) });
+    }
+
+    let msg = b"grafted-objc: unhandled selector sent to instance\n";
+    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+    unsafe { libc::_exit(127) };
+}
+
+// objc_msgSend implementation in naked assembly.
+// Must save argument registers, call grafted_lookup_method, restore registers,
+// and tail-call (jmp) to the returned IMP (in rax).
+global_asm!(r#"
+    .global objc_msgSend
+    .type objc_msgSend, @function
+objc_msgSend:
+    // If receiver (rdi) is nil, return 0 (rax)
+    test rdi, rdi
+    jz .Lnil_receiver
+
+    // Save integer arguments
+    push rbp
+    mov rbp, rsp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push r8
+    push r9
+
+    // Save floating-point arguments (xmm0-xmm7)
+    sub rsp, 128
+    movups [rsp + 0x00], xmm0
+    movups [rsp + 0x10], xmm1
+    movups [rsp + 0x20], xmm2
+    movups [rsp + 0x30], xmm3
+    movups [rsp + 0x40], xmm4
+    movups [rsp + 0x50], xmm5
+    movups [rsp + 0x60], xmm6
+    movups [rsp + 0x70], xmm7
+
+    // Call grafted_lookup_method(rdi: id, rsi: SEL) -> IMP
+    call grafted_lookup_method
+
+    // The IMP is now in rax. If it's null (rare, handled inside lookup), trap.
+    test rax, rax
+    jz .Lnil_receiver
+
+    // Restore xmm registers
+    movups xmm0, [rsp + 0x00]
+    movups xmm1, [rsp + 0x10]
+    movups xmm2, [rsp + 0x20]
+    movups xmm3, [rsp + 0x30]
+    movups xmm4, [rsp + 0x40]
+    movups xmm5, [rsp + 0x50]
+    movups xmm6, [rsp + 0x60]
+    movups xmm7, [rsp + 0x70]
+    add rsp, 128
+
+    // Restore integer registers
+    pop r9
+    pop r8
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+
+    pop rbp
+
+    // Tail call to the method implementation
+    jmp rax
+
+.Lnil_receiver:
+    xor rax, rax
+    // Zero out other potential return registers
+    xor rdx, rdx
+    ret
+"#);
+
+unsafe extern "C" {
+    pub fn objc_msgSend(receiver: id, selector: SEL, ...) -> id;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::objc_class;
+
+    unsafe extern "C" fn mock_method(_self_ptr: id, _cmd: SEL, arg1: usize) -> id {
+        // Return arg1 + 42 as a pointer to verify arguments are passed correctly.
+        (arg1 + 42) as id
+    }
+
+    #[test]
+    fn test_objc_msgsend() {
+        let mut cls = objc_class {
+            isa: std::ptr::null_mut(),
+            super_class: std::ptr::null_mut(),
+            name: std::ptr::null(),
+            version: 0,
+            info: 0,
+            instance_size: 0,
+            ivars: std::ptr::null_mut(),
+            methodLists: std::ptr::null_mut(),
+            cache: std::ptr::null_mut(),
+            protocols: std::ptr::null_mut(),
+        };
+        let cls_ptr = &mut cls as *mut _ as Class;
+
+        let mut obj = crate::types::objc_object { isa: cls_ptr };
+        let obj_ptr = &mut obj as *mut _ as id;
+
+        let sel = 0xdeadbeefusize as SEL;
+
+        class_addMethod(cls_ptr, sel, Some(unsafe { std::mem::transmute(mock_method as *const ()) }), std::ptr::null());
+
+        let result = unsafe { objc_msgSend(obj_ptr, sel, 100usize) };
+        assert_eq!(result as usize, 142);
+    }
+}

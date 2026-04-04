@@ -262,7 +262,7 @@ out += struct.pack('<II', LC_DYLD_INFO_ONLY, 48)
 out += struct.pack('<IIIIIIIIII', 0, 0, BIND_FILEOFF, bind_size, 0, 0, 0, 0, 0, 0)
 
 # LC_MAIN
-out += struct.pack('<IIQQ', LC_MAIN, 24, 0, 0)
+out += struct.pack('<IIQQ', LC_MAIN, 24, TEXT_FILEOFF, 0)
 
 assert len(out) <= TEXT_FILEOFF
 out += b'\x00' * (TEXT_FILEOFF - len(out))

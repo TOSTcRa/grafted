@@ -27,6 +27,31 @@ static int grafted_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static long dispatch_mach_trap(struct grafted_mach_trap *trap)
+{
+	switch (trap->trap_number) {
+	case 26: /* mach_reply_port */
+		/* Just return a fake port name based on pid for now */
+		trap->result = 0x1000 + current->pid;
+		return 0;
+
+	case 27: /* thread_self_trap */
+		/* Return a fake thread port name */
+		trap->result = 0x2000 + current->pid;
+		return 0;
+
+	case 28: /* host_self_trap */
+		/* Return host port name (constant in Mach) */
+		trap->result = 1;
+		return 0;
+
+	default:
+		pr_debug("grafted: unhandled mach trap %u\n", trap->trap_number);
+		trap->result = -1; /* KERN_FAILURE */
+		return 0;
+	}
+}
+
 static long grafted_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
@@ -53,11 +78,7 @@ static long grafted_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 		if (copy_from_user(&trap, (void __user *)arg, sizeof(trap)))
 			return -EFAULT;
 
-		pr_debug("grafted: mach trap %u from pid %d\n",
-			 trap.trap_number, current->pid);
-
-		/* TODO: dispatch to Mach trap handler */
-		trap.result = -1; /* KERN_FAILURE for now */
+		dispatch_mach_trap(&trap);
 
 		if (copy_to_user((void __user *)arg, &trap, sizeof(trap)))
 			return -EFAULT;

@@ -7,3 +7,5 @@ edition.workspace = true
 [dependencies]
 thiserror.workspace = true
 log.workspace = true
+libc = "0.2"
+lazy_static = "1.4.0"

@@ -117,7 +117,7 @@ call_exit_rip = call_exit_pos + 6
 got_exit_rel = (GOT_EXIT_ADDR) - (TEXT_VMADDR + call_exit_rip)
 struct.pack_into('<i', code, call_exit_pos + 2, got_exit_rel)
 
-ENTRY_OFF = 0
+ENTRY_OFF = TEXT_FILEOFF  # LC_MAIN entryoff is relative to __TEXT file start
 
 # --- Build bind opcodes ---
 # Segment indices: __PAGEZERO=0, __TEXT=1, __DATA=2.

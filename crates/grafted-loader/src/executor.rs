@@ -25,14 +25,44 @@ const PR_SYS_DISPATCH_ON: libc::c_int = 1;
 const SYSCALL_DISPATCH_FILTER_ALLOW: u8 = 0;
 const SYSCALL_DISPATCH_FILTER_BLOCK: u8 = 1;
 
+use std::sync::atomic::{AtomicPtr, Ordering};
+
 const SYS_USER_DISPATCH: i32 = 2;
 
-static mut SELECTOR: u8 = SYSCALL_DISPATCH_FILTER_ALLOW;
-static mut TRAMPOLINE_ADDR: u64 = 0;
+// We dynamically allocate the selector to guarantee it's in a writable page.
+static SELECTOR_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
 pub fn selector_ptr() -> *mut u8 {
-    (&raw mut SELECTOR) as *mut u8
+    let mut ptr = SELECTOR_PTR.load(Ordering::Acquire);
+    if ptr.is_null() {
+        let size = NonZeroUsize::new(4096).unwrap();
+        ptr = unsafe {
+            mmap_anonymous(
+                None,
+                size,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE,
+            )
+        }
+        .expect("failed to allocate selector page")
+        .as_ptr() as *mut u8;
+        unsafe { *ptr = SYSCALL_DISPATCH_FILTER_ALLOW };
+        
+        if SELECTOR_PTR.compare_exchange(
+            std::ptr::null_mut(),
+            ptr,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ).is_err() {
+            // Leak is harmless: one 4KiB page, process-lifetime singleton.
+            ptr = SELECTOR_PTR.load(Ordering::Acquire);
+        }
+    }
+    ptr
 }
+
+static mut TRAMPOLINE_ADDR: u64 = 0;
+static mut GRAFTED_FD: libc::c_int = -1;
 
 // ---- Stack allocation ----
 
@@ -64,7 +94,7 @@ fn alloc_stack() -> Result<usize, LoaderError> {
 /// and sets RIP to this trampoline. The trampoline re-arms SUD then `ret`s back.
 /// This avoids clobbering any callee-saved registers.
 fn alloc_trampoline() -> Result<u64, LoaderError> {
-    let selector_ptr = (&raw mut SELECTOR) as u64;
+    let sel_ptr = selector_ptr() as u64;
 
     //   movabs rax, <selector_ptr>      ; 10 bytes
     //   mov byte ptr [rax], 1           ; 3 bytes
@@ -73,7 +103,7 @@ fn alloc_trampoline() -> Result<u64, LoaderError> {
     let mut code = [0u8; 14];
     code[0] = 0x48;
     code[1] = 0xb8;
-    code[2..10].copy_from_slice(&selector_ptr.to_le_bytes());
+    code[2..10].copy_from_slice(&sel_ptr.to_le_bytes());
     code[10] = 0xc6;
     code[11] = 0x00;
     code[12] = SYSCALL_DISPATCH_FILTER_BLOCK;
@@ -99,34 +129,14 @@ fn alloc_trampoline() -> Result<u64, LoaderError> {
     Ok(addr)
 }
 
-// ---- SIGSYS signal handler ----
+// ---- Syscall Processing ----
 
-unsafe extern "C" fn sigsys_handler(
-    _sig: libc::c_int,
-    info: *mut libc::siginfo_t,
-    context: *mut libc::c_void,
-) {
-    // FIRST: allow our own syscalls
-    unsafe { SELECTOR = SYSCALL_DISPATCH_FILTER_ALLOW };
-
-    let info = unsafe { &*info };
-    if info.si_code != SYS_USER_DISPATCH {
-        unsafe { SELECTOR = SYSCALL_DISPATCH_FILTER_BLOCK };
-        return;
-    }
-
-    let uctx = unsafe { &mut *(context as *mut libc::ucontext_t) };
-    let gregs = &mut uctx.uc_mcontext.gregs;
-
-    let raw_syscall = gregs[libc::REG_RAX as usize] as u64;
-    let arg1 = gregs[libc::REG_RDI as usize] as u64;
-    let arg2 = gregs[libc::REG_RSI as usize] as u64;
-    let arg3 = gregs[libc::REG_RDX as usize] as u64;
-    let arg4 = gregs[libc::REG_R10 as usize] as u64;
-    let arg5 = gregs[libc::REG_R8 as usize] as u64;
-    let arg6 = gregs[libc::REG_R9 as usize] as u64;
-
-    let result: i64 = match syscall::translate(raw_syscall) {
+unsafe fn process_syscall(
+    raw_syscall: u64,
+    args: [u64; 6],
+    fd: libc::c_int,
+) -> i64 {
+    match syscall::translate(raw_syscall) {
         DarwinSyscall::Unix { linux_nr, .. } if linux_nr >= 0 => {
             // exit/exit_group: terminate immediately
             if linux_nr == 60 || linux_nr == 231 {
@@ -134,7 +144,7 @@ unsafe extern "C" fn sigsys_handler(
                     asm!(
                         "syscall",
                         in("rax") 231_i64,
-                        in("rdi") arg1,
+                        in("rdi") args[0],
                         options(noreturn, nostack),
                     );
                 }
@@ -145,12 +155,12 @@ unsafe extern "C" fn sigsys_handler(
                 asm!(
                     "syscall",
                     inlateout("rax") linux_nr as i64 => ret,
-                    in("rdi") arg1,
-                    in("rsi") arg2,
-                    in("rdx") arg3,
-                    in("r10") arg4,
-                    in("r8") arg5,
-                    in("r9") arg6,
+                    in("rdi") args[0],
+                    in("rsi") args[1],
+                    in("rdx") args[2],
+                    in("r10") args[3],
+                    in("r8") args[4],
+                    in("r9") args[5],
                     lateout("rcx") _,
                     lateout("r11") _,
                     options(nostack),
@@ -163,13 +173,89 @@ unsafe extern "C" fn sigsys_handler(
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
             -38
         }
-        DarwinSyscall::MachTrap { .. } => {
-            let msg = b"grafted: unimplemented Mach trap\n";
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
-            -38
+        DarwinSyscall::MachTrap { trap_nr } => {
+            if fd < 0 {
+                let msg = b"grafted: mach trap called but /dev/grafted is not open\n";
+                unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+                -38
+            } else {
+                let mut trap = grafted_kernel::ioctl::GraftedMachTrap {
+                    trap_number: trap_nr,
+                    args,
+                    result: 0,
+                };
+                let res = unsafe {
+                    grafted_kernel::ioctl::grafted_mach_trap(fd, &mut trap)
+                };
+                if res.is_err() {
+                    -38 // Return ENOSYS if ioctl fails
+                } else {
+                    trap.result
+                }
+            }
         }
-        DarwinSyscall::Unknown { .. } => -38,
-    };
+        DarwinSyscall::Unknown { raw } => {
+            if raw < 500 {
+                // Allow raw Linux syscalls to pass through unmodified.
+                // This is crucial for our Linux libc shims to work.
+                let ret: i64;
+                unsafe {
+                    asm!(
+                        "syscall",
+                        inlateout("rax") raw as i64 => ret,
+                        in("rdi") args[0],
+                        in("rsi") args[1],
+                        in("rdx") args[2],
+                        in("r10") args[3],
+                        in("r8") args[4],
+                        in("r9") args[5],
+                        lateout("rcx") _,
+                        lateout("r11") _,
+                        options(nostack),
+                    );
+                }
+                ret
+            } else {
+                let msg = b"grafted: unknown syscall class\n";
+                unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+                -38
+            }
+        }
+    }
+}
+
+// ---- SIGSYS signal handler ----
+
+unsafe extern "C" fn sigsys_handler(
+    _sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    let sel_ptr = selector_ptr();
+
+    // FIRST: allow our own syscalls
+    unsafe { *sel_ptr = SYSCALL_DISPATCH_FILTER_ALLOW };
+
+    let info = unsafe { &*info };
+    if info.si_code != SYS_USER_DISPATCH {
+        unsafe { *sel_ptr = SYSCALL_DISPATCH_FILTER_BLOCK };
+        return;
+    }
+
+    let uctx = unsafe { &mut *(context as *mut libc::ucontext_t) };
+    let gregs = &mut uctx.uc_mcontext.gregs;
+
+    let raw_syscall = gregs[libc::REG_RAX as usize] as u64;
+    let args = [
+        gregs[libc::REG_RDI as usize] as u64,
+        gregs[libc::REG_RSI as usize] as u64,
+        gregs[libc::REG_RDX as usize] as u64,
+        gregs[libc::REG_R10 as usize] as u64,
+        gregs[libc::REG_R8 as usize] as u64,
+        gregs[libc::REG_R9 as usize] as u64,
+    ];
+
+    let result = unsafe { process_syscall(raw_syscall, args, GRAFTED_FD) };
 
     gregs[libc::REG_RAX as usize] = result;
 
@@ -190,14 +276,14 @@ unsafe extern "C" fn sigsys_handler(
 // ---- SUD setup ----
 
 fn enable_sud() -> Result<(), LoaderError> {
-    let selector_ptr = (&raw mut SELECTOR) as *mut u8;
+    let sel_ptr = selector_ptr();
     let ret = unsafe {
         libc::prctl(
             PR_SET_SYSCALL_USER_DISPATCH,
             PR_SYS_DISPATCH_ON,
             0_usize,
             0_usize,
-            selector_ptr as usize,
+            sel_ptr as usize,
         )
     };
     if ret != 0 {
@@ -230,16 +316,6 @@ fn install_sigsys_handler() -> Result<(), LoaderError> {
 
 /// Build a Darwin-compatible process stack with argc/argv/envp/apple[].
 /// Returns the address of argc (where rsp should point on entry).
-///
-/// Layout (high to low):
-///   string data (argv[i], envp[i], apple[i] C strings)
-///   NULL
-///   apple[0..n] pointers
-///   NULL
-///   envp[0..n] pointers
-///   NULL
-///   argv[0..n] pointers
-///   argc (u64)          ← returned address
 fn build_stack(
     stack_top: usize,
     argv: &[String],
@@ -257,7 +333,6 @@ fn build_stack(
         format!("executable_path={binary_path}"),
     ];
 
-    // Helper: push a C string onto the stack, return its address
     let push_string = |sp: &mut usize, s: &str| -> u64 {
         let bytes = s.as_bytes();
         let len = bytes.len() + 1; // include null terminator
@@ -270,19 +345,15 @@ fn build_stack(
         *sp as u64
     };
 
-    // Push all strings first (they go at the top of the stack)
     let apple_ptrs: Vec<u64> = apple.iter().map(|s| push_string(&mut sp, s)).collect();
     let envp_ptrs: Vec<u64> = envp.iter().map(|s| push_string(&mut sp, s)).collect();
     let argv_ptrs: Vec<u64> = argv.iter().map(|s| push_string(&mut sp, s)).collect();
 
-    // Now push the pointer arrays and argc (growing downward)
     // Align to 16 bytes before the pointer block
     sp &= !0xF;
 
     // Calculate total entries to ensure 16-byte alignment of final rsp
-    // argc(1) + argv(n+1) + envp(n+1) + apple(n+1) = entries
     let total_entries = 1 + (argv.len() + 1) + (envp.len() + 1) + (apple.len() + 1);
-    // If total_entries is odd, the stack won't be 16-byte aligned; add padding
     if total_entries % 2 != 0 {
         sp -= 8; // padding for alignment
     }
@@ -292,25 +363,21 @@ fn build_stack(
         unsafe { (*sp as *mut u64).write(val) };
     };
 
-    // Push apple[] (NULL terminated, reverse order)
-    push_u64(&mut sp, 0); // NULL terminator
+    push_u64(&mut sp, 0);
     for ptr in apple_ptrs.iter().rev() {
         push_u64(&mut sp, *ptr);
     }
 
-    // Push envp[] (NULL terminated, reverse order)
     push_u64(&mut sp, 0);
     for ptr in envp_ptrs.iter().rev() {
         push_u64(&mut sp, *ptr);
     }
 
-    // Push argv[] (NULL terminated, reverse order)
     push_u64(&mut sp, 0);
     for ptr in argv_ptrs.iter().rev() {
         push_u64(&mut sp, *ptr);
     }
 
-    // Push argc
     push_u64(&mut sp, argv.len() as u64);
 
     sp
@@ -325,29 +392,100 @@ pub fn execute(entry_point: u64, argv: &[String], binary_path: &str) -> ! {
 
     unsafe { TRAMPOLINE_ADDR = trampoline };
 
+    // Try to open /dev/grafted. If it fails, we continue without Mach trap support.
+    let fd = unsafe {
+        libc::open(
+            b"/dev/grafted\0".as_ptr() as *const libc::c_char,
+            libc::O_RDWR,
+        )
+    };
+    if fd >= 0 {
+        unsafe {
+            GRAFTED_FD = fd;
+            // Register this process
+            let pid = libc::getpid() as u32;
+            let _ = grafted_kernel::ioctl::grafted_register(fd, &pid as *const _);
+        }
+        log::info!("connected to /dev/grafted (fd {})", fd);
+    } else {
+        log::warn!("failed to open /dev/grafted: Mach traps will not work");
+    }
+
     install_sigsys_handler().expect("failed to install SIGSYS handler");
     enable_sud().expect("failed to enable SUD");
 
     log::info!("jumping to entry point {entry_point:#x}, argc={}", argv.len());
 
-    let selector_ptr = (&raw mut SELECTOR) as *mut u8;
+    // If LC_MAIN, the entry point expects arguments in registers (C calling convention)
+    // argc is at [rsp], argv is at [rsp+8], envp is after argv
+    let _argc = argv.len() as u64;
+    
+    // We need to pass argc, argv, envp, apple to the entry point in registers.
+    // AND we need to put a return address on the stack that calls exit.
+    
+    // Exit trampoline: xor edi,edi; mov eax,0x2000001 (Darwin exit); syscall
+    let exit_trampoline: [u8; 12] = [0x31, 0xff, 0xb8, 0x01, 0x00, 0x00, 0x02, 0x0f, 0x05, 0xcc, 0xcc, 0xcc];
+    let exit_trampoline_addr = unsafe {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        std::ptr::copy_nonoverlapping(exit_trampoline.as_ptr(), ptr as *mut u8, exit_trampoline.len());
+        ptr as u64
+    };
 
+    // Adjust stack pointer to "push" the return address
+    let mut final_stack = stack_ptr;
+    unsafe {
+        final_stack -= 8;
+        *(final_stack as *mut u64) = exit_trampoline_addr;
+    }
+    
     unsafe {
         asm!(
-            "mov byte ptr [{selector}], {block}",
-            "mov rsp, {stack}",
+            "mov byte ptr [r10], {block}",
+            "mov rsp, r11",
+            "mov rdi, [rsp + 8]",       // rdi = argc (now at rsp+8 because of pushed return addr)
+            "lea rsi, [rsp + 16]",      // rsi = argv
+            "lea rdx, [rsp + 16 + rdi * 8 + 8]", // rdx = envp
+            
+            "mov rcx, rdx",             // rcx = apple (approximate)
+
             "xor rbp, rbp",
             "xor rbx, rbx",
             "xor r12, r12",
             "xor r13, r13",
             "xor r14, r14",
             "xor r15, r15",
-            "jmp {entry}",
-            selector = in(reg) selector_ptr,
+            "jmp rax",
+            in("r10") selector_ptr(),
+            in("r11") final_stack,
+            in("rax") entry_point,
             block = const SYSCALL_DISPATCH_FILTER_BLOCK,
-            stack = in(reg) stack_ptr,
-            entry = in(reg) entry_point,
             options(noreturn),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_syscall_unix_getpid() {
+        // Darwin getpid is 20, Linux is 39.
+        let res = unsafe { process_syscall(0x2000014, [0; 6], -1) };
+        assert_eq!(res, unsafe { libc::getpid() } as i64);
+    }
+
+    #[test]
+    fn test_process_syscall_mach_trap_unsupported_fd() {
+        // Mach trap 26 (mach_reply_port)
+        let res = unsafe { process_syscall(0x100001a, [0; 6], -1) };
+        assert_eq!(res, -38); // ENOSYS
     }
 }

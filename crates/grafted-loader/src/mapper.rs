@@ -1,7 +1,4 @@
 //! Segment memory mapper.
-//!
-//! Maps Mach-O segments into memory at their specified virtual addresses
-//! using mmap(MAP_FIXED). Skips __PAGEZERO (guard page).
 
 use std::num::NonZeroUsize;
 use std::ptr;
@@ -11,7 +8,6 @@ use nix::sys::mman::{mmap_anonymous, mprotect, MapFlags, ProtFlags};
 use crate::error::LoaderError;
 use crate::macho::{MachOBinary, Segment};
 
-/// Convert Mach-O protection flags to Linux mmap ProtFlags.
 fn macho_prot_to_linux(prot: u32) -> ProtFlags {
     let mut flags = ProtFlags::empty();
     if prot & 1 != 0 {
@@ -26,7 +22,6 @@ fn macho_prot_to_linux(prot: u32) -> ProtFlags {
     flags
 }
 
-/// Map a single segment into memory at its vmaddr.
 fn map_segment(seg: &Segment, file_data: &[u8]) -> Result<(), LoaderError> {
     if seg.vmsize == 0 {
         return Ok(());
@@ -79,8 +74,6 @@ fn map_segment(seg: &Segment, file_data: &[u8]) -> Result<(), LoaderError> {
     Ok(())
 }
 
-/// Map all segments of a Mach-O binary into memory.
-/// Skips __PAGEZERO (null guard page).
 /// Returns the resolved entry point address.
 pub fn map_binary(binary: &MachOBinary) -> Result<u64, LoaderError> {
     for seg in &binary.segments {
@@ -93,13 +86,14 @@ pub fn map_binary(binary: &MachOBinary) -> Result<u64, LoaderError> {
     }
 
     let entry = if binary.entry_is_offset {
-        // LC_MAIN: offset relative to __TEXT vmaddr
+        // LC_MAIN: offset relative to the file start
         let text_seg = binary
             .segments
             .iter()
             .find(|s| s.name == "__TEXT")
             .ok_or(LoaderError::NoTextSegment)?;
-        text_seg.vmaddr + binary.entry_point
+        let base_addr = text_seg.vmaddr - text_seg.fileoff;
+        base_addr + binary.entry_point
     } else {
         // LC_UNIXTHREAD: absolute address
         binary.entry_point

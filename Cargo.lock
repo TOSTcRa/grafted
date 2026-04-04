@@ -184,6 +184,8 @@ name = "grafted-dyld"
 version = "0.1.0"
 dependencies = [
  "goblin",
+ "grafted-loader",
+ "grafted-objc",
  "libc",
  "log",
  "memmap2",
@@ -228,6 +230,8 @@ dependencies = [
 name = "grafted-objc"
 version = "0.1.0"
 dependencies = [
+ "lazy_static",
+ "libc",
  "log",
  "thiserror",
 ]
@@ -267,6 +271,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "lazy_static"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
