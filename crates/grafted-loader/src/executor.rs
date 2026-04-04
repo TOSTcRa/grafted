@@ -96,18 +96,20 @@ fn alloc_stack() -> Result<usize, LoaderError> {
 fn alloc_trampoline() -> Result<u64, LoaderError> {
     let sel_ptr = selector_ptr() as u64;
 
-    //   movabs rax, <selector_ptr>      ; 10 bytes
-    //   mov byte ptr [rax], 1           ; 3 bytes
+    // Use r11 (caller-saved, not return value) to avoid clobbering rax
+    //   movabs r11, <selector_ptr>      ; 10 bytes (49 bb ...)
+    //   mov byte ptr [r11], 1           ; 4 bytes (41 c6 03 01)
     //   ret                             ; 1 byte
-    // Total: 14 bytes
-    let mut code = [0u8; 14];
-    code[0] = 0x48;
-    code[1] = 0xb8;
+    // Total: 15 bytes
+    let mut code = [0u8; 15];
+    code[0] = 0x49;
+    code[1] = 0xbb;
     code[2..10].copy_from_slice(&sel_ptr.to_le_bytes());
-    code[10] = 0xc6;
-    code[11] = 0x00;
-    code[12] = SYSCALL_DISPATCH_FILTER_BLOCK;
-    code[13] = 0xc3; // ret
+    code[10] = 0x41;
+    code[11] = 0xc6;
+    code[12] = 0x03;
+    code[13] = SYSCALL_DISPATCH_FILTER_BLOCK;
+    code[14] = 0xc3; // ret
 
     let size = NonZeroUsize::new(4096).unwrap();
     let page = unsafe {
@@ -295,6 +297,49 @@ fn enable_sud() -> Result<(), LoaderError> {
     Ok(())
 }
 
+unsafe extern "C" fn sigsegv_handler(
+    _sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    let info = unsafe { &*info };
+    let uctx = unsafe { &*(context as *const libc::ucontext_t) };
+    let rip = uctx.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
+    let rsp = uctx.uc_mcontext.gregs[libc::REG_RSP as usize] as u64;
+    let rdi = uctx.uc_mcontext.gregs[libc::REG_RDI as usize] as u64;
+    let r10 = uctx.uc_mcontext.gregs[libc::REG_R10 as usize] as u64;
+    let fault_addr = unsafe { info.si_addr() } as u64;
+
+    // Print: read return address from stack to identify caller
+    let ret_addr = if rsp > 0x1000 { unsafe { *(rsp as *const u64) } } else { 0 };
+
+    let mut buf = [0u8; 256];
+    let msg = format_crash_ext(&mut buf, fault_addr, rip, rsp, rdi, r10, ret_addr);
+    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
+    unsafe { libc::_exit(139) };
+}
+
+fn format_crash_ext(buf: &mut [u8; 256], addr: u64, rip: u64, rsp: u64, rdi: u64, r10: u64, ret: u64) -> &[u8] {
+    fn hex(val: u64, out: &mut [u8]) -> usize {
+        let digits = b"0123456789abcdef";
+        let mut i = 16;
+        let mut v = val;
+        while i > 0 { i -= 1; out[i] = digits[(v & 0xf) as usize]; v >>= 4; }
+        16
+    }
+    fn w(buf: &mut [u8], pos: &mut usize, s: &[u8]) { buf[*pos..*pos+s.len()].copy_from_slice(s); *pos += s.len(); }
+    fn wh(buf: &mut [u8], pos: &mut usize, v: u64) { *pos += hex(v, &mut buf[*pos..*pos+16]); }
+    let mut p = 0;
+    w(buf, &mut p, b"SIGSEGV at=0x"); wh(buf, &mut p, addr);
+    w(buf, &mut p, b" rip=0x"); wh(buf, &mut p, rip);
+    w(buf, &mut p, b" rsp=0x"); wh(buf, &mut p, rsp);
+    w(buf, &mut p, b" rdi=0x"); wh(buf, &mut p, rdi);
+    w(buf, &mut p, b" r10=0x"); wh(buf, &mut p, r10);
+    w(buf, &mut p, b" ret=0x"); wh(buf, &mut p, ret);
+    buf[p] = b'\n'; p += 1;
+    &buf[..p]
+}
+
 fn install_sigsys_handler() -> Result<(), LoaderError> {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -308,6 +353,8 @@ fn install_sigsys_handler() -> Result<(), LoaderError> {
                 std::io::Error::last_os_error()
             )));
         }
+
+        // Let SIGSEGV produce a core dump for GDB analysis (default action)
     }
     Ok(())
 }

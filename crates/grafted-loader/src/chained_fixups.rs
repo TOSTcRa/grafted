@@ -68,6 +68,7 @@ where
         };
 
         let addr = resolve_symbol(dylib_name, name);
+        log::trace!("chained import[{i}]: {dylib_name}::{name} → {addr:#x}");
         resolved_imports.push(addr);
     }
 
@@ -85,6 +86,10 @@ where
         let mapped_seg = &binary.segments[i as usize];
         if mapped_seg.name == "__PAGEZERO" { continue; }
 
+        log::debug!("chained fixups seg {}: {} pages, page_size={}, format={}, seg_offset={:#x}, seg={}",
+            i, seg_starts.page_count, seg_starts.page_size, seg_starts.pointer_format,
+            seg_starts.segment_offset, mapped_seg.name);
+
         let page_starts_ptr = seg_starts_ptr.wrapping_add(22); // skip header to page_start array
 
         for j in 0..seg_starts.page_count {
@@ -94,25 +99,49 @@ where
             // Address of the first fixup on this page
             let mut chain_ptr = (mapped_seg.vmaddr + (j as u64 * seg_starts.page_size as u64) + page_start_offset as u64) as *mut u64;
             
+            let ptr_format = seg_starts.pointer_format;
+
             loop {
                 let encoded = unsafe { *chain_ptr };
-                let is_bind = (encoded >> 63) != 0;
-                let next = (encoded >> 51) & 0xFFF; // 12 bits
 
-                let addr = if is_bind {
-                    // DYLD_CHAINED_PTR_64_BIND: ordinal:24, addend:8, reserved:19, next:12, bind:1
-                    let ordinal = encoded & 0xFFFFFF;
-                    if ordinal < resolved_imports.len() as u64 {
-                        resolved_imports[ordinal as usize]
-                    } else {
-                        0
+                let (is_bind, next, addr) = match ptr_format {
+                    // DYLD_CHAINED_PTR_64 (format 1)
+                    1 => {
+                        let bind = (encoded >> 63) != 0;
+                        let nxt = (encoded >> 51) & 0xFFF;
+                        let a = if bind {
+                            let ordinal = encoded & 0xFFFFFF;
+                            resolved_imports.get(ordinal as usize).copied().unwrap_or(0)
+                        } else {
+                            let target = encoded & 0xFFFFFFFFF;
+                            let high8 = (encoded >> 36) & 0xFF;
+                            let unpacked = (high8 << 56) | target;
+                            if unpacked == 0 { 0 } else { preferred_load_address + unpacked }
+                        };
+                        (bind, nxt, a)
                     }
-                } else {
-                    // DYLD_CHAINED_PTR_64_REBASE: target:36, high8:8, reserved:7, next:12, bind:1
-                    let target = encoded & 0xFFFFFFFFF;
-                    let high8 = (encoded >> 36) & 0xFF;
-                    let unpacked_target = (high8 << 56) | target;
-                    preferred_load_address + unpacked_target
+                    // DYLD_CHAINED_PTR_64_OFFSET (format 6)
+                    // rebase: target:36, high8:8, next:12, bind(0):1  (high8 is unused/reserved)
+                    // bind:   ordinal:24, addend:8, next:12, bind(1):1
+                    6 => {
+                        let bind = (encoded >> 63) != 0;
+                        let nxt = (encoded >> 51) & 0xFFF;
+                        let a = if bind {
+                            let ordinal = encoded & 0xFFFFFF;
+                            let addend = ((encoded >> 24) & 0xFF) as i8 as i64;
+                            let base = resolved_imports.get(ordinal as usize).copied().unwrap_or(0);
+                            if base == 0 { 0 } else { (base as i64 + addend) as u64 }
+                        } else {
+                            // target is a 36-bit offset from mach header start
+                            let target = encoded & 0xFFFFFFFFF;
+                            if target == 0 { 0 } else { preferred_load_address + target }
+                        };
+                        (bind, nxt, a)
+                    }
+                    _ => {
+                        log::warn!("unsupported chained fixup pointer format {}", ptr_format);
+                        break;
+                    }
                 };
 
                 log::trace!("fixup at {:p}: bind={} raw={:#x} → {:#x}", chain_ptr, is_bind, encoded, addr);
