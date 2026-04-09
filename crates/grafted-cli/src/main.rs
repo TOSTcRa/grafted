@@ -59,6 +59,7 @@ fn main() -> ExitCode {
 
     grafted_dyld::shims::set_selector_ptr(grafted_loader::executor::selector_ptr());
 
+
     let mut linker = grafted_dyld::Linker::new();
     
     if let Err(e) = linker.load_dependencies(&binary) {

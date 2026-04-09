@@ -143,6 +143,9 @@ unsafe extern "C" {
     // glibc fortified functions (same signature as Darwin's _chk variants)
     pub fn __snprintf_chk(s: *mut i8, maxlen: libc::size_t, flag: libc::c_int, slen: libc::size_t, fmt: *const i8, ...) -> libc::c_int;
     pub fn __sprintf_chk(s: *mut i8, flag: libc::c_int, slen: libc::size_t, fmt: *const i8, ...) -> libc::c_int;
+    pub fn __vsnprintf_chk(s: *mut i8, maxlen: libc::size_t, flag: libc::c_int, slen: libc::size_t, fmt: *const i8, ap: *mut libc::c_void) -> libc::c_int;
+    pub fn __memset_chk(dest: *mut libc::c_void, c: libc::c_int, len: libc::size_t, destlen: libc::size_t) -> *mut libc::c_void;
+    pub fn __strncpy_chk(dest: *mut i8, src: *const i8, len: libc::size_t, destlen: libc::size_t) -> *mut i8;
     pub fn timegm(tm: *mut libc::tm) -> libc::time_t;
 
     // Float variants
@@ -373,6 +376,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_fputc", libc::fputc);
     reg_libc!("_fputs", libc::fputs);
     reg_libc!("_getc", libc::fgetc);
+    reg_libc!("_getchar", libc::getchar);
     reg_libc!("___srget", libc::fgetc);
     reg_libc!("_ungetc", libc::ungetc);
     reg_libc!("_feof", libc::feof);
@@ -479,6 +483,9 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     // Fortified functions — _chk variants have extra args, we forward to the base
     reg_libc!("___snprintf_chk", __snprintf_chk);
     reg_libc!("___sprintf_chk", __sprintf_chk);
+    reg_libc!("___vsnprintf_chk", __vsnprintf_chk);
+    reg_libc!("___memset_chk", __memset_chk);
+    reg_libc!("___strncpy_chk", __strncpy_chk);
     reg!("___memcpy_chk", shim_memcpy_chk);
     reg!("___memmove_chk", shim_memmove_chk);
 
@@ -528,7 +535,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_stat$INODE64", libc::stat);
     reg_libc!("_fstat$INODE64", libc::fstat);
 
-    // pthread — must wrap with selector toggle since host libc makes syscalls internally
+    // pthread — custom wrappers that toggle selector AND handle Darwin/Linux key size mismatch
     reg!("_pthread_create", shim_pthread_create);
     reg!("_pthread_join", shim_pthread_join);
     reg!("_pthread_getspecific", shim_pthread_getspecific);
@@ -760,27 +767,27 @@ unsafe extern "C" fn shim_abort() -> ! {
 }
 
 // pthread TLS — Darwin uses 64-bit pthread_key_t, Linux uses 32-bit.
-// We use in-process TLS with 64-bit keys to avoid the ABI mismatch.
-static TLS_STORE: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
-static TLS_NEXT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-unsafe extern "C" fn shim_pthread_key_create(key_out: *mut u64, _dtor: Option<unsafe extern "C" fn(*mut libc::c_void)>) -> i32 {
-    let key = TLS_NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-    unsafe { *key_out = key };
-    0
+// We bridge by zero-extending the key slot and toggling SUD selector
+// around libc calls (which use futex internally).
+unsafe extern "C" fn shim_pthread_key_create(key_out: *mut u64, dtor: Option<unsafe extern "C" fn(*mut libc::c_void)>) -> i32 {
+    // Zero the 8-byte Darwin slot (Linux writes only 4 bytes for pthread_key_t)
+    unsafe { *key_out = 0 };
+    selector_allow();
+    let ret = unsafe { libc::pthread_key_create(key_out as *mut libc::pthread_key_t, dtor) };
+    selector_block();
+    ret
 }
 unsafe extern "C" fn shim_pthread_setspecific(key: u64, val: *const libc::c_void) -> i32 {
-    let mut guard = TLS_STORE.lock().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    map.insert(key, val as u64);
-    0
+    selector_allow();
+    let ret = unsafe { libc::pthread_setspecific(key as libc::pthread_key_t, val) };
+    selector_block();
+    ret
 }
 unsafe extern "C" fn shim_pthread_getspecific(key: u64) -> *mut libc::c_void {
-    let guard = TLS_STORE.lock().unwrap();
-    guard.as_ref()
-        .and_then(|m| m.get(&key))
-        .map(|&v| v as *mut libc::c_void)
-        .unwrap_or(std::ptr::null_mut())
+    selector_allow();
+    let ret = unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) };
+    selector_block();
+    ret
 }
 unsafe extern "C" fn shim_pthread_create(
     thread: *mut libc::pthread_t,
@@ -799,7 +806,18 @@ unsafe extern "C" fn shim_pthread_join(thread: libc::pthread_t, retval: *mut *mu
     selector_block();
     ret
 }
+// Darwin PTHREAD_ONCE_INIT = {0x30B1BCBA, 0} (16 bytes).
+// Linux PTHREAD_ONCE_INIT = 0 (4 bytes).
+// We detect the Darwin magic and reset to Linux's 0 before calling.
+const DARWIN_PTHREAD_ONCE_INIT: u32 = 0x30B1BCBA;
+
 unsafe extern "C" fn shim_pthread_once(once: *mut libc::pthread_once_t, init: extern "C" fn()) -> i32 {
+    // Check if this is an uninitialized Darwin pthread_once_t
+    let once_val = unsafe { *(once as *const u32) };
+    if once_val == DARWIN_PTHREAD_ONCE_INIT {
+        // Reset to Linux PTHREAD_ONCE_INIT (0) so pthread_once will call init
+        unsafe { *(once as *mut u32) = 0 };
+    }
     selector_allow();
     let ret = unsafe { libc::pthread_once(once, init) };
     selector_block();
