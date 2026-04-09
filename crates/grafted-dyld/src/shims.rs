@@ -1484,7 +1484,7 @@ unsafe extern "C" fn shim_mach_vm_protect(
 unsafe extern "C" fn shim_vm_protect(
     _task: u32, addr: u64, size: u32, _set_max: i32, prot: i32,
 ) -> i32 {
-    shim_mach_vm_protect(_task, addr, size as u64, _set_max, prot)
+    unsafe { shim_mach_vm_protect(_task, addr, size as u64, _set_max, prot) }
 }
 
 // Darwin pthread_get_stack{addr,size}_np — return stack bounds.
@@ -1529,7 +1529,7 @@ unsafe extern "C" fn shim_pthread_setname_np(name: *const i8) -> i32 {
 // GCD dispatch_semaphore — minimal implementation using POSIX semaphores
 // Darwin dispatch_semaphore_t is an opaque pointer. We use a box'd sem_t.
 unsafe extern "C" fn shim_dispatch_semaphore_create(value: i64) -> *mut libc::sem_t {
-    let sem = Box::into_raw(Box::new(std::mem::zeroed::<libc::sem_t>()));
+    let sem = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<libc::sem_t>() }));
     selector_allow();
     unsafe { libc::sem_init(sem, 0, value as u32) };
     selector_block();
