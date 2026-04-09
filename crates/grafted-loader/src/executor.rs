@@ -147,8 +147,7 @@ unsafe fn process_syscall(
     fd: libc::c_int,
 ) -> i64 {
     match syscall::translate(raw_syscall) {
-        DarwinSyscall::Unix { linux_nr, .. } if linux_nr >= 0 => {
-            // exit/exit_group: terminate immediately
+        DarwinSyscall::Unix { linux_nr, darwin_nr } if linux_nr >= 0 => {
             if linux_nr == 60 || linux_nr == 231 {
                 unsafe {
                     asm!(
@@ -160,17 +159,49 @@ unsafe fn process_syscall(
                 }
             }
 
+            let mut a = args;
+            match darwin_nr {
+                // mmap: translate flags (Darwin MAP_ANON=0x1000 → Linux=0x20)
+                197 | 199 => {
+                    let df = a[3] as i32;
+                    let mut lf = df & 0x1F;
+                    if df & 0x1000 != 0 { lf |= 0x20; }
+                    if df & 0x0040 != 0 { lf |= 0x4000; }
+                    a[3] = lf as u64;
+                    // Guard page (PROT_NONE + MAP_FIXED + MAP_ANON) → fake success
+                    if a[2] == 0 && lf & 0x30 == 0x30 {
+                        return if a[0] != 0 { a[0] as i64 } else { 0x7fff_0000 };
+                    }
+                }
+                // mprotect: guard page (PROT_NONE) → fake success
+                74 => {
+                    if a[2] == 0 { return 0; }
+                }
+                // open: translate flags (Darwin O_CREAT=0x200 → Linux=0x40)
+                5 => {
+                    let df = a[1] as i32;
+                    let mut lf = df & 0x3;
+                    if df & 0x0008 != 0 { lf |= 0x0400; }
+                    if df & 0x0004 != 0 { lf |= 0x0800; }
+                    if df & 0x0200 != 0 { lf |= 0x0040; }
+                    if df & 0x0400 != 0 { lf |= 0x0200; }
+                    if df & 0x0800 != 0 { lf |= 0x0080; }
+                    a[1] = lf as u64;
+                }
+                _ => {}
+            }
+
             let ret: i64;
             unsafe {
                 asm!(
                     "syscall",
                     inlateout("rax") linux_nr as i64 => ret,
-                    in("rdi") args[0],
-                    in("rsi") args[1],
-                    in("rdx") args[2],
-                    in("r10") args[3],
-                    in("r8") args[4],
-                    in("r9") args[5],
+                    in("rdi") a[0],
+                    in("rsi") a[1],
+                    in("rdx") a[2],
+                    in("r10") a[3],
+                    in("r8") a[4],
+                    in("r9") a[5],
                     lateout("rcx") _,
                     lateout("r11") _,
                     options(nostack),
@@ -179,28 +210,33 @@ unsafe fn process_syscall(
             ret
         }
         DarwinSyscall::Unix { .. } => {
-            let msg = b"grafted: unimplemented Darwin syscall\n";
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
             -38
         }
         DarwinSyscall::MachTrap { trap_nr } => {
-            if fd < 0 {
-                let msg = b"grafted: mach trap called but /dev/grafted is not open\n";
-                unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
-                -38
-            } else {
-                let mut trap = grafted_kernel::ioctl::GraftedMachTrap {
-                    trap_number: trap_nr,
-                    args,
-                    result: 0,
-                };
-                let res = unsafe {
-                    grafted_kernel::ioctl::grafted_mach_trap(fd, &mut trap)
-                };
-                if res.is_err() {
-                    -38 // Return ENOSYS if ioctl fails
-                } else {
-                    trap.result
+            match trap_nr {
+                26 => 0x307,  // mach_reply_port
+                27 => 0x203,  // mach_thread_self
+                28 => 0x103,  // mach_task_self
+                // mach_vm_protect → mprotect (guard page PROT_NONE → fake success)
+                14 => {
+                    let prot = args[4] as i32;
+                    if prot == 0 { return 0; }
+                    let addr = args[1] & !0xFFF;
+                    let size = ((args[1] + args[2] + 0xFFF) & !0xFFF) - addr;
+                    let ret = unsafe { libc::mprotect(addr as *mut _, size as usize, prot) };
+                    if ret == 0 { 0 } else { 1 }
+                }
+                _ => {
+                    if fd < 0 { return -38; }
+                    let mut trap = grafted_kernel::ioctl::GraftedMachTrap {
+                        trap_number: trap_nr,
+                        args,
+                        result: 0,
+                    };
+                    let res = unsafe {
+                        grafted_kernel::ioctl::grafted_mach_trap(fd, &mut trap)
+                    };
+                    if res.is_err() { -38 } else { trap.result }
                 }
             }
         }

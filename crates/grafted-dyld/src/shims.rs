@@ -708,7 +708,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_strerror_r", libc::strerror_r);
     reg_libc!("_posix_memalign", libc::posix_memalign);
     reg_libc!("_posix_madvise", libc::posix_madvise);
-    reg_libc!("_sigaltstack", libc::sigaltstack);
+    reg!("_sigaltstack", shim_sigaltstack_noop);
     reg!("_sysctl", shim_sysctl);
     reg!("_sysctlbyname", shim_sysctlbyname);
 
@@ -964,14 +964,37 @@ unsafe extern "C" fn shim_pthread_getspecific(key: u64) -> *mut libc::c_void {
     selector_block();
     ret
 }
+struct ThreadStartCtx {
+    real_start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
+    real_arg: *mut libc::c_void,
+}
+unsafe impl Send for ThreadStartCtx {}
+
+extern "C" fn thread_start_wrapper(ctx_ptr: *mut libc::c_void) -> *mut libc::c_void {
+    let ctx = unsafe { Box::from_raw(ctx_ptr as *mut ThreadStartCtx) };
+    // Install SUD for this new thread
+    let sel_ptr = SELECTOR_PTR.load(Ordering::Acquire);
+    if !sel_ptr.is_null() {
+        unsafe {
+            libc::prctl(59, 1, 0usize, 0usize, sel_ptr as usize);
+            sel_ptr.write_volatile(1); // BLOCK
+        }
+    }
+    (ctx.real_start)(ctx.real_arg)
+}
+
 unsafe extern "C" fn shim_pthread_create(
     thread: *mut libc::pthread_t,
     attr: *const libc::pthread_attr_t,
     start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
     arg: *mut libc::c_void,
 ) -> i32 {
-    selector_allow();
-    let ret = unsafe { libc::pthread_create(thread, attr, start, arg) };
+    selector_allow(); // Must be ALLOW for Box allocation (may use mmap internally)
+    let ctx = Box::into_raw(Box::new(ThreadStartCtx {
+        real_start: start,
+        real_arg: arg,
+    }));
+    let ret = unsafe { libc::pthread_create(thread, attr, thread_start_wrapper, ctx as *mut _) };
     selector_block();
     ret
 }
@@ -1278,16 +1301,25 @@ unsafe extern "C" fn shim_munmap(addr: u64, len: usize) -> i32 {
 }
 
 unsafe extern "C" fn shim_mprotect(addr: u64, len: usize, prot: i32) -> i32 {
-    // If Rust is trying to set a guard page (PROT_NONE) within our known stack,
-    // just pretend it succeeded. This avoids the "failed to allocate guard page" panic.
-    let stack_base = STACK_BASE_VAL.load(Ordering::Acquire);
-    if prot == 0 && stack_base != 0 && addr >= stack_base && addr < stack_base + STACK_SIZE_VAL.load(Ordering::Acquire) {
-        return 0; // Fake success — guard page not actually needed
-    }
+    // PROT_NONE = guard page request — always fake success.
+    // Both main thread and spawned threads use this for stack overflow detection.
+    if prot == 0 { return 0; }
     selector_allow();
     let ret = unsafe { libc::mprotect(addr as *mut _, len, prot) };
     selector_block();
     ret
+}
+
+// sigaltstack stub — prevents Rust from failing during stack overflow handler setup
+unsafe extern "C" fn shim_sigaltstack_noop(_ss: *const libc::stack_t, _oss: *mut libc::stack_t) -> i32 {
+    if !_oss.is_null() {
+        unsafe {
+            (*_oss).ss_sp = std::ptr::null_mut();
+            (*_oss).ss_flags = 2; // SS_DISABLE
+            (*_oss).ss_size = 0;
+        }
+    }
+    0
 }
 
 // Old stat shims removed — replaced by DarwinStat translation wrappers above
