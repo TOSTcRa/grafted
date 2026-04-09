@@ -709,7 +709,8 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_posix_memalign", libc::posix_memalign);
     reg_libc!("_posix_madvise", libc::posix_madvise);
     reg_libc!("_sigaltstack", libc::sigaltstack);
-    reg!("_sysctl", shim_noop); // stub — most sysctl calls are for system info, safe to fail
+    reg!("_sysctl", shim_sysctl);
+    reg!("_sysctlbyname", shim_sysctlbyname);
 
     // pthread extras
     reg_libc!("_pthread_self", libc::pthread_self);
@@ -1368,6 +1369,100 @@ unsafe extern "C" fn shim_tlv_bootstrap(descriptor: *mut u64) -> *mut u8 {
 }
 
 // Mach stubs for Rust std
+// sysctl — translate Darwin MIBs to Linux values
+// Go runtime uses: CTL_HW(6)+HW_NCPU(3), CTL_HW(6)+HW_PAGESIZE(7), CTL_HW(6)+HW_MEMSIZE(24)
+unsafe extern "C" fn shim_sysctl(
+    name: *const i32, namelen: u32, oldp: *mut u8, oldlenp: *mut usize,
+    _newp: *const u8, _newlen: usize,
+) -> i32 {
+    if name.is_null() || namelen < 2 { return -1; }
+    let mib0 = unsafe { *name };
+    let mib1 = unsafe { *name.add(1) };
+
+    // CTL_HW = 6
+    if mib0 == 6 {
+        match mib1 {
+            3 => { // HW_NCPU
+                if !oldp.is_null() && !oldlenp.is_null() {
+                    selector_allow();
+                    let ncpu = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as i32;
+                    selector_block();
+                    let val = if ncpu > 0 { ncpu } else { 1 };
+                    let len = unsafe { *oldlenp };
+                    if len >= 4 { unsafe { *(oldp as *mut i32) = val; *oldlenp = 4; } }
+                }
+                return 0;
+            }
+            7 => { // HW_PAGESIZE
+                if !oldp.is_null() && !oldlenp.is_null() {
+                    let len = unsafe { *oldlenp };
+                    if len >= 4 { unsafe { *(oldp as *mut i32) = 4096; *oldlenp = 4; } }
+                }
+                return 0;
+            }
+            24 => { // HW_MEMSIZE (u64)
+                if !oldp.is_null() && !oldlenp.is_null() {
+                    let len = unsafe { *oldlenp };
+                    if len >= 8 { unsafe { *(oldp as *mut u64) = 8 * 1024 * 1024 * 1024; *oldlenp = 8; } } // 8GB fake
+                }
+                return 0;
+            }
+            _ => {}
+        }
+    }
+    // CTL_KERN = 1
+    if mib0 == 1 {
+        match mib1 {
+            14 => { // KERN_MAXPROC — just return something
+                if !oldp.is_null() && !oldlenp.is_null() {
+                    let len = unsafe { *oldlenp };
+                    if len >= 4 { unsafe { *(oldp as *mut i32) = 2048; *oldlenp = 4; } }
+                }
+                return 0;
+            }
+            _ => {}
+        }
+    }
+    // Unknown MIB — return success with no data (Go handles this)
+    0
+}
+
+unsafe extern "C" fn shim_sysctlbyname(
+    name: *const i8, oldp: *mut u8, oldlenp: *mut usize,
+    _newp: *const u8, _newlen: usize,
+) -> i32 {
+    if name.is_null() { return -1; }
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }.to_str().unwrap_or("");
+    match name_str {
+        "hw.ncpu" | "hw.logicalcpu" | "hw.physicalcpu" => {
+            if !oldp.is_null() && !oldlenp.is_null() {
+                selector_allow();
+                let ncpu = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as i32;
+                selector_block();
+                let val = if ncpu > 0 { ncpu } else { 1 };
+                let len = unsafe { *oldlenp };
+                if len >= 4 { unsafe { *(oldp as *mut i32) = val; *oldlenp = 4; } }
+            }
+            0
+        }
+        "hw.pagesize" => {
+            if !oldp.is_null() && !oldlenp.is_null() {
+                let len = unsafe { *oldlenp };
+                if len >= 4 { unsafe { *(oldp as *mut i32) = 4096; *oldlenp = 4; } }
+            }
+            0
+        }
+        "hw.memsize" => {
+            if !oldp.is_null() && !oldlenp.is_null() {
+                let len = unsafe { *oldlenp };
+                if len >= 8 { unsafe { *(oldp as *mut u64) = 8 * 1024 * 1024 * 1024; *oldlenp = 8; } }
+            }
+            0
+        }
+        _ => 0 // unknown — return success
+    }
+}
+
 unsafe extern "C" fn shim_mach_task_self() -> u32 { 0x103 }
 unsafe extern "C" fn shim_mach_thread_self() -> u32 { 0x203 }
 
