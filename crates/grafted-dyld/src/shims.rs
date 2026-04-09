@@ -494,7 +494,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg!("_os_unfair_lock_unlock", shim_noop);
 
     // Misc missing
-    reg_libc!("_openat", libc::openat);
+    reg!("_openat", shim_openat);
     reg_libc!("_readv", libc::readv);
     reg_libc!("_writev", libc::writev);
     reg_libc!("_msync", libc::msync);
@@ -906,8 +906,33 @@ unsafe extern "C" fn shim_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     linux_syscall!(0, fd, buf, count)
 }
 
+// Darwin open() flags differ from Linux:
+//   Darwin O_CREAT=0x200, O_TRUNC=0x400, O_EXCL=0x800, O_APPEND=0x8, O_NONBLOCK=0x4
+//   Linux  O_CREAT=0x40,  O_TRUNC=0x200, O_EXCL=0x80,  O_APPEND=0x400, O_NONBLOCK=0x800
+fn translate_open_flags(darwin: i32) -> i32 {
+    let mut linux = darwin & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2 — same on both
+    if darwin & 0x0008 != 0 { linux |= 0x0400; } // O_APPEND
+    if darwin & 0x0004 != 0 { linux |= 0x0800; } // O_NONBLOCK
+    if darwin & 0x0200 != 0 { linux |= 0x0040; } // O_CREAT
+    if darwin & 0x0400 != 0 { linux |= 0x0200; } // O_TRUNC
+    if darwin & 0x0800 != 0 { linux |= 0x0080; } // O_EXCL
+    if darwin & 0x0010 != 0 { linux |= 0x0100; } // O_NOCTTY (same? Darwin=0x20000 actually)
+    if darwin & 0x10000 != 0 { linux |= 0x10000; } // O_DIRECTORY
+    if darwin & 0x100000 != 0 { linux |= 0x200000; } // O_CLOEXEC
+    linux
+}
+
 unsafe extern "C" fn shim_open(path: *const i8, flags: i32, mode: i32) -> i64 {
-    linux_syscall!(2, path, flags, mode)
+    let linux_flags = translate_open_flags(flags);
+    linux_syscall!(2, path, linux_flags, mode)
+}
+
+unsafe extern "C" fn shim_openat(dirfd: i32, path: *const i8, flags: i32, mode: i32) -> i64 {
+    let linux_flags = translate_open_flags(flags);
+    selector_allow();
+    let ret = unsafe { libc::openat(dirfd, path, linux_flags, mode as libc::mode_t) } as i64;
+    selector_block();
+    ret
 }
 
 // Darwin struct stat (x86_64) — 144 bytes
