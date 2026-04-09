@@ -588,7 +588,50 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_dlsym", libc::dlsym);
     reg_libc!("_dlerror", libc::dlerror);
 
-    reg!("_sigaction", shim_noop); // stub
+    reg_libc!("_sigaction", libc::sigaction);
+    reg_libc!("_signal", libc::signal);
+    reg_libc!("_sigprocmask", libc::sigprocmask);
+    reg_libc!("_sigemptyset", libc::sigemptyset);
+    reg_libc!("_sigfillset", libc::sigfillset);
+    reg_libc!("_sigaddset", libc::sigaddset);
+    reg_libc!("_kill", libc::kill);
+
+    // I/O multiplexing
+    reg_libc!("_poll", libc::poll);
+    reg_libc!("_select", libc::select);
+    reg_libc!("_select$1050", libc::select);
+    reg_libc!("_pselect", libc::pselect);
+
+    // stat — Darwin struct layout differs from Linux; use wrappers that translate
+    reg!("_stat", shim_stat);
+    reg!("_fstat", shim_fstat);
+    reg!("_lstat", shim_lstat);
+    reg!("_stat$INODE64", shim_stat);
+    reg!("_fstat$INODE64", shim_fstat);
+    reg!("_lstat$INODE64", shim_lstat);
+
+    // Additional commonly needed functions
+    reg_libc!("_access", libc::access);
+    reg_libc!("_unlink", libc::unlink);
+    reg_libc!("_rename", libc::rename);
+    reg_libc!("_mkdir", libc::mkdir);
+    reg_libc!("_rmdir", libc::rmdir);
+    reg_libc!("_getcwd", libc::getcwd);
+    reg_libc!("_chdir", libc::chdir);
+    reg_libc!("_pipe", libc::pipe);
+    reg_libc!("_fork", libc::fork);
+    reg_libc!("_execve", libc::execve);
+    reg_libc!("_waitpid", libc::waitpid);
+    reg_libc!("_sysconf", libc::sysconf);
+    reg_libc!("_getrlimit", libc::getrlimit);
+    reg_libc!("_madvise", libc::madvise);
+    reg_libc!("_srand", libc::srand);
+    reg_libc!("_strtol", libc::strtol);
+    reg_libc!("_strtoul", libc::strtoul);
+    reg_libc!("_strtoll", libc::strtoll);
+    reg_libc!("_strnlen", libc::strnlen);
+    reg_libc!("_strncat", libc::strncat);
+    reg_libc!("_strtok", libc::strtok);
     reg!("__setjmp", _setjmp);
     reg!("__longjmp", _longjmp);
 
@@ -867,6 +910,82 @@ unsafe extern "C" fn shim_open(path: *const i8, flags: i32, mode: i32) -> i64 {
     linux_syscall!(2, path, flags, mode)
 }
 
+// Darwin struct stat (x86_64) — 144 bytes
+// Linux fills a different layout; we translate field by field.
+#[repr(C)]
+struct DarwinStat {
+    st_dev: i32,        // 0
+    st_mode: u16,       // 4
+    st_nlink: u16,      // 6
+    st_ino: u64,        // 8
+    st_uid: u32,        // 16
+    st_gid: u32,        // 20
+    st_rdev: i32,       // 24
+    _pad0: i32,         // 28
+    st_atim: [i64; 2],  // 32 (sec, nsec)
+    st_mtim: [i64; 2],  // 48
+    st_ctim: [i64; 2],  // 64
+    st_birthtim: [i64; 2], // 80
+    st_size: i64,       // 96
+    st_blocks: i64,     // 104
+    st_blksize: i32,    // 112
+    st_flags: u32,      // 116
+    st_gen: u32,        // 120
+    _pad1: i32,         // 124
+    _reserved: [i64; 2],// 128
+}
+
+fn linux_to_darwin_stat(linux: &libc::stat, darwin: *mut DarwinStat) {
+    unsafe {
+        (*darwin).st_dev = linux.st_dev as i32;
+        (*darwin).st_mode = linux.st_mode as u16;
+        (*darwin).st_nlink = linux.st_nlink as u16;
+        (*darwin).st_ino = linux.st_ino;
+        (*darwin).st_uid = linux.st_uid;
+        (*darwin).st_gid = linux.st_gid;
+        (*darwin).st_rdev = linux.st_rdev as i32;
+        (*darwin)._pad0 = 0;
+        (*darwin).st_atim = [linux.st_atime, linux.st_atime_nsec];
+        (*darwin).st_mtim = [linux.st_mtime, linux.st_mtime_nsec];
+        (*darwin).st_ctim = [linux.st_ctime, linux.st_ctime_nsec];
+        (*darwin).st_birthtim = [linux.st_ctime, linux.st_ctime_nsec]; // Linux has no birthtime
+        (*darwin).st_size = linux.st_size;
+        (*darwin).st_blocks = linux.st_blocks;
+        (*darwin).st_blksize = linux.st_blksize as i32;
+        (*darwin).st_flags = 0;
+        (*darwin).st_gen = 0;
+        (*darwin)._pad1 = 0;
+        (*darwin)._reserved = [0; 2];
+    }
+}
+
+unsafe extern "C" fn shim_stat(path: *const i8, buf: *mut DarwinStat) -> i32 {
+    let mut linux_buf: libc::stat = unsafe { std::mem::zeroed() };
+    selector_allow();
+    let ret = unsafe { libc::stat(path, &mut linux_buf) };
+    selector_block();
+    if ret == 0 { linux_to_darwin_stat(&linux_buf, buf); }
+    ret
+}
+
+unsafe extern "C" fn shim_fstat(fd: i32, buf: *mut DarwinStat) -> i32 {
+    let mut linux_buf: libc::stat = unsafe { std::mem::zeroed() };
+    selector_allow();
+    let ret = unsafe { libc::fstat(fd, &mut linux_buf) };
+    selector_block();
+    if ret == 0 { linux_to_darwin_stat(&linux_buf, buf); }
+    ret
+}
+
+unsafe extern "C" fn shim_lstat(path: *const i8, buf: *mut DarwinStat) -> i32 {
+    let mut linux_buf: libc::stat = unsafe { std::mem::zeroed() };
+    selector_allow();
+    let ret = unsafe { libc::lstat(path, &mut linux_buf) };
+    selector_block();
+    if ret == 0 { linux_to_darwin_stat(&linux_buf, buf); }
+    ret
+}
+
 unsafe extern "C" fn shim_close(fd: i32) -> i64 {
     linux_syscall!(3, fd)
 }
@@ -934,34 +1053,7 @@ unsafe extern "C" fn shim_mprotect(addr: u64, len: usize, prot: i32) -> i32 {
     ret
 }
 
-unsafe extern "C" fn shim_fstat(fd: i32, darwin_stat: *mut u8) -> i32 {
-    let mut linux_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let ret = linux_syscall!(5, fd, linux_stat.as_mut_ptr());
-    if ret == 0 {
-        let linux_stat = unsafe { linux_stat.assume_init() };
-        unsafe {
-            std::ptr::write_bytes(darwin_stat, 0, 144);
-            *(darwin_stat.add(0) as *mut i32) = linux_stat.st_dev as i32;
-            *(darwin_stat.add(8) as *mut u64) = linux_stat.st_ino;
-            *(darwin_stat.add(16) as *mut u16) = linux_stat.st_mode as u16;
-            *(darwin_stat.add(48) as *mut i64) = linux_stat.st_size;
-        }
-    }
-    ret as i32
-}
-
-unsafe extern "C" fn shim_stat(path: *const i8, darwin_stat: *mut u8) -> i32 {
-    let mut linux_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let ret = linux_syscall!(4, path, linux_stat.as_mut_ptr());
-    if ret == 0 {
-        let linux_stat = unsafe { linux_stat.assume_init() };
-        unsafe {
-            std::ptr::write_bytes(darwin_stat, 0, 144);
-            *(darwin_stat.add(48) as *mut i64) = linux_stat.st_size;
-        }
-    }
-    ret as i32
-}
+// Old stat shims removed — replaced by DarwinStat translation wrappers above
 
 unsafe extern "C" fn shim_puts(s: *const i8) -> i32 {
     selector_allow();
