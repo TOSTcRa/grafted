@@ -619,6 +619,24 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_getcwd", libc::getcwd);
     reg_libc!("_chdir", libc::chdir);
     reg_libc!("_pipe", libc::pipe);
+
+    // Networking
+    reg_libc!("_socket", libc::socket);
+    reg_libc!("_connect", libc::connect);
+    reg_libc!("_bind", libc::bind);
+    reg_libc!("_listen", libc::listen);
+    reg_libc!("_accept", libc::accept);
+    reg_libc!("_send", libc::send);
+    reg_libc!("_recv", libc::recv);
+    reg_libc!("_sendto", libc::sendto);
+    reg_libc!("_recvfrom", libc::recvfrom);
+    reg_libc!("_setsockopt", libc::setsockopt);
+    reg_libc!("_getsockopt", libc::getsockopt);
+    reg!("_getaddrinfo", shim_getaddrinfo);
+    reg!("_freeaddrinfo", shim_freeaddrinfo);
+    reg_libc!("_gai_strerror", libc::gai_strerror);
+    reg_libc!("_getnameinfo", libc::getnameinfo);
+    reg_libc!("_shutdown", libc::shutdown);
     reg_libc!("_fork", libc::fork);
     reg_libc!("_execve", libc::execve);
     reg_libc!("_waitpid", libc::waitpid);
@@ -925,6 +943,56 @@ fn translate_open_flags(darwin: i32) -> i32 {
 unsafe extern "C" fn shim_open(path: *const i8, flags: i32, mode: i32) -> i64 {
     let linux_flags = translate_open_flags(flags);
     linux_syscall!(2, path, linux_flags, mode)
+}
+
+// Darwin vs Linux addrinfo: ai_canonname and ai_addr are swapped.
+// Darwin: {flags, family, socktype, protocol, addrlen, *canonname, *addr, *next}
+// Linux:  {flags, family, socktype, protocol, addrlen, *addr, *canonname, *next}
+// We call Linux getaddrinfo then swap the two pointer fields in each result node.
+unsafe extern "C" fn shim_getaddrinfo(
+    node: *const i8, service: *const i8,
+    hints: *const libc::addrinfo, res: *mut *mut libc::addrinfo,
+) -> i32 {
+    // If hints is non-null, it's in Darwin layout — but the first 5 fields (flags..addrlen)
+    // are the same. The pointer fields in hints are typically NULL, so no swap needed.
+    selector_allow();
+    let ret = unsafe { libc::getaddrinfo(node, service, hints, res) };
+    selector_block();
+    if ret == 0 && !res.is_null() {
+        // Walk the linked list and swap ai_addr <-> ai_canonname in each node
+        let mut cur = unsafe { *res };
+        while !cur.is_null() {
+            unsafe {
+                let addr = (*cur).ai_addr;
+                let canon = (*cur).ai_canonname;
+                // Swap: Darwin binary reads offset 24 as canonname, offset 32 as addr
+                // Linux wrote addr at 24, canonname at 32
+                // By swapping, Darwin binary finds addr at its expected offset 32
+                (*cur).ai_addr = canon as *mut libc::sockaddr;
+                (*cur).ai_canonname = addr as *mut i8;
+                cur = (*cur).ai_next;
+            }
+        }
+    }
+    ret
+}
+
+unsafe extern "C" fn shim_freeaddrinfo(res: *mut libc::addrinfo) {
+    if res.is_null() { return; }
+    // Swap back before freeing so libc can correctly free the struct
+    let mut cur = res;
+    while !cur.is_null() {
+        unsafe {
+            let addr = (*cur).ai_addr;
+            let canon = (*cur).ai_canonname;
+            (*cur).ai_addr = canon as *mut libc::sockaddr;
+            (*cur).ai_canonname = addr as *mut i8;
+            cur = (*cur).ai_next;
+        }
+    }
+    selector_allow();
+    unsafe { libc::freeaddrinfo(res) };
+    selector_block();
 }
 
 unsafe extern "C" fn shim_openat(dirfd: i32, path: *const i8, flags: i32, mode: i32) -> i64 {
