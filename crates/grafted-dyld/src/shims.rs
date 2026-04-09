@@ -989,7 +989,7 @@ unsafe extern "C" fn shim_pthread_create(
     start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
     arg: *mut libc::c_void,
 ) -> i32 {
-    selector_allow(); // Must be ALLOW for Box allocation (may use mmap internally)
+    selector_allow();
     let ctx = Box::into_raw(Box::new(ThreadStartCtx {
         real_start: start,
         real_arg: arg,
@@ -1276,6 +1276,14 @@ fn translate_mmap_flags(darwin: i32) -> i32 {
 
 unsafe extern "C" fn shim_mmap(addr: u64, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> u64 {
     let linux_flags = translate_mmap_flags(flags);
+
+    // Guard page (PROT_NONE + MAP_FIXED + MAP_ANON) — fake success
+    if prot == 0 && linux_flags & 0x30 == 0x30 {
+        return if addr != 0 { addr } else { 0x7fff_dead_0000 };
+    }
+    if prot == 0 {
+    }
+
     // If MAP_FIXED with unaligned address, page-align it (round down)
     let actual_addr = if linux_flags & 0x10 != 0 && addr & 0xFFF != 0 {
         addr & !0xFFF
