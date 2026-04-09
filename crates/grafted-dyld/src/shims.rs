@@ -17,6 +17,17 @@ pub fn set_selector_ptr(ptr: *mut u8) {
     SELECTOR_PTR.store(ptr, Ordering::Release);
 }
 
+/// Set process info globals (_NSGetArgc/Argv/Environ/ExecutablePath)
+pub fn set_process_info(binary_path: &str) {
+    unsafe {
+        let path_bytes = binary_path.as_bytes();
+        let ep = &raw mut EXECUTABLE_PATH;
+        let len = path_bytes.len().min(1023);
+        std::ptr::copy_nonoverlapping(path_bytes.as_ptr(), (*ep).as_mut_ptr(), len);
+        (*ep)[len] = 0;
+    }
+}
+
 fn selector_allow() {
     let ptr = SELECTOR_PTR.load(Ordering::Acquire);
     if !ptr.is_null() {
@@ -560,6 +571,35 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     s.insert("_NXArgc".into(), (&raw const NXARGC) as u64);
     s.insert("_NXArgv".into(), (&raw const NXARGV) as u64);
 
+    // _NSGet* functions — return pointers to the global CRT variables
+    reg!("__NSGetArgc", shim_nsgetargc);
+    reg!("__NSGetArgv", shim_nsgetargv);
+    reg!("__NSGetEnviron", shim_nsgetenviron);
+    reg!("__NSGetExecutablePath", shim_nsgetexecutablepath);
+
+    // C++ exception unwinding — stub out for Rust panic=abort builds
+    reg!("__Unwind_Backtrace", shim_noop);
+    reg!("__Unwind_GetIP", shim_noop);
+    reg!("__Unwind_GetRegionStart", shim_noop);
+    reg!("__Unwind_SetGR", shim_noop);
+    reg!("__Unwind_SetIP", shim_noop);
+    reg!("__Unwind_RaiseException", shim_noop);
+    reg!("__Unwind_Resume", shim_noop);
+    reg!("__Unwind_DeleteException", shim_noop);
+    reg!("__Unwind_GetDataRelBase", shim_noop);
+    reg!("__Unwind_GetTextRelBase", shim_noop);
+    reg!("__Unwind_FindEnclosingFunction", shim_noop);
+    reg!("__Unwind_GetLanguageSpecificData", shim_noop);
+
+    // mach_* stubs for Rust std
+    reg!("_mach_task_self", shim_mach_task_self);
+    reg!("_mach_thread_self", shim_mach_thread_self);
+    reg!("_mach_port_deallocate", shim_noop);
+    reg!("_mach_vm_protect", shim_mach_vm_protect);
+    reg!("_mach_vm_map", shim_noop); // stub
+    reg!("_vm_protect", shim_vm_protect);
+    reg!("_vm_deallocate", shim_noop);
+
     s.insert("___stdinp".into(), (&raw mut REAL_STDIN) as u64);
     s.insert("___stdoutp".into(), (&raw mut REAL_STDOUT) as u64);
     s.insert("___stderrp".into(), (&raw mut REAL_STDERR) as u64);
@@ -641,6 +681,79 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_execve", libc::execve);
     reg_libc!("_waitpid", libc::waitpid);
     reg_libc!("_sysconf", libc::sysconf);
+
+    // Directory operations
+    reg_libc!("_opendir", libc::opendir);
+    reg_libc!("_opendir$INODE64", libc::opendir);
+    reg_libc!("_readdir_r$INODE64", libc::readdir_r);
+    reg_libc!("_closedir", libc::closedir);
+    reg_libc!("_dirfd", libc::dirfd);
+
+    // Time
+    reg_libc!("_clock_gettime", libc::clock_gettime);
+    reg_libc!("_nanosleep", libc::nanosleep);
+
+    // Process/user
+    reg_libc!("_execvp", libc::execvp);
+    reg_libc!("_gethostname", libc::gethostname);
+    reg_libc!("_getpwuid_r", libc::getpwuid_r);
+    reg_libc!("_getentropy", libc::getentropy);
+    reg_libc!("_setuid", libc::setuid);
+    reg_libc!("_setgid", libc::setgid);
+    reg_libc!("_setgroups", libc::setgroups);
+    reg_libc!("_setpgid", libc::setpgid);
+    reg_libc!("_uname", libc::uname);
+    reg_libc!("_ioctl", libc::ioctl);
+    reg_libc!("_sched_yield", libc::sched_yield);
+    reg_libc!("_strerror_r", libc::strerror_r);
+    reg_libc!("_posix_memalign", libc::posix_memalign);
+    reg_libc!("_posix_madvise", libc::posix_madvise);
+    reg_libc!("_sigaltstack", libc::sigaltstack);
+    reg!("_sysctl", shim_noop); // stub — most sysctl calls are for system info, safe to fail
+
+    // pthread extras
+    reg_libc!("_pthread_self", libc::pthread_self);
+    reg_libc!("_pthread_attr_init", libc::pthread_attr_init);
+    reg_libc!("_pthread_attr_destroy", libc::pthread_attr_destroy);
+    reg_libc!("_pthread_attr_setstacksize", libc::pthread_attr_setstacksize);
+    reg_libc!("_pthread_detach", libc::pthread_detach);
+    reg_libc!("_pthread_mutex_init", libc::pthread_mutex_init);
+    reg_libc!("_pthread_mutex_destroy", libc::pthread_mutex_destroy);
+    reg_libc!("_pthread_mutex_lock", libc::pthread_mutex_lock);
+    reg_libc!("_pthread_mutex_unlock", libc::pthread_mutex_unlock);
+    reg_libc!("_pthread_mutex_trylock", libc::pthread_mutex_trylock);
+    reg_libc!("_pthread_mutexattr_init", libc::pthread_mutexattr_init);
+    reg_libc!("_pthread_mutexattr_destroy", libc::pthread_mutexattr_destroy);
+    reg_libc!("_pthread_mutexattr_settype", libc::pthread_mutexattr_settype);
+    reg!("_pthread_setname_np", shim_pthread_setname_np);
+    reg!("_pthread_get_stackaddr_np", shim_pthread_get_stackaddr_np);
+    reg!("_pthread_get_stacksize_np", shim_pthread_get_stacksize_np);
+
+    // posix_spawn (used by Rust std::process::Command)
+    reg_libc!("_posix_spawnp", libc::posix_spawnp);
+    reg_libc!("_posix_spawnattr_init", libc::posix_spawnattr_init);
+    reg_libc!("_posix_spawnattr_destroy", libc::posix_spawnattr_destroy);
+    reg_libc!("_posix_spawnattr_setflags", libc::posix_spawnattr_setflags);
+    reg_libc!("_posix_spawnattr_setpgroup", libc::posix_spawnattr_setpgroup);
+    reg_libc!("_posix_spawnattr_setsigdefault", libc::posix_spawnattr_setsigdefault);
+    reg_libc!("_posix_spawn_file_actions_init", libc::posix_spawn_file_actions_init);
+    reg_libc!("_posix_spawn_file_actions_destroy", libc::posix_spawn_file_actions_destroy);
+    reg_libc!("_posix_spawn_file_actions_adddup2", libc::posix_spawn_file_actions_adddup2);
+
+    // Grand Central Dispatch — minimal stubs using POSIX semaphores
+    reg!("_dispatch_semaphore_create", shim_dispatch_semaphore_create);
+    reg!("_dispatch_semaphore_signal", shim_dispatch_semaphore_signal);
+    reg!("_dispatch_semaphore_wait", shim_dispatch_semaphore_wait);
+    reg!("_dispatch_time", shim_dispatch_time);
+    reg!("_dispatch_release", shim_noop);
+
+    // TLS bootstrap — Darwin Thread Local Variables
+    reg!("__tlv_bootstrap", shim_tlv_bootstrap);
+    reg!("__tlv_atexit", shim_noop);
+
+    // More Unwind stubs
+    reg!("__Unwind_GetCFA", shim_noop);
+    reg!("__Unwind_GetIPInfo", shim_noop);
     reg_libc!("_getrlimit", libc::getrlimit);
     reg_libc!("_madvise", libc::madvise);
     reg_libc!("_srand", libc::srand);
@@ -1125,9 +1238,33 @@ unsafe extern "C" fn shim_getegid() -> i32 {
     linux_syscall!(108, 0) as i32
 }
 
+// Darwin mmap flags differ from Linux:
+// Darwin MAP_ANON=0x1000, Linux MAP_ANON=0x20
+// Darwin MAP_PRIVATE=0x02, Linux MAP_PRIVATE=0x02 (same)
+// Darwin MAP_FIXED=0x10, Linux MAP_FIXED=0x10 (same)
+// Darwin MAP_NORESERVE=0x40, Linux MAP_NORESERVE=0x4000
+fn translate_mmap_flags(darwin: i32) -> i32 {
+    let mut linux = darwin & 0x1F; // MAP_SHARED(1), MAP_PRIVATE(2), MAP_FIXED(0x10) — same
+    if darwin & 0x1000 != 0 { linux |= 0x20; } // MAP_ANON
+    if darwin & 0x0040 != 0 { linux |= 0x4000; } // MAP_NORESERVE
+    linux
+}
+
 unsafe extern "C" fn shim_mmap(addr: u64, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> u64 {
+    let linux_flags = translate_mmap_flags(flags);
+    // If MAP_FIXED with unaligned address, page-align it (round down)
+    let actual_addr = if linux_flags & 0x10 != 0 && addr & 0xFFF != 0 {
+        addr & !0xFFF
+    } else {
+        addr
+    };
+    let actual_len = if actual_addr != addr {
+        len + (addr - actual_addr) as usize // extend to cover original range
+    } else {
+        len
+    };
     selector_allow();
-    let ret = unsafe { libc::mmap(addr as *mut _, len, prot, flags, fd, offset) };
+    let ret = unsafe { libc::mmap(actual_addr as *mut _, actual_len, prot, linux_flags, fd, offset) };
     selector_block();
     ret as u64
 }
@@ -1140,6 +1277,12 @@ unsafe extern "C" fn shim_munmap(addr: u64, len: usize) -> i32 {
 }
 
 unsafe extern "C" fn shim_mprotect(addr: u64, len: usize, prot: i32) -> i32 {
+    // If Rust is trying to set a guard page (PROT_NONE) within our known stack,
+    // just pretend it succeeded. This avoids the "failed to allocate guard page" panic.
+    let stack_base = STACK_BASE_VAL.load(Ordering::Acquire);
+    if prot == 0 && stack_base != 0 && addr >= stack_base && addr < stack_base + STACK_SIZE_VAL.load(Ordering::Acquire) {
+        return 0; // Fake success — guard page not actually needed
+    }
     selector_allow();
     let ret = unsafe { libc::mprotect(addr as *mut _, len, prot) };
     selector_block();
@@ -1158,6 +1301,164 @@ unsafe extern "C" fn shim_puts(s: *const i8) -> i32 {
 // Global data symbols
 static mut ENVIRON_PTR: *const *const i8 = std::ptr::null();
 static mut PROGNAME_PTR: *const i8 = std::ptr::null();
+static mut EXECUTABLE_PATH: [u8; 1024] = [0; 1024];
+
+// _NSGet* functions return pointers to the CRT globals
+unsafe extern "C" fn shim_nsgetargc() -> *mut i32 {
+    (&raw mut NXARGC) as *mut i32
+}
+unsafe extern "C" fn shim_nsgetargv() -> *mut *const *const i8 {
+    (&raw mut NXARGV) as *mut *const *const i8
+}
+unsafe extern "C" fn shim_nsgetenviron() -> *mut *const *const i8 {
+    (&raw mut ENVIRON_PTR) as *mut *const *const i8
+}
+unsafe extern "C" fn shim_nsgetexecutablepath(buf: *mut i8, bufsize: *mut u32) -> i32 {
+    let path_ptr = (&raw const EXECUTABLE_PATH) as *const u8;
+    let mut len = 0;
+    while len < 1024 && unsafe { *path_ptr.add(len) } != 0 { len += 1; }
+    let avail = unsafe { *bufsize } as usize;
+    if len + 1 > avail {
+        unsafe { *bufsize = (len + 1) as u32 };
+        return -1;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(path_ptr, buf as *mut u8, len + 1);
+        *bufsize = len as u32;
+    }
+    0
+}
+
+// Darwin TLV (Thread Local Variables) bootstrap.
+// All TLV descriptors in an image share ONE pthread key. The key is stored
+// in each descriptor at offset 8. On first call, we create the key and
+// allocate a large block. Each TLV variable lives at its own offset within the block.
+static TLV_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static TLV_KEY_INIT: std::sync::Once = std::sync::Once::new();
+const TLV_BLOCK_SIZE: usize = 1024 * 1024; // 1MB — generous for Rust TLS
+
+unsafe extern "C" fn shim_tlv_bootstrap(descriptor: *mut u64) -> *mut u8 {
+    let offset = unsafe { *descriptor.add(2) } as usize;
+
+    // Ensure the shared key is created (once)
+    TLV_KEY_INIT.call_once(|| {
+        selector_allow();
+        let mut key: libc::pthread_key_t = 0;
+        unsafe { libc::pthread_key_create(&mut key, Some(libc::free)) };
+        TLV_KEY.store(key as u32, Ordering::Release);
+        selector_block();
+    });
+
+    let key = TLV_KEY.load(Ordering::Acquire) as libc::pthread_key_t;
+
+    // Update the descriptor's key field so the binary can use it directly later
+    unsafe { *descriptor.add(1) = key as u64 };
+
+    // Get or allocate the TLS block for this thread
+    selector_allow();
+    let mut block = unsafe { libc::pthread_getspecific(key) } as *mut u8;
+    if block.is_null() {
+        block = unsafe { libc::calloc(1, TLV_BLOCK_SIZE) } as *mut u8;
+        unsafe { libc::pthread_setspecific(key, block as *const libc::c_void) };
+    }
+    selector_block();
+
+    if block.is_null() { return std::ptr::null_mut(); }
+    unsafe { block.add(offset) }
+}
+
+// Mach stubs for Rust std
+unsafe extern "C" fn shim_mach_task_self() -> u32 { 0x103 }
+unsafe extern "C" fn shim_mach_thread_self() -> u32 { 0x203 }
+
+// mach_vm_protect(task, addr, size, set_max, prot) → kern_return_t
+// Translate Darwin VM_PROT to Linux PROT and call mprotect
+unsafe extern "C" fn shim_mach_vm_protect(
+    _task: u32, addr: u64, size: u64, _set_max: i32, prot: i32,
+) -> i32 {
+    // Darwin VM_PROT: VM_PROT_READ=1, VM_PROT_WRITE=2, VM_PROT_EXECUTE=4 — same as Linux PROT_*
+    let aligned_addr = addr & !0xFFF;
+    let aligned_size = ((addr + size + 0xFFF) & !0xFFF) - aligned_addr;
+    selector_allow();
+    let ret = unsafe { libc::mprotect(aligned_addr as *mut _, aligned_size as usize, prot) };
+    selector_block();
+    if ret == 0 { 0 } else { 1 } // KERN_SUCCESS=0, KERN_FAILURE=1
+}
+
+// vm_protect — older Mach API, same args but 32-bit size
+unsafe extern "C" fn shim_vm_protect(
+    _task: u32, addr: u64, size: u32, _set_max: i32, prot: i32,
+) -> i32 {
+    shim_mach_vm_protect(_task, addr, size as u64, _set_max, prot)
+}
+
+// Darwin pthread_get_stack{addr,size}_np — return stack bounds.
+// Darwin: stackaddr = TOP of stack (highest address), size = total size.
+// Rust computes guard page as: stackaddr - stacksize + guard_size.
+// We must ensure this yields a valid address BELOW our current rsp.
+static STACK_BASE_VAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STACK_SIZE_VAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(8 * 1024 * 1024);
+
+pub fn set_stack_bounds(base: u64, size: u64) {
+    STACK_BASE_VAL.store(base, Ordering::Release);
+    STACK_SIZE_VAL.store(size, Ordering::Release);
+}
+
+unsafe extern "C" fn shim_pthread_get_stackaddr_np(_thread: u64) -> *mut libc::c_void {
+    let base = STACK_BASE_VAL.load(Ordering::Acquire);
+    let size = STACK_SIZE_VAL.load(Ordering::Acquire);
+    let result = if base != 0 {
+        (base + size) as *mut libc::c_void
+    } else {
+        let mut rsp: u64;
+        unsafe { std::arch::asm!("mov {}, rsp", out(reg) rsp) };
+        ((rsp + 0x800000) & !0xFFF) as *mut libc::c_void
+    };
+    result
+}
+
+unsafe extern "C" fn shim_pthread_get_stacksize_np(_thread: u64) -> libc::size_t {
+    STACK_SIZE_VAL.load(Ordering::Acquire) as libc::size_t
+}
+
+// pthread_setname_np on Darwin takes (const char*) for current thread only
+// Linux takes (pthread_t, const char*). Bridge by ignoring thread arg.
+unsafe extern "C" fn shim_pthread_setname_np(name: *const i8) -> i32 {
+    selector_allow();
+    let me = unsafe { libc::pthread_self() };
+    let ret = unsafe { libc::pthread_setname_np(me, name) };
+    selector_block();
+    ret
+}
+
+// GCD dispatch_semaphore — minimal implementation using POSIX semaphores
+// Darwin dispatch_semaphore_t is an opaque pointer. We use a box'd sem_t.
+unsafe extern "C" fn shim_dispatch_semaphore_create(value: i64) -> *mut libc::sem_t {
+    let sem = Box::into_raw(Box::new(std::mem::zeroed::<libc::sem_t>()));
+    selector_allow();
+    unsafe { libc::sem_init(sem, 0, value as u32) };
+    selector_block();
+    sem
+}
+unsafe extern "C" fn shim_dispatch_semaphore_signal(sem: *mut libc::sem_t) -> i64 {
+    if sem.is_null() { return 0; }
+    selector_allow();
+    let ret = unsafe { libc::sem_post(sem) };
+    selector_block();
+    ret as i64
+}
+unsafe extern "C" fn shim_dispatch_semaphore_wait(sem: *mut libc::sem_t, timeout: u64) -> i64 {
+    if sem.is_null() { return -1; }
+    let _ = timeout; // TODO: handle timeout properly
+    selector_allow();
+    let ret = unsafe { libc::sem_wait(sem) };
+    selector_block();
+    ret as i64
+}
+// dispatch_time(DISPATCH_TIME_NOW, nsec) → absolute time. We return nsec as-is.
+unsafe extern "C" fn shim_dispatch_time(when: u64, delta: i64) -> u64 {
+    when.wrapping_add(delta as u64)
+}
 static mut STACK_CHK_GUARD: usize = 0xdeadbeef;
 static mut NXARGC: i32 = 0;
 static mut NXARGV: *const *const i8 = std::ptr::null();

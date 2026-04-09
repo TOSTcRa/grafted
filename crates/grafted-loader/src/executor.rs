@@ -32,6 +32,12 @@ const SYS_USER_DISPATCH: i32 = 2;
 // We dynamically allocate the selector to guarantee it's in a writable page.
 static SELECTOR_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
+static STACK_BASE_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn stack_base() -> u64 {
+    STACK_BASE_ADDR.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn selector_ptr() -> *mut u8 {
     let mut ptr = SELECTOR_PTR.load(Ordering::Acquire);
     if ptr.is_null() {
@@ -66,9 +72,10 @@ static mut GRAFTED_FD: libc::c_int = -1;
 
 // ---- Stack allocation ----
 
-const STACK_SIZE: usize = 8 * 1024 * 1024;
+pub const STACK_SIZE: usize = 8 * 1024 * 1024;
 
-fn alloc_stack() -> Result<usize, LoaderError> {
+// Returns (stack_base, stack_top)
+fn alloc_stack() -> Result<(usize, usize), LoaderError> {
     let size = NonZeroUsize::new(STACK_SIZE).unwrap();
     let base = unsafe {
         mmap_anonymous(
@@ -80,8 +87,9 @@ fn alloc_stack() -> Result<usize, LoaderError> {
     }
     .map_err(|e| LoaderError::Mmap(format!("stack alloc: {e}")))?;
 
-    let top = base.as_ptr() as usize + STACK_SIZE;
-    Ok(top & !0xF)
+    let base_addr = base.as_ptr() as usize;
+    let top = base_addr + STACK_SIZE;
+    Ok((base_addr, top & !0xF))
 }
 
 // ---- Trampoline ----
@@ -432,8 +440,10 @@ fn build_stack(
 
 // ---- Entry ----
 
-pub fn execute(entry_point: u64, argv: &[String], binary_path: &str) -> ! {
-    let stack_top = alloc_stack().expect("failed to allocate stack");
+pub fn execute(entry_point: u64, argv: &[String], binary_path: &str, on_stack_ready: impl FnOnce(u64, u64)) -> ! {
+    let (stack_base, stack_top) = alloc_stack().expect("failed to allocate stack");
+    STACK_BASE_ADDR.store(stack_base as u64, std::sync::atomic::Ordering::Release);
+    on_stack_ready(stack_base as u64, STACK_SIZE as u64);
     let trampoline = alloc_trampoline().expect("failed to allocate trampoline");
     let stack_ptr = build_stack(stack_top, argv, binary_path);
 

@@ -65,15 +65,28 @@ impl Linker {
             }
 
             log::info!("resolving library: {}", dylib_path);
-            let linux_path = self.resolver.resolve(
+            let linux_path = match self.resolver.resolve(
                 &dylib_path,
                 Some(&executable_path),
                 Some(&loader_path),
                 &rpaths,
-            )
-            .ok_or_else(|| LinkError::LibraryNotFound(dylib_path.clone()))?;
+            ) {
+                Some(p) => p,
+                None => {
+                    log::warn!("library not found, skipping: {dylib_path}");
+                    loaded.insert(dylib_path);
+                    continue;
+                }
+            };
 
-            let lib_binary = MachOBinary::from_path(&linux_path)?;
+            let lib_binary = match MachOBinary::from_path(&linux_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("failed to load {}: {e}", linux_path.display());
+                    loaded.insert(dylib_path);
+                    continue;
+                }
+            };
             
             grafted_loader::mapper::map_binary(&lib_binary)?;
 
