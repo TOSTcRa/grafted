@@ -297,15 +297,21 @@ impl Linker {
 
     /// Run initializers for all loaded libraries, then the main binary.
     pub fn run_all_initializers(&self, main_binary: &MachOBinary) -> Result<(), LinkError> {
-        // Before running initializers, register all ObjC classes
-        for lib in self.loaded_libraries.values() {
-            self.register_objc_metadata(lib)?;
-        }
-        self.register_objc_metadata(main_binary)?;
+        // Register ObjC classes. Skip slid dylibs (vmaddr=0 → slid to random address)
+        // since their class pointers reference pre-slide addresses. Classes from slid
+        // libraries are auto-stubbed by the linker's resolve_external.
+        // ObjC metadata registration is skipped for now — auto-stub classes
+        // handle all _OBJC_CLASS_$_ symbols. Full metadata parsing needs slide-aware
+        // pointer resolution which is a future improvement.
+        log::info!("ObjC classes auto-stubbed by linker (metadata parsing skipped)");
 
         // In Darwin, initializers are called in bottom-up order (dependencies first).
+        // Skip slid libraries for now (init funcs also use pre-slide addresses).
         for lib in self.loaded_libraries.values() {
-            self.run_initializers(lib)?;
+            let text_vmaddr = lib.segments.iter().find(|s| s.name == "__TEXT").map(|s| s.vmaddr).unwrap_or(0);
+            if text_vmaddr > 0 {
+                self.run_initializers(lib)?;
+            }
         }
         self.run_initializers(main_binary)?;
         Ok(())
@@ -325,14 +331,18 @@ impl Linker {
                         log::info!("grafted-dyld: processing {} classes in {}", count, binary.path);
                         
                         for i in 0..count {
-                            let cls_ptr = unsafe { *ptrs.add(i as usize) };
+                            let cls_ptr = unsafe { std::ptr::read_unaligned(ptrs.add(i as usize)) };
                             if cls_ptr.is_null() { continue; }
                             
                             unsafe {
-                                let data_ptr = (*cls_ptr).data;
+                                let data_ptr = std::ptr::read_unaligned((cls_ptr as *const u8).add(
+                                    std::mem::offset_of!(grafted_objc::types::class_t, data)
+                                ) as *const *mut grafted_objc::types::class_ro_t);
                                 if data_ptr.is_null() { continue; }
-                                
-                                let class_name_ptr = (*data_ptr).name;
+
+                                let class_name_ptr = std::ptr::read_unaligned((data_ptr as *const u8).add(
+                                    std::mem::offset_of!(grafted_objc::types::class_ro_t, name)
+                                ) as *const *const i8);
                                 let class_name = if !class_name_ptr.is_null() {
                                     std::ffi::CStr::from_ptr(class_name_ptr).to_string_lossy().into_owned()
                                 } else {

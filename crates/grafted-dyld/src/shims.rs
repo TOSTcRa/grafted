@@ -821,8 +821,22 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     let mut objc = HashMap::new();
     objc.insert("_objc_msgSend".into(), grafted_objc::objc_msgSend as *const () as u64);
     objc.insert("_objc_getClass".into(), grafted_objc::objc_getClass as *const () as u64);
+    objc.insert("_objc_lookUpClass".into(), grafted_objc::objc_getClass as *const () as u64);
     objc.insert("_sel_registerName".into(), grafted_objc::sel_registerName as *const () as u64);
     objc.insert("_objc_registerClassPair".into(), grafted_objc::objc_registerClassPair as *const () as u64);
+    // ARC: retain/release/autorelease
+    objc.insert("_objc_retain".into(), shim_objc_retain as *const () as u64);
+    objc.insert("_objc_release".into(), shim_objc_release as *const () as u64);
+    objc.insert("_objc_retainAutorelease".into(), shim_objc_retain as *const () as u64);
+    objc.insert("_objc_autoreleaseReturnValue".into(), shim_objc_retain as *const () as u64);
+    objc.insert("_objc_retainAutoreleasedReturnValue".into(), shim_objc_retain as *const () as u64);
+    objc.insert("_objc_allocWithZone".into(), shim_objc_alloc_with_zone as *const () as u64);
+    objc.insert("_objc_opt_self".into(), shim_objc_retain as *const () as u64); // returns self
+    objc.insert("_objc_msgSendSuper2".into(), shim_objc_msg_send_super2 as *const () as u64);
+    objc.insert("_objc_msgSend_stret".into(), grafted_objc::objc_msgSend as *const () as u64);
+    objc.insert("_objc_getAssociatedObject".into(), shim_noop_ret0 as *const () as u64);
+    objc.insert("_objc_setAssociatedObject".into(), shim_noop as *const () as u64);
+    objc.insert("_objc_setHook_getClass".into(), shim_noop as *const () as u64);
     // ObjC runtime globals
     objc.insert("__objc_empty_cache".into(),
         unsafe { &raw mut grafted_frameworks::registry::__objc_empty_cache } as u64);
@@ -916,6 +930,23 @@ unsafe extern "C" fn shim_snprintf_vararg_fix() {
 unsafe extern "C" fn shim_noop() {}
 unsafe extern "C" fn shim_noop_true() -> i32 { 1 }
 unsafe extern "C" fn shim_noop_ret0() -> i64 { 0 }
+
+// ObjC ARC stubs
+unsafe extern "C" fn shim_objc_retain(obj: *mut u8) -> *mut u8 { obj }
+unsafe extern "C" fn shim_objc_release(_obj: *mut u8) {}
+unsafe extern "C" fn shim_objc_alloc_with_zone(cls: *mut u8, _zone: *mut u8) -> *mut u8 {
+    // Simplified alloc: calloc an instance
+    let sel = grafted_objc::sel_registerName(b"alloc\0".as_ptr() as *const i8);
+    grafted_objc::objc_msgSend(cls as *mut _, sel) as *mut u8
+}
+unsafe extern "C" fn shim_objc_msg_send_super2(
+    super_: *mut u8, sel: *mut u8,
+) -> *mut u8 {
+    // Simplified: just dispatch on the receiver (super_->receiver)
+    if super_.is_null() { return std::ptr::null_mut(); }
+    let receiver = unsafe { *(super_ as *const *mut u8) };
+    grafted_objc::objc_msgSend(receiver as *mut _, sel as *mut _) as *mut u8
+}
 unsafe extern "C" fn shim_issetugid() -> i32 { 0 } // not setuid
 
 // kqueue/kevent — BSD-only, emulate with epoll
