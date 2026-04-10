@@ -66,7 +66,9 @@ fn darwin_unix_to_linux(darwin_nr: u32) -> i64 {
         74 => 10,   // mprotect → mprotect
 
         // Signals
+        46 => 13,   // sigaction → rt_sigaction
         48 => 62,   // kill → kill
+        13 => 13,   // fchdir → fchdir (also catches unprefixed rt_sigaction)
 
         // Directory
         59 => 84,   // execve → ... (complex, not 1:1)

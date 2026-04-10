@@ -18,13 +18,28 @@ pub fn set_selector_ptr(ptr: *mut u8) {
 }
 
 /// Set process info globals (_NSGetArgc/Argv/Environ/ExecutablePath)
-pub fn set_process_info(binary_path: &str) {
+/// Set process info globals: executable path + argc/argv for _NSGetArgc/v
+pub fn set_process_info(binary_path: &str, argv: &[String]) {
     unsafe {
         let path_bytes = binary_path.as_bytes();
         let ep = &raw mut EXECUTABLE_PATH;
         let len = path_bytes.len().min(1023);
         std::ptr::copy_nonoverlapping(path_bytes.as_ptr(), (*ep).as_mut_ptr(), len);
         (*ep)[len] = 0;
+
+        // Build a C-style argv array that persists (leaked intentionally)
+        let mut c_argv: Vec<*const i8> = Vec::with_capacity(argv.len() + 1);
+        for arg in argv {
+            let cstr = std::ffi::CString::new(arg.as_str()).unwrap_or_default();
+            c_argv.push(cstr.into_raw() as *const i8);
+        }
+        c_argv.push(std::ptr::null()); // NULL terminator
+
+        let argv_ptr = c_argv.as_ptr();
+        std::mem::forget(c_argv); // leak — must persist for process lifetime
+
+        NXARGC = argv.len() as i32;
+        NXARGV = argv_ptr;
     }
 }
 
@@ -628,7 +643,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_dlsym", libc::dlsym);
     reg_libc!("_dlerror", libc::dlerror);
 
-    reg_libc!("_sigaction", libc::sigaction);
+    reg!("_sigaction", shim_sigaction);
     reg_libc!("_signal", libc::signal);
     reg_libc!("_sigprocmask", libc::sigprocmask);
     reg_libc!("_sigemptyset", libc::sigemptyset);
@@ -1279,26 +1294,38 @@ unsafe extern "C" fn shim_mmap(addr: u64, len: usize, prot: i32, flags: i32, fd:
 
     // Guard page (PROT_NONE + MAP_FIXED + MAP_ANON) — fake success
     if prot == 0 && linux_flags & 0x30 == 0x30 {
+        selector_allow();
+        unsafe { libc::write(2, b"GUARD_FAKE\n".as_ptr() as *const _, 11) };
+        selector_block();
         return if addr != 0 { addr } else { 0x7fff_dead_0000 };
     }
     if prot == 0 {
+        selector_allow();
+        unsafe { libc::write(2, b"MMAP_P0_OTHER\n".as_ptr() as *const _, 14) };
+        selector_block();
     }
 
-    // If MAP_FIXED with unaligned address, page-align it (round down)
+    // For MAP_FIXED with unaligned address: align down but return the ORIGINAL
+    // requested address to the caller (Rust checks for exact match)
     let actual_addr = if linux_flags & 0x10 != 0 && addr & 0xFFF != 0 {
         addr & !0xFFF
     } else {
         addr
     };
     let actual_len = if actual_addr != addr {
-        len + (addr - actual_addr) as usize // extend to cover original range
+        len + (addr - actual_addr) as usize
     } else {
         len
     };
+    let return_original = linux_flags & 0x10 != 0 && addr != actual_addr;
     selector_allow();
     let ret = unsafe { libc::mmap(actual_addr as *mut _, actual_len, prot, linux_flags, fd, offset) };
     selector_block();
-    ret as u64
+    if ret == libc::MAP_FAILED {
+        return ret as u64;
+    }
+    // If we aligned down, return the original address the caller expected
+    if return_original { addr } else { ret as u64 }
 }
 
 unsafe extern "C" fn shim_munmap(addr: u64, len: usize) -> i32 {
@@ -1310,10 +1337,85 @@ unsafe extern "C" fn shim_munmap(addr: u64, len: usize) -> i32 {
 
 unsafe extern "C" fn shim_mprotect(addr: u64, len: usize, prot: i32) -> i32 {
     // PROT_NONE = guard page request — always fake success.
-    // Both main thread and spawned threads use this for stack overflow detection.
     if prot == 0 { return 0; }
     selector_allow();
     let ret = unsafe { libc::mprotect(addr as *mut _, len, prot) };
+    selector_block();
+    ret
+}
+
+// Darwin sigaction struct translation
+// Darwin: { handler(8), sa_mask(4), sa_flags(4) } = 16 bytes
+// Linux:  { handler(8), sa_flags(8), sa_restorer(8), sa_mask(128) } = 152 bytes
+#[repr(C)]
+struct DarwinSigaction {
+    sa_handler: u64,
+    sa_mask: u32,
+    sa_flags: i32,
+}
+
+// Darwin SA_* flags that differ from Linux
+const DARWIN_SA_SIGINFO: i32 = 0x0040;
+const LINUX_SA_SIGINFO: i32 = 4;
+const DARWIN_SA_RESTART: i32 = 0x0002;
+const LINUX_SA_RESTART: i32 = 0x10000000;
+const DARWIN_SA_NOCLDSTOP: i32 = 0x0008;
+const LINUX_SA_NOCLDSTOP: i32 = 1;
+const DARWIN_SA_NODEFER: i32 = 0x0010;
+const LINUX_SA_NODEFER: i32 = 0x40000000;
+const DARWIN_SA_ONSTACK: i32 = 0x0001;
+const LINUX_SA_ONSTACK: i32 = 0x08000000;
+const DARWIN_SA_RESETHAND: i32 = 0x0004;
+const LINUX_SA_RESETHAND: i32 = 0x80000000_u32 as i32;
+
+fn translate_sa_flags(darwin: i32) -> u64 {
+    let mut linux: u64 = 0;
+    if darwin & DARWIN_SA_SIGINFO != 0 { linux |= LINUX_SA_SIGINFO as u64; }
+    if darwin & DARWIN_SA_RESTART != 0 { linux |= LINUX_SA_RESTART as u64; }
+    if darwin & DARWIN_SA_NOCLDSTOP != 0 { linux |= LINUX_SA_NOCLDSTOP as u64; }
+    if darwin & DARWIN_SA_NODEFER != 0 { linux |= LINUX_SA_NODEFER as u64; }
+    if darwin & DARWIN_SA_ONSTACK != 0 { linux |= LINUX_SA_ONSTACK as u64; }
+    if darwin & DARWIN_SA_RESETHAND != 0 { linux |= LINUX_SA_RESETHAND as u64; }
+    linux
+}
+
+unsafe extern "C" fn shim_sigaction(sig: i32, act: *const DarwinSigaction, oldact: *mut DarwinSigaction) -> i32 {
+    selector_allow();
+    let mut linux_act: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut linux_oldact: libc::sigaction = unsafe { std::mem::zeroed() };
+
+    let act_ptr = if !act.is_null() {
+        let da = unsafe { &*act };
+        linux_act.sa_sigaction = da.sa_handler as usize;
+        linux_act.sa_flags = translate_sa_flags(da.sa_flags) as i32;
+        // Convert Darwin 32-bit mask to Linux 128-byte mask
+        unsafe { libc::sigemptyset(&mut linux_act.sa_mask) };
+        for bit in 0..32 {
+            if da.sa_mask & (1 << bit) != 0 {
+                unsafe { libc::sigaddset(&mut linux_act.sa_mask, bit + 1) };
+            }
+        }
+        &linux_act as *const _
+    } else {
+        std::ptr::null()
+    };
+
+    let oldact_ptr = if !oldact.is_null() {
+        &mut linux_oldact as *mut _
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let ret = unsafe { libc::sigaction(sig, act_ptr, oldact_ptr) };
+
+    if ret == 0 && !oldact.is_null() {
+        unsafe {
+            (*oldact).sa_handler = linux_oldact.sa_sigaction as u64;
+            (*oldact).sa_flags = linux_oldact.sa_flags; // approximate
+            (*oldact).sa_mask = 0; // simplified
+        }
+    }
+
     selector_block();
     ret
 }
@@ -1381,26 +1483,24 @@ const TLV_BLOCK_SIZE: usize = 1024 * 1024; // 1MB — generous for Rust TLS
 unsafe extern "C" fn shim_tlv_bootstrap(descriptor: *mut u64) -> *mut u8 {
     let offset = unsafe { *descriptor.add(2) } as usize;
 
-    // Ensure the shared key is created (once)
+    // Must be ALLOW for all libc calls (Once uses futex, pthread uses futex)
+    selector_allow();
+
     TLV_KEY_INIT.call_once(|| {
-        selector_allow();
         let mut key: libc::pthread_key_t = 0;
         unsafe { libc::pthread_key_create(&mut key, Some(libc::free)) };
         TLV_KEY.store(key as u32, Ordering::Release);
-        selector_block();
     });
 
     let key = TLV_KEY.load(Ordering::Acquire) as libc::pthread_key_t;
-
-    // Update the descriptor's key field so the binary can use it directly later
     unsafe { *descriptor.add(1) = key as u64 };
 
-    // Get or allocate the TLS block for this thread
-    selector_allow();
     let mut block = unsafe { libc::pthread_getspecific(key) } as *mut u8;
     if block.is_null() {
         block = unsafe { libc::calloc(1, TLV_BLOCK_SIZE) } as *mut u8;
-        unsafe { libc::pthread_setspecific(key, block as *const libc::c_void) };
+        if !block.is_null() {
+            unsafe { libc::pthread_setspecific(key, block as *const libc::c_void) };
+        }
     }
     selector_block();
 

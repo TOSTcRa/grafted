@@ -58,7 +58,7 @@ fn main() -> ExitCode {
     };
 
     grafted_dyld::shims::set_selector_ptr(grafted_loader::executor::selector_ptr());
-    grafted_dyld::shims::set_process_info(&args.binary.display().to_string());
+    // set_process_info is called below after argv is built
 
 
     let mut linker = grafted_dyld::Linker::new();
@@ -99,6 +99,7 @@ fn main() -> ExitCode {
 
     let mut argv = vec![args.binary.display().to_string()];
     argv.extend(args.args.iter().cloned());
+    grafted_dyld::shims::set_process_info(&argv[0], &argv);
     grafted_loader::executor::execute(entry_point, &argv, &argv[0], |base, size| {
         grafted_dyld::shims::set_stack_bounds(base, size);
     })

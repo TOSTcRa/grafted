@@ -294,6 +294,7 @@ unsafe extern "C" fn sigsys_handler(
     let gregs = &mut uctx.uc_mcontext.gregs;
 
     let raw_syscall = gregs[libc::REG_RAX as usize] as u64;
+
     let args = [
         gregs[libc::REG_RDI as usize] as u64,
         gregs[libc::REG_RSI as usize] as u64,
@@ -325,12 +326,15 @@ unsafe extern "C" fn sigsys_handler(
 
 fn enable_sud() -> Result<(), LoaderError> {
     let sel_ptr = selector_ptr();
+    // Set allowed range to [0, 0x100000000) — our process code + libc.
+    // Darwin binary code at 0x100000000+ will check selector.
+    // With selector=BLOCK, Darwin syscalls trigger SIGSYS.
     let ret = unsafe {
         libc::prctl(
             PR_SET_SYSCALL_USER_DISPATCH,
             PR_SYS_DISPATCH_ON,
-            0_usize,
-            0_usize,
+            0x1000_usize,        // offset: skip NULL page
+            0xFFFF_F000_usize,   // len: covers 0x1000..0xFFFF_FFFF (4GB)
             sel_ptr as usize,
         )
     };
