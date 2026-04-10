@@ -802,11 +802,18 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg!("__setjmp", _setjmp);
     reg!("__longjmp", _longjmp);
 
+    // C++ new/delete (needed by Swift apps that import from "self")
+    reg_libc!("__Znwm", libc::malloc);     // operator new(size_t)
+    reg_libc!("__Znam", libc::malloc);     // operator new[](size_t)
+    reg_libc!("__ZdlPv", libc::free);      // operator delete(void*)
+    reg_libc!("__ZdaPv", libc::free);      // operator delete[](void*)
+
     for name in [
         "/usr/lib/libSystem.B.dylib",
         "/usr/lib/libSystem.dylib",
         "libSystem.B.dylib",
         "libSystem.dylib",
+        "self", // Go/Swift binaries import from "self"
     ] {
         registry.insert(name.into(), s.clone());
     }
@@ -815,6 +822,12 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     objc.insert("_objc_msgSend".into(), grafted_objc::objc_msgSend as *const () as u64);
     objc.insert("_objc_getClass".into(), grafted_objc::objc_getClass as *const () as u64);
     objc.insert("_sel_registerName".into(), grafted_objc::sel_registerName as *const () as u64);
+    objc.insert("_objc_registerClassPair".into(), grafted_objc::objc_registerClassPair as *const () as u64);
+    // ObjC runtime globals
+    objc.insert("__objc_empty_cache".into(),
+        unsafe { &raw mut grafted_frameworks::registry::__objc_empty_cache } as u64);
+    objc.insert("__objc_empty_vtable".into(),
+        unsafe { &raw mut grafted_frameworks::registry::__objc_empty_vtable } as u64);
     for name in ["/usr/lib/libobjc.A.dylib", "libobjc.A.dylib", "libobjc.dylib"] {
         registry.insert(name.into(), objc.clone());
     }

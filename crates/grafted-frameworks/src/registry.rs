@@ -305,6 +305,28 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     sym!(s, "_swift_bridgeObjectRetain", swift_noop_ptr);
     sym!(s, "_swift_unknownObjectRetain", swift_noop_ptr);
     sym!(s, "_swift_unknownObjectRelease", swift_noop);
+    sym!(s, "_swift_deletedMethodError", swift_deleted_method);
+    sym!(s, "_swift_getTypeByMangledNameInContext", swift_noop_ptr);
+    sym!(s, "_swift_getTypeByMangledNameInContextInMetadataState", swift_noop_ptr);
+    sym!(s, "_swift_getExistentialTypeMetadata", swift_noop_ptr);
+    sym!(s, "_swift_getGenericMetadata", swift_noop_ptr);
+    sym!(s, "_swift_getObjCClassMetadata", swift_noop_ptr);
+    sym!(s, "_swift_getWitnessTable", swift_noop_ptr);
+    sym!(s, "_swift_getAssociatedTypeWitness", swift_noop_ptr);
+    sym!(s, "_swift_checkMetadataState", swift_check_metadata);
+    sym!(s, "_swift_getFunctionTypeMetadata", swift_noop_ptr);
+    sym!(s, "_swift_getTupleTypeMetadata", swift_noop_ptr);
+    sym!(s, "_swift_getMetatypeMetadata", swift_noop_ptr);
+    sym!(s, "_swift_allocBox", swift_alloc_box);
+    sym!(s, "_swift_projectBox", swift_noop_ptr);
+    sym!(s, "_swift_deallocBox", swift_noop);
+    sym!(s, "_swift_makeBoxUnique", swift_noop_ptr);
+    sym!(s, "_swift_errorRetain", swift_noop_ptr);
+    sym!(s, "_swift_errorRelease", swift_noop);
+    sym!(s, "_swift_willThrow", swift_noop);
+    sym!(s, "_swift_isUniquelyReferenced_nonNull_native", swift_noop_true);
+    sym!(s, "_swift_isUniquelyReferenced_native", swift_noop_true);
+    sym!(s, "_swift_stdlib_reportFatalError", swift_deleted_method);
     s
 }
 
@@ -315,6 +337,11 @@ fn libcxx_symbols() -> HashMap<String, u64> {
     sym!(s, "___cxa_guard_acquire", cxa_guard_acquire);
     sym!(s, "___cxa_guard_release", swift_noop);
     sym!(s, "___cxa_guard_abort", swift_noop);
+    // C++ operator new/delete
+    sym!(s, "__Znwm", cxx_new);       // operator new(size_t)
+    sym!(s, "__ZdlPv", cxx_delete);    // operator delete(void*)
+    sym!(s, "__ZdaPv", cxx_delete);    // operator delete[](void*)
+    sym!(s, "__Znam", cxx_new);        // operator new[](size_t)
     s
 }
 
@@ -338,8 +365,32 @@ unsafe extern "C" fn swift_once(predicate: *mut isize, fn_ptr: unsafe extern "C"
 unsafe extern "C" fn swift_noop() {}
 unsafe extern "C" fn swift_noop_ptr(p: *mut u8) -> *mut u8 { p }
 unsafe extern "C" fn swift_noop_false() -> i32 { 0 }
+unsafe extern "C" fn swift_noop_true() -> i32 { 1 }
 unsafe extern "C" fn noop_ptr() -> *mut u8 { std::ptr::null_mut() }
+unsafe extern "C" fn swift_deleted_method() {
+    let msg = b"grafted: swift_deletedMethodError\n";
+    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
+    unsafe { libc::_exit(1) };
+}
+unsafe extern "C" fn swift_check_metadata(_req: usize, metadata: *mut u8) -> *mut u8 { metadata }
+unsafe extern "C" fn swift_alloc_box(_type: *mut u8) -> *mut u8 {
+    unsafe { libc::calloc(1, 64) as *mut u8 }
+}
+unsafe extern "C" fn cxx_new(size: usize) -> *mut u8 {
+    unsafe { libc::malloc(size) as *mut u8 }
+}
+unsafe extern "C" fn cxx_delete(ptr: *mut u8) {
+    if !ptr.is_null() { unsafe { libc::free(ptr as *mut _) }; }
+}
 unsafe extern "C" fn cxa_guard_acquire(guard: *mut i64) -> i32 {
     if guard.is_null() { return 0; }
     if unsafe { *guard } == 0 { unsafe { *guard = 1 }; 1 } else { 0 }
 }
+
+// ObjC runtime globals
+#[repr(C)]
+pub struct ObjcCache { _mask: u32, _occupied: u32, _buckets: [*mut u8; 1] }
+#[unsafe(no_mangle)]
+pub static mut __objc_empty_cache: ObjcCache = ObjcCache { _mask: 0, _occupied: 0, _buckets: [std::ptr::null_mut()] };
+#[unsafe(no_mangle)]
+pub static mut __objc_empty_vtable: [*mut u8; 1] = [std::ptr::null_mut()];

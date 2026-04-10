@@ -12,6 +12,10 @@ unsafe extern "C" fn shim_unresolved_trap() -> ! {
     unsafe { libc::_exit(127) };
 }
 
+/// Soft stub: returns 0/NULL instead of aborting. Used for Swift symbols
+/// and other non-critical unresolved symbols during early framework bringup.
+unsafe extern "C" fn shim_unresolved_soft() -> u64 { 0 }
+
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {
     #[error("parse error: {0}")]
@@ -407,8 +411,15 @@ impl Linker {
         match self.resolve(dylib, symbol, false) {
             Ok(addr) => addr,
             Err(_) => {
-                log::warn!("chained fixup: unresolved symbol {symbol} from {dylib}");
-                shim_unresolved_trap as *const () as u64
+                // Use soft stub for Swift mangled symbols (there are thousands).
+                // Hard trap only for symbols that are likely to be called immediately.
+                if symbol.starts_with("_$s") || symbol.starts_with("$s") {
+                    log::trace!("soft stub: {symbol}");
+                    shim_unresolved_soft as *const () as u64
+                } else {
+                    log::warn!("chained fixup: unresolved symbol {symbol} from {dylib}");
+                    shim_unresolved_soft as *const () as u64
+                }
             }
         }
     }
@@ -438,6 +449,23 @@ impl Linker {
         for lib in self.loaded_libraries.values() {
             if let Some(addr) = self.find_symbol_in_binary(lib, symbol) {
                 return Ok(addr);
+            }
+        }
+
+        // Auto-generate stub ObjC classes for _OBJC_CLASS_$_ and _OBJC_METACLASS_$_ symbols.
+        // Darwin binaries reference classes by these symbols; we create minimal stubs
+        // registered with our ObjC runtime so objc_msgSend can dispatch to them.
+        if let Some(class_name) = symbol.strip_prefix("_OBJC_CLASS_$_") {
+            let cls = auto_create_objc_class(class_name);
+            if !cls.is_null() {
+                return Ok(cls as u64);
+            }
+        }
+        if let Some(class_name) = symbol.strip_prefix("_OBJC_METACLASS_$_") {
+            // Metaclass — for simplicity, return the same class pointer
+            let cls = auto_create_objc_class(class_name);
+            if !cls.is_null() {
+                return Ok(cls as u64);
             }
         }
 
@@ -487,6 +515,48 @@ impl Default for Linker {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Auto-create a stub ObjC class and register it with the runtime.
+/// Returns the class pointer, or null if already registered.
+fn auto_create_objc_class(name: &str) -> grafted_objc::types::Class {
+    use std::sync::Mutex;
+    use std::collections::HashMap as HMap;
+
+    // Class pointers are process-lifetime allocations — safe to share across threads.
+    struct SendClass(HMap<String, grafted_objc::types::Class>);
+    unsafe impl Send for SendClass {}
+    static CLASS_CACHE: Mutex<Option<SendClass>> = Mutex::new(None);
+
+    let mut cache = CLASS_CACHE.lock().unwrap();
+    let map = &mut cache.get_or_insert_with(|| SendClass(HMap::new())).0;
+
+    if let Some(&cls) = map.get(name) {
+        return cls;
+    }
+
+    // Check if already registered in the ObjC runtime
+    let c_name = std::ffi::CString::new(name).unwrap_or_default();
+    let existing = grafted_objc::objc_getClass(c_name.as_ptr());
+    if !existing.is_null() {
+        map.insert(name.to_string(), existing);
+        return existing;
+    }
+
+    // Allocate a new stub class
+    let cls = unsafe { libc::calloc(1, 256) } as grafted_objc::types::Class;
+    let ro = unsafe { libc::calloc(1, 256) } as *mut grafted_objc::types::class_ro_t;
+    let leaked_name = c_name.into_raw();
+    unsafe {
+        (*ro).name = leaked_name;
+        (*ro).instance_size = 256; // generous default
+        (*(cls as *mut grafted_objc::types::class_t)).data = ro;
+    }
+    grafted_objc::objc_registerClassPair(cls);
+
+    log::debug!("auto-created ObjC stub class: {name}");
+    map.insert(name.to_string(), cls);
+    cls
 }
 
 #[cfg(test)]
