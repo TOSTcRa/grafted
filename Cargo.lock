@@ -184,6 +184,7 @@ name = "grafted-dyld"
 version = "0.1.0"
 dependencies = [
  "goblin",
+ "grafted-frameworks",
  "grafted-loader",
  "grafted-objc",
  "libc",

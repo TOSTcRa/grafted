@@ -32,8 +32,15 @@ pub struct Linker {
 
 impl Linker {
     pub fn new() -> Self {
+        let mut registry = shims::default_registry();
+
+        // Merge framework symbols (CoreFoundation, CoreGraphics, AppKit, Swift, etc.)
+        for (path, symbols) in grafted_frameworks::registry::framework_registry() {
+            registry.entry(path).or_default().extend(symbols);
+        }
+
         Self {
-            registry: shims::default_registry(),
+            registry,
             resolver: DylibResolver::default(),
             loaded_libraries: HashMap::new(),
         }
