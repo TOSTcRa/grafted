@@ -569,7 +569,17 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     // mach_* stubs for Rust std
     reg!("_mach_task_self", shim_mach_task_self);
     reg!("_mach_thread_self", shim_mach_thread_self);
-    reg!("_mach_port_deallocate", shim_noop);
+    reg!("_host_self", shim_host_self);
+    reg!("_mach_host_self", shim_host_self);
+    reg!("_mach_port_allocate", shim_mach_port_allocate);
+    reg!("_mach_port_deallocate", shim_mach_port_deallocate);
+    reg!("_mach_port_insert_right", shim_mach_port_insert_right);
+    reg!("_mach_port_mod_refs", shim_mach_port_mod_refs);
+    reg!("_mach_port_type", shim_mach_port_type);
+    reg!("_mach_msg", shim_mach_msg);
+    reg!("_mach_msg_overwrite", shim_mach_msg);
+    reg!("_mach_reply_port", shim_mach_reply_port);
+    reg!("_bootstrap_port", shim_bootstrap_port_addr);
     reg!("_mach_vm_protect", shim_mach_vm_protect);
     reg!("_mach_vm_map", shim_noop); // stub
     reg!("_vm_protect", shim_vm_protect);
@@ -760,6 +770,35 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg!("_mach_absolute_time", shim_mach_absolute_time);
     reg!("_mach_timebase_info", shim_mach_timebase_info);
     reg!("dyld_stub_binder", shim_noop);
+
+    // Go runtime needs
+    reg!("_stat64", shim_stat);
+    reg!("_fstat64", shim_fstat);
+    reg!("_lstat64", shim_lstat);
+    reg_libc!("_fdopendir$INODE64", libc::fdopendir);
+    reg_libc!("_chroot", libc::chroot);
+    reg_libc!("_getpeername", libc::getpeername);
+    reg_libc!("_getsockname", libc::getsockname);
+    reg!("_kevent", shim_kevent);
+    reg!("_kqueue", shim_kqueue);
+    reg_libc!("_mkfifo", libc::mkfifo);
+    reg_libc!("_sendfile", libc::sendfile);
+    reg_libc!("_setrlimit", libc::setrlimit);
+    reg_libc!("_setsid", libc::setsid);
+    reg_libc!("_usleep", libc::usleep);
+    reg_libc!("_wait4", libc::wait4);
+    reg_libc!("_pthread_attr_getstacksize", libc::pthread_attr_getstacksize);
+    reg_libc!("_pthread_attr_setdetachstate", libc::pthread_attr_setdetachstate);
+    reg_libc!("_pthread_cond_init", libc::pthread_cond_init);
+    reg_libc!("_pthread_cond_signal", libc::pthread_cond_signal);
+    reg_libc!("_pthread_cond_wait", libc::pthread_cond_wait);
+    reg_libc!("_pthread_kill", libc::pthread_kill);
+    reg_libc!("_pthread_sigmask", libc::pthread_sigmask);
+    reg!("_pthread_cond_timedwait_relative_np", shim_pthread_cond_timedwait_relative_np);
+    reg!("_issetugid", shim_issetugid);
+    reg!("_ptrace", shim_noop_ret0);
+    reg!("_notify_is_valid_token", shim_noop_ret0);
+    reg!("_xpc_date_create_from_current", shim_noop_ret0);
     reg!("__setjmp", _setjmp);
     reg!("__longjmp", _longjmp);
 
@@ -863,6 +902,66 @@ unsafe extern "C" fn shim_snprintf_vararg_fix() {
 
 unsafe extern "C" fn shim_noop() {}
 unsafe extern "C" fn shim_noop_true() -> i32 { 1 }
+unsafe extern "C" fn shim_noop_ret0() -> i64 { 0 }
+unsafe extern "C" fn shim_issetugid() -> i32 { 0 } // not setuid
+
+// kqueue/kevent — BSD-only, emulate with epoll
+unsafe extern "C" fn shim_kqueue() -> i32 {
+    selector_allow();
+    let fd = unsafe { libc::epoll_create1(0) };
+    selector_block();
+    fd
+}
+
+unsafe extern "C" fn shim_kevent(
+    kq: i32, changelist: *const u8, nchanges: i32,
+    eventlist: *mut u8, nevents: i32, timeout: *const libc::timespec,
+) -> i32 {
+    // Minimal stub: if nevents > 0 and timeout is provided, do a timed wait via epoll
+    if nevents > 0 {
+        let timeout_ms = if timeout.is_null() {
+            -1
+        } else {
+            let ts = unsafe { &*timeout };
+            (ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000) as i32
+        };
+        selector_allow();
+        let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::epoll_wait(kq, &mut ev, 1, timeout_ms) };
+        selector_block();
+        return ret; // 0 = timeout, >0 = events
+    }
+    let _ = (changelist, nchanges, eventlist);
+    0
+}
+
+// Darwin-specific pthread_cond_timedwait with relative timeout
+unsafe extern "C" fn shim_pthread_cond_timedwait_relative_np(
+    cond: *mut libc::pthread_cond_t,
+    mutex: *mut libc::pthread_mutex_t,
+    reltime: *const libc::timespec,
+) -> i32 {
+    if reltime.is_null() {
+        selector_allow();
+        let ret = unsafe { libc::pthread_cond_wait(cond, mutex) };
+        selector_block();
+        return ret;
+    }
+    // Convert relative timeout to absolute for Linux pthread_cond_timedwait
+    let mut abstime: libc::timespec = unsafe { std::mem::zeroed() };
+    selector_allow();
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut abstime) };
+    let rel = unsafe { &*reltime };
+    abstime.tv_sec += rel.tv_sec;
+    abstime.tv_nsec += rel.tv_nsec;
+    if abstime.tv_nsec >= 1_000_000_000 {
+        abstime.tv_sec += 1;
+        abstime.tv_nsec -= 1_000_000_000;
+    }
+    let ret = unsafe { libc::pthread_cond_timedwait(cond, mutex, &abstime) };
+    selector_block();
+    ret
+}
 
 // Darwin's ___maskrune(c, mask) — character classification.
 // Returns mask & runetype[c]. We implement using Linux libc's is* functions.
@@ -1707,8 +1806,70 @@ unsafe extern "C" fn shim_sysctlbyname(
     }
 }
 
-unsafe extern "C" fn shim_mach_task_self() -> u32 { 0x103 }
-unsafe extern "C" fn shim_mach_thread_self() -> u32 { 0x203 }
+unsafe extern "C" fn shim_mach_task_self() -> u32 {
+    crate::mach_ipc::task_self_port()
+}
+unsafe extern "C" fn shim_mach_thread_self() -> u32 {
+    crate::mach_ipc::thread_self_port()
+}
+unsafe extern "C" fn shim_host_self() -> u32 {
+    crate::mach_ipc::host_self_port()
+}
+unsafe extern "C" fn shim_mach_reply_port() -> u32 {
+    crate::mach_ipc::reply_port()
+}
+
+static mut BOOTSTRAP_PORT_VAL: u32 = crate::mach_ipc::SPECIAL_PORT_BOOTSTRAP;
+unsafe extern "C" fn shim_bootstrap_port_addr() -> *mut u32 {
+    unsafe { &raw mut BOOTSTRAP_PORT_VAL }
+}
+
+unsafe extern "C" fn shim_mach_port_allocate(task: u32, right: u32, name: *mut u32) -> i32 {
+    let _ = task;
+    match crate::mach_ipc::port_allocate(right) {
+        Ok(n) => {
+            if !name.is_null() { unsafe { *name = n } };
+            crate::mach_ipc::KERN_SUCCESS
+        }
+        Err(e) => e,
+    }
+}
+
+unsafe extern "C" fn shim_mach_port_deallocate(task: u32, name: u32) -> i32 {
+    let _ = task;
+    crate::mach_ipc::port_deallocate(name)
+}
+
+unsafe extern "C" fn shim_mach_port_insert_right(task: u32, name: u32, poly: u32, poly_type: u32) -> i32 {
+    let _ = task;
+    crate::mach_ipc::port_insert_right(name, poly, poly_type)
+}
+
+unsafe extern "C" fn shim_mach_port_mod_refs(task: u32, name: u32, right: u32, delta: i32) -> i32 {
+    let _ = task;
+    crate::mach_ipc::port_mod_refs(name, right, delta)
+}
+
+unsafe extern "C" fn shim_mach_port_type(task: u32, name: u32, ptype: *mut u32) -> i32 {
+    let _ = task;
+    let (ret, t) = crate::mach_ipc::port_type(name);
+    if !ptype.is_null() { unsafe { *ptype = t } };
+    ret
+}
+
+unsafe extern "C" fn shim_mach_msg(
+    msg: *mut crate::mach_ipc::MachMsgHeader,
+    option: i32,
+    send_size: u32,
+    rcv_size: u32,
+    rcv_name: u32,
+    timeout: u32,
+    notify: u32,
+) -> i32 {
+    log::trace!("mach_msg: option={:#x} send={} rcv={} rcv_name={:#x}",
+        option, send_size, rcv_size, rcv_name);
+    unsafe { crate::mach_ipc::mach_msg(msg, option, send_size, rcv_size, rcv_name, timeout, notify) }
+}
 
 // mach_vm_protect(task, addr, size, set_max, prot) → kern_return_t
 // Translate Darwin VM_PROT to Linux PROT and call mprotect

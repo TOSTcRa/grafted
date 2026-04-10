@@ -59,6 +59,11 @@ fn main() -> ExitCode {
 
     // Per-thread selectors are now managed automatically by executor + shims.
 
+    // Tell executor where the binary's __TEXT is mapped (affects SUD range selection)
+    if let Some(text_seg) = binary.segments.iter().find(|s| s.name == "__TEXT") {
+        grafted_loader::executor::set_darwin_text_base(text_seg.vmaddr);
+    }
+
     // Set up TLV init image from __thread_data section so thread-locals get
     // correct initial values (not just zeros).
     if let Some((data_addr, data_size, total_size)) = binary.tlv_init_image() {
@@ -100,16 +105,29 @@ fn main() -> ExitCode {
             }
         }
 
+        // Resolve __nl_symbol_ptr entries for binaries that DON'T use chained fixups
+        // (e.g., Go binaries). Don't overwrite entries already resolved by apply_fixups.
+        if binary.chained_fixups.is_none() {
+            match linker.bind_nl_symbol_ptrs(&binary) {
+                Ok(n) if n > 0 => log::info!("resolved {n} nl_symbol_ptr entries"),
+                Err(e) => log::warn!("nl_symbol_ptr binding: {e}"),
+                _ => {}
+            }
+        }
+
         if let Err(e) = linker.run_all_initializers(&binary) {
             eprintln!("grafted: failed to run initializers: {e}");
             return ExitCode::FAILURE;
         }
     }
 
+    // Patch Go runtime.settls if this is a Go binary (sets GS base for TLS)
+    grafted_loader::executor::patch_go_settls(&binary);
+
     let mut argv = vec![args.binary.display().to_string()];
     argv.extend(args.args.iter().cloned());
     grafted_dyld::shims::set_process_info(&argv[0], &argv);
-    grafted_loader::executor::execute(entry_point, &argv, &argv[0], |base, size| {
+    grafted_loader::executor::execute(entry_point, &argv, &argv[0], binary.entry_is_offset, |base, size| {
         grafted_dyld::shims::set_stack_bounds(base, size);
     })
 }

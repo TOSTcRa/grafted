@@ -41,6 +41,11 @@ thread_local! {
 }
 
 static STACK_BASE_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DARWIN_TEXT_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_darwin_text_base(addr: u64) {
+    DARWIN_TEXT_BASE.store(addr, std::sync::atomic::Ordering::Release);
+}
 
 pub fn stack_base() -> u64 {
     STACK_BASE_ADDR.load(std::sync::atomic::Ordering::Acquire)
@@ -95,12 +100,18 @@ pub fn setup_thread_sud(sel_ptr: *mut u8) {
     let tramp = alloc_trampoline_for(sel_ptr).expect("trampoline alloc");
     THREAD_SELECTOR.with(|c| c.set(sel_ptr));
     THREAD_TRAMPOLINE.with(|c| c.set(tramp));
+    let text_base = DARWIN_TEXT_BASE.load(std::sync::atomic::Ordering::Acquire);
+    let (sud_off, sud_len) = if text_base > 0 && text_base < 0x1_0000_0000 {
+        (0_usize, 0_usize)
+    } else {
+        (0x1000_usize, 0xFFFF_F000_usize)
+    };
     unsafe {
         libc::prctl(
             PR_SET_SYSCALL_USER_DISPATCH,
             PR_SYS_DISPATCH_ON,
-            0x1000_usize,
-            0xFFFF_F000_usize,
+            sud_off,
+            sud_len,
             sel_ptr as usize,
         );
         *sel_ptr = SYSCALL_DISPATCH_FILTER_BLOCK;
@@ -366,15 +377,20 @@ unsafe extern "C" fn sigsys_handler(
 
 fn enable_sud() -> Result<(), LoaderError> {
     let sel_ptr = selector_ptr();
-    // Set allowed range to [0, 0x100000000) — our process code + libc.
-    // Darwin binary code at 0x100000000+ will check selector.
-    // With selector=BLOCK, Darwin syscalls trigger SIGSYS.
+    // Dynamic range: Go binaries mapped at <4GB need empty range.
+    // Rust binaries at >4GB use the standard range (our code + libc exempt).
+    let text_base = DARWIN_TEXT_BASE.load(std::sync::atomic::Ordering::Acquire);
+    let (sud_off, sud_len) = if text_base > 0 && text_base < 0x1_0000_0000 {
+        (0_usize, 0_usize)
+    } else {
+        (0x1000_usize, 0xFFFF_F000_usize)
+    };
     let ret = unsafe {
         libc::prctl(
             PR_SET_SYSCALL_USER_DISPATCH,
             PR_SYS_DISPATCH_ON,
-            0x1000_usize,        // offset: skip NULL page
-            0xFFFF_F000_usize,   // len: covers 0x1000..0xFFFF_FFFF (4GB)
+            sud_off,
+            sud_len,
             sel_ptr as usize,
         )
     };
@@ -442,6 +458,37 @@ fn install_sigsys_handler() -> Result<(), LoaderError> {
         libc::sigaction(libc::SIGSEGV, &sa2, std::ptr::null_mut());
     }
     Ok(())
+}
+
+// ---- Go runtime patching ----
+
+/// Patch Go's `runtime.settls` to call arch_prctl(ARCH_SET_GS) on Linux.
+pub fn patch_go_settls(binary: &crate::macho::MachOBinary) {
+    use goblin::mach::MachO;
+    let Ok(macho) = MachO::parse(&binary.data, 0) else { return };
+    let mut settls_addr: Option<u64> = None;
+    for sym in macho.symbols() {
+        if let Ok((name, nlist)) = sym {
+            if (name == "_runtime.settls.abi0" || name == "_runtime.settls") && nlist.n_value != 0 {
+                settls_addr = Some(nlist.n_value);
+                break;
+            }
+        }
+    }
+    let Some(addr) = settls_addr else { return };
+    log::info!("patching Go runtime.settls at {addr:#x}");
+    // lea rsi,[rdi-0x30]; mov edi,0x1001; mov eax,158; syscall; ret
+    let code: [u8; 17] = [
+        0x48, 0x8d, 0x77, 0xd0, 0xbf, 0x01, 0x10, 0x00, 0x00,
+        0xb8, 0x9e, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc3,
+    ];
+    let page = (addr & !0xFFF) as *mut libc::c_void;
+    unsafe {
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC);
+        std::ptr::copy_nonoverlapping(code.as_ptr(), addr as *mut u8, code.len());
+        libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+    }
+    log::info!("Go runtime.settls patched — arch_prctl(ARCH_SET_GS)");
 }
 
 // ---- Stack layout for LC_MAIN ----
@@ -517,7 +564,7 @@ fn build_stack(
 
 // ---- Entry ----
 
-pub fn execute(entry_point: u64, argv: &[String], binary_path: &str, on_stack_ready: impl FnOnce(u64, u64)) -> ! {
+pub fn execute(entry_point: u64, argv: &[String], binary_path: &str, is_lc_main: bool, on_stack_ready: impl FnOnce(u64, u64)) -> ! {
     let (stack_base, stack_top) = alloc_stack().expect("failed to allocate stack");
     STACK_BASE_ADDR.store(stack_base as u64, std::sync::atomic::Ordering::Release);
     on_stack_ready(stack_base as u64, STACK_SIZE as u64);
@@ -557,52 +604,60 @@ pub fn execute(entry_point: u64, argv: &[String], binary_path: &str, on_stack_re
     // We need to pass argc, argv, envp, apple to the entry point in registers.
     // AND we need to put a return address on the stack that calls exit.
     
-    // Exit trampoline: use Linux exit_group directly (works regardless of SUD selector state).
-    // mov edi, eax (preserve main's return value); mov eax, 231 (exit_group); syscall
-    let exit_trampoline: [u8; 12] = [0x89, 0xc7, 0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xcc, 0xcc, 0xcc];
-    let exit_trampoline_addr = unsafe {
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            4096,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        std::ptr::copy_nonoverlapping(exit_trampoline.as_ptr(), ptr as *mut u8, exit_trampoline.len());
-        ptr as u64
+    // Set up %gs for Darwin TLS (Go uses %gs:0x30 for the g pointer)
+    let gs_page = unsafe {
+        libc::mmap(std::ptr::null_mut(), 4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
     };
-
-    // Adjust stack pointer to "push" the return address
-    let mut final_stack = stack_ptr;
-    unsafe {
-        final_stack -= 8;
-        *(final_stack as *mut u64) = exit_trampoline_addr;
+    if gs_page != libc::MAP_FAILED {
+        unsafe { libc::syscall(libc::SYS_arch_prctl, 0x1001i32 /*ARCH_SET_GS*/, gs_page) };
     }
-    
-    unsafe {
-        asm!(
-            "mov byte ptr [r10], {block}",
-            "mov rsp, r11",
-            "mov rdi, [rsp + 8]",       // rdi = argc (now at rsp+8 because of pushed return addr)
-            "lea rsi, [rsp + 16]",      // rsi = argv
-            "lea rdx, [rsp + 16 + rdi * 8 + 8]", // rdx = envp
-            
-            "mov rcx, rdx",             // rcx = apple (approximate)
 
-            "xor rbp, rbp",
-            "xor rbx, rbx",
-            "xor r12, r12",
-            "xor r13, r13",
-            "xor r14, r14",
-            "xor r15, r15",
-            "jmp rax",
-            in("r10") selector_ptr(),
-            in("r11") final_stack,
-            in("rax") entry_point,
-            block = const SYSCALL_DISPATCH_FILTER_BLOCK,
-            options(noreturn),
-        );
+    let final_stack;
+    if is_lc_main {
+        // LC_MAIN: entry expects argc in rdi, argv in rsi, return addr on stack.
+        let exit_code: [u8; 12] = [0x89, 0xc7, 0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xcc, 0xcc, 0xcc];
+        let exit_addr = unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), 4096,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+            std::ptr::copy_nonoverlapping(exit_code.as_ptr(), p as *mut u8, exit_code.len());
+            p as u64
+        };
+        final_stack = stack_ptr - 8;
+        unsafe { *(final_stack as *mut u64) = exit_addr };
+
+        unsafe {
+            asm!(
+                "mov byte ptr [r10], {block}",
+                "mov rsp, r11",
+                "mov rdi, [rsp + 8]",
+                "lea rsi, [rsp + 16]",
+                "lea rdx, [rsp + 16 + rdi * 8 + 8]",
+                "mov rcx, rdx",
+                "xor rbp, rbp", "xor rbx, rbx",
+                "xor r12, r12", "xor r13, r13", "xor r14, r14", "xor r15, r15",
+                "jmp rax",
+                in("r10") selector_ptr(), in("r11") final_stack, in("rax") entry_point,
+                block = const SYSCALL_DISPATCH_FILTER_BLOCK, options(noreturn),
+            );
+        }
+    } else {
+        // LC_UNIXTHREAD: entry reads argc from [rsp], argv from [rsp+8]. No return addr.
+        final_stack = stack_ptr;
+        unsafe {
+            asm!(
+                "mov byte ptr [r10], {block}",
+                "mov rsp, r11",
+                "mov rdi, [rsp]", "lea rsi, [rsp + 8]",
+                "xor rbp, rbp", "xor rbx, rbx",
+                "xor r12, r12", "xor r13, r13", "xor r14, r14", "xor r15, r15",
+                "jmp rax",
+                in("r10") selector_ptr(), in("r11") final_stack, in("rax") entry_point,
+                block = const SYSCALL_DISPATCH_FILTER_BLOCK, options(noreturn),
+            );
+        }
     }
 }
 

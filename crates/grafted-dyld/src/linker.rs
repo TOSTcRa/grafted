@@ -144,6 +144,110 @@ impl Linker {
         Ok(bound)
     }
 
+    /// Resolve __nl_symbol_ptr entries for binaries that use non-lazy symbol pointers
+    /// (e.g., Go binaries). Uses the indirect symbol table to map each nl_symbol_ptr
+    /// entry to the correct symbol. Go's linker sometimes doesn't set indirectsymoff/
+    /// nindirectsyms in LC_DYSYMTAB but still places the data after the symbol table.
+    pub fn bind_nl_symbol_ptrs(&self, binary: &MachOBinary) -> Result<usize, LinkError> {
+        let macho = MachO::parse(&binary.data, 0)
+            .map_err(|e| LinkError::Parse(e.to_string()))?;
+
+        // Find __nl_symbol_ptr section
+        let mut nl_ptr_addr: u64 = 0;
+        let mut nl_ptr_count: u64 = 0;
+        for seg in &macho.segments {
+            for section_res in seg {
+                if let Ok((section, _)) = section_res {
+                    if section.flags & 0xFF == 0x6 { // S_NON_LAZY_SYMBOL_POINTERS
+                        nl_ptr_addr = section.addr;
+                        nl_ptr_count = section.size / 8;
+                    }
+                }
+            }
+        }
+        if nl_ptr_count == 0 { return Ok(0); }
+
+        // Get symtab/dysymtab info
+        let mut symtab_off = 0u32;
+        let mut nsyms = 0u32;
+        let mut strtab_off = 0u32;
+        let mut indirect_off = 0u32;
+        let mut nindirect = 0u32;
+        for lc in &macho.load_commands {
+            match &lc.command {
+                goblin::mach::load_command::CommandVariant::Symtab(s) => {
+                    symtab_off = s.symoff; nsyms = s.nsyms; strtab_off = s.stroff;
+                }
+                goblin::mach::load_command::CommandVariant::Dysymtab(d) => {
+                    indirect_off = d.indirectsymoff; nindirect = d.nindirectsyms;
+                }
+                _ => {}
+            }
+        }
+
+        // Find the indirect table: prefer the header, fall back to after-symtab
+        let indirect_data_off = if indirect_off > 0 && nindirect > 0 {
+            indirect_off as usize
+        } else {
+            // Go's linker places it right after the symbol table
+            (symtab_off as usize) + (nsyms as usize) * 16
+        };
+
+        // For __symbol_stub1, indirect entries start at index 0.
+        // For __nl_symbol_ptr, indirect entries start at nl_reserved1.
+        // The stub entries (0..nl_reserved1) and nl_ptr entries (nl_reserved1..)
+        // use the SAME indirect table. stub[k] uses nl_ptr[k], and
+        // indirect[k] gives the symbol for stub[k].
+        // So nl_ptr[k] should contain the resolved address for symbol at indirect[k].
+
+        let symbols: Vec<_> = macho.symbols().collect();
+        let mut bound = 0;
+
+        log::debug!("bind_nl_symbol_ptrs: {} entries, indirect at file offset {:#x}, stub_start_idx=0",
+            nl_ptr_count, indirect_data_off);
+
+        for k in 0..nl_ptr_count as usize {
+            // Read indirect table entry: 4-byte symbol table index
+            let entry_off = indirect_data_off + k * 4;
+            if entry_off + 4 > binary.data.len() { break; }
+            let sym_idx = u32::from_le_bytes([
+                binary.data[entry_off],
+                binary.data[entry_off + 1],
+                binary.data[entry_off + 2],
+                binary.data[entry_off + 3],
+            ]) as usize;
+
+            // Validate and look up symbol name
+            if sym_idx >= symbols.len() { continue; }
+            let (name, _nlist) = match &symbols[sym_idx] {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let dylib = "/usr/lib/libSystem.B.dylib";
+            let addr = match self.resolve(dylib, name, false) {
+                Ok(a) => a,
+                Err(_) => {
+                    log::warn!("nl_symbol_ptr: unresolved {name}, binding to trap");
+                    shim_unresolved_trap as *const () as u64
+                }
+            };
+
+            let target_addr = nl_ptr_addr + (k as u64) * 8;
+            let page = (target_addr & !0xFFF) as *mut libc::c_void;
+            unsafe {
+                libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE);
+                (target_addr as *mut u64).write(addr);
+            }
+
+            log::debug!("nl_sym[{k}] {name} → {addr:#x} at {target_addr:#x}");
+            bound += 1;
+        }
+
+        log::info!("bound {bound} nl_symbol_ptr entries");
+        Ok(bound)
+    }
+
     /// Run initialization functions (__mod_init_func and LC_ROUTINES).
     pub fn run_initializers(&self, binary: &MachOBinary) -> Result<(), LinkError> {
         let macho = MachO::parse(&binary.data, 0)
