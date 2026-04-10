@@ -8,3 +8,4 @@ edition.workspace = true
 grafted-objc.workspace = true
 thiserror.workspace = true
 log.workspace = true
+libc = "0.2"

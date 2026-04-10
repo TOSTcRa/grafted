@@ -197,6 +197,7 @@ name = "grafted-frameworks"
 version = "0.1.0"
 dependencies = [
  "grafted-objc",
+ "libc",
  "log",
  "thiserror",
 ]
