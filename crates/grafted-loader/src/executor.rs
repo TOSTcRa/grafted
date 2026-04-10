@@ -10,6 +10,7 @@
 //! trampoline that re-sets selector=BLOCK before resuming the Darwin code.
 
 use std::arch::asm;
+use std::cell::Cell;
 use std::num::NonZeroUsize;
 
 use nix::sys::mman::{mmap_anonymous, MapFlags, ProtFlags};
@@ -22,15 +23,22 @@ use crate::error::LoaderError;
 
 const PR_SET_SYSCALL_USER_DISPATCH: libc::c_int = 59;
 const PR_SYS_DISPATCH_ON: libc::c_int = 1;
-const SYSCALL_DISPATCH_FILTER_ALLOW: u8 = 0;
-const SYSCALL_DISPATCH_FILTER_BLOCK: u8 = 1;
+pub const SYSCALL_DISPATCH_FILTER_ALLOW: u8 = 0;
+pub const SYSCALL_DISPATCH_FILTER_BLOCK: u8 = 1;
 
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 const SYS_USER_DISPATCH: i32 = 2;
 
-// We dynamically allocate the selector to guarantee it's in a writable page.
-static SELECTOR_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+// Per-thread SUD selectors: each thread gets its own byte from a shared page.
+// This eliminates races when multiple threads toggle ALLOW/BLOCK concurrently.
+static SELECTOR_PAGE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static SELECTOR_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static THREAD_SELECTOR: Cell<*mut u8> = const { Cell::new(std::ptr::null_mut()) };
+    static THREAD_TRAMPOLINE: Cell<u64> = const { Cell::new(0) };
+}
 
 static STACK_BASE_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -38,36 +46,74 @@ pub fn stack_base() -> u64 {
     STACK_BASE_ADDR.load(std::sync::atomic::Ordering::Acquire)
 }
 
-pub fn selector_ptr() -> *mut u8 {
-    let mut ptr = SELECTOR_PTR.load(Ordering::Acquire);
-    if ptr.is_null() {
-        let size = NonZeroUsize::new(4096).unwrap();
-        ptr = unsafe {
-            mmap_anonymous(
-                None,
-                size,
-                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                MapFlags::MAP_PRIVATE,
-            )
-        }
-        .expect("failed to allocate selector page")
-        .as_ptr() as *mut u8;
-        unsafe { *ptr = SYSCALL_DISPATCH_FILTER_ALLOW };
-        
-        if SELECTOR_PTR.compare_exchange(
-            std::ptr::null_mut(),
-            ptr,
-            Ordering::Release,
-            Ordering::Relaxed,
-        ).is_err() {
-            // Leak is harmless: one 4KiB page, process-lifetime singleton.
-            ptr = SELECTOR_PTR.load(Ordering::Acquire);
-        }
+/// Get (or lazily allocate) the shared selector page.
+fn selector_page() -> *mut u8 {
+    let ptr = SELECTOR_PAGE.load(Ordering::Acquire);
+    if !ptr.is_null() { return ptr; }
+    let size = NonZeroUsize::new(4096).unwrap();
+    let new_ptr = unsafe {
+        mmap_anonymous(
+            None,
+            size,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_PRIVATE,
+        )
     }
+    .expect("failed to allocate selector page")
+    .as_ptr() as *mut u8;
+    match SELECTOR_PAGE.compare_exchange(
+        std::ptr::null_mut(),
+        new_ptr,
+        Ordering::Release,
+        Ordering::Relaxed,
+    ) {
+        Ok(_) => new_ptr,
+        Err(_) => SELECTOR_PAGE.load(Ordering::Acquire),
+    }
+}
+
+/// Allocate a per-thread selector byte and store it in thread-local storage.
+pub fn alloc_thread_selector() -> *mut u8 {
+    let page = selector_page();
+    let offset = SELECTOR_NEXT.fetch_add(1, Ordering::Relaxed);
+    assert!(offset < 4096, "grafted: too many threads for selector page");
+    let ptr = unsafe { page.add(offset) };
+    unsafe { *ptr = SYSCALL_DISPATCH_FILTER_ALLOW };
+    THREAD_SELECTOR.with(|c| c.set(ptr));
     ptr
 }
 
-static mut TRAMPOLINE_ADDR: u64 = 0;
+/// Get the current thread's selector byte. Allocates one if not yet assigned.
+pub fn selector_ptr() -> *mut u8 {
+    let ptr = THREAD_SELECTOR.with(|c| c.get());
+    if !ptr.is_null() { return ptr; }
+    alloc_thread_selector()
+}
+
+/// Set up SUD for the current thread with a per-thread selector and trampoline.
+pub fn setup_thread_sud(sel_ptr: *mut u8) {
+    let tramp = alloc_trampoline_for(sel_ptr).expect("trampoline alloc");
+    THREAD_SELECTOR.with(|c| c.set(sel_ptr));
+    THREAD_TRAMPOLINE.with(|c| c.set(tramp));
+    unsafe {
+        libc::prctl(
+            PR_SET_SYSCALL_USER_DISPATCH,
+            PR_SYS_DISPATCH_ON,
+            0x1000_usize,
+            0xFFFF_F000_usize,
+            sel_ptr as usize,
+        );
+        *sel_ptr = SYSCALL_DISPATCH_FILTER_BLOCK;
+    }
+}
+
+/// Called from gen_trampoline assembly to set the current thread's selector to ALLOW.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafted_selector_allow() {
+    let ptr = selector_ptr();
+    unsafe { ptr.write_volatile(SYSCALL_DISPATCH_FILTER_ALLOW) };
+}
+
 static mut GRAFTED_FD: libc::c_int = -1;
 
 // ---- Stack allocation ----
@@ -94,25 +140,20 @@ fn alloc_stack() -> Result<(usize, usize), LoaderError> {
 
 // ---- Trampoline ----
 
-/// Allocate an executable page containing a trampoline that:
-///   1. Sets SELECTOR = BLOCK
-///   2. Returns to the real RIP (pushed on stack by the signal handler)
-///
-/// The signal handler pushes the real resume RIP onto the Darwin stack
-/// and sets RIP to this trampoline. The trampoline re-arms SUD then `ret`s back.
-/// This avoids clobbering any callee-saved registers.
-fn alloc_trampoline() -> Result<u64, LoaderError> {
-    let sel_ptr = selector_ptr() as u64;
+/// Allocate an executable trampoline that sets the given selector byte to BLOCK,
+/// then returns to the real RIP (pushed on stack by the signal handler).
+/// Each thread gets its own trampoline pointing to its own selector byte.
+fn alloc_trampoline_for(sel_ptr: *mut u8) -> Result<u64, LoaderError> {
+    let sel_addr = sel_ptr as u64;
 
-    // Use r11 (caller-saved, not return value) to avoid clobbering rax
-    //   movabs r11, <selector_ptr>      ; 10 bytes (49 bb ...)
+    //   movabs r11, <sel_ptr>           ; 10 bytes (49 bb ...)
     //   mov byte ptr [r11], 1           ; 4 bytes (41 c6 03 01)
     //   ret                             ; 1 byte
     // Total: 15 bytes
     let mut code = [0u8; 15];
     code[0] = 0x49;
     code[1] = 0xbb;
-    code[2..10].copy_from_slice(&sel_ptr.to_le_bytes());
+    code[2..10].copy_from_slice(&sel_addr.to_le_bytes());
     code[10] = 0x41;
     code[11] = 0xc6;
     code[12] = 0x03;
@@ -135,7 +176,7 @@ fn alloc_trampoline() -> Result<u64, LoaderError> {
     }
 
     let addr = page.as_ptr() as u64;
-    log::debug!("trampoline at {addr:#x}");
+    log::debug!("trampoline at {addr:#x} for selector {sel_addr:#x}");
     Ok(addr)
 }
 
@@ -275,7 +316,9 @@ unsafe extern "C" fn sigsys_handler(
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
-    let sel_ptr = selector_ptr();
+    // Per-thread selector: each thread has its own byte, no races.
+    let sel_ptr = THREAD_SELECTOR.with(|c| c.get());
+    if sel_ptr.is_null() { return; }
 
     // FIRST: allow our own syscalls
     unsafe { *sel_ptr = SYSCALL_DISPATCH_FILTER_ALLOW };
@@ -305,14 +348,15 @@ unsafe extern "C" fn sigsys_handler(
     gregs[libc::REG_RAX as usize] = result;
 
     // Push the real resume RIP onto the Darwin stack, then redirect to trampoline.
-    // The trampoline sets SELECTOR=BLOCK then `ret` pops the real RIP.
-    // This avoids clobbering any registers the Darwin code uses.
+    // The per-thread trampoline sets THIS thread's SELECTOR=BLOCK then `ret`s.
+    let trampoline = THREAD_TRAMPOLINE.with(|c| c.get());
+
     let real_rip = gregs[libc::REG_RIP as usize] as u64;
     let rsp = gregs[libc::REG_RSP as usize] as u64;
     let new_rsp = rsp - 8;
     unsafe { (new_rsp as *mut u64).write(real_rip) };
     gregs[libc::REG_RSP as usize] = new_rsp as i64;
-    gregs[libc::REG_RIP as usize] = unsafe { TRAMPOLINE_ADDR } as i64;
+    gregs[libc::REG_RIP as usize] = trampoline as i64;
 
     // Leave selector as ALLOW — sigreturn needs it to work.
     // The trampoline will set it back to BLOCK.
@@ -352,38 +396,28 @@ unsafe extern "C" fn sigsegv_handler(
     let uctx = unsafe { &*(context as *const libc::ucontext_t) };
     let rip = uctx.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
     let rsp = uctx.uc_mcontext.gregs[libc::REG_RSP as usize] as u64;
+    let rax = uctx.uc_mcontext.gregs[libc::REG_RAX as usize] as u64;
+    let rdx = uctx.uc_mcontext.gregs[libc::REG_RDX as usize] as u64;
     let rdi = uctx.uc_mcontext.gregs[libc::REG_RDI as usize] as u64;
-    let r10 = uctx.uc_mcontext.gregs[libc::REG_R10 as usize] as u64;
+    let rsi = uctx.uc_mcontext.gregs[libc::REG_RSI as usize] as u64;
     let fault_addr = unsafe { info.si_addr() } as u64;
 
-    // Print: read return address from stack to identify caller
-    let ret_addr = if rsp > 0x1000 { unsafe { *(rsp as *const u64) } } else { 0 };
-
-    let mut buf = [0u8; 256];
-    let msg = format_crash_ext(&mut buf, fault_addr, rip, rsp, rdi, r10, ret_addr);
-    unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
-    unsafe { libc::_exit(139) };
-}
-
-fn format_crash_ext(buf: &mut [u8; 256], addr: u64, rip: u64, rsp: u64, rdi: u64, r10: u64, ret: u64) -> &[u8] {
-    fn hex(val: u64, out: &mut [u8]) -> usize {
-        let digits = b"0123456789abcdef";
-        let mut i = 16;
-        let mut v = val;
-        while i > 0 { i -= 1; out[i] = digits[(v & 0xf) as usize]; v >>= 4; }
-        16
-    }
-    fn w(buf: &mut [u8], pos: &mut usize, s: &[u8]) { buf[*pos..*pos+s.len()].copy_from_slice(s); *pos += s.len(); }
-    fn wh(buf: &mut [u8], pos: &mut usize, v: u64) { *pos += hex(v, &mut buf[*pos..*pos+16]); }
+    // Print crash info with all relevant registers
+    let mut buf = [0u8; 512];
     let mut p = 0;
-    w(buf, &mut p, b"SIGSEGV at=0x"); wh(buf, &mut p, addr);
-    w(buf, &mut p, b" rip=0x"); wh(buf, &mut p, rip);
-    w(buf, &mut p, b" rsp=0x"); wh(buf, &mut p, rsp);
-    w(buf, &mut p, b" rdi=0x"); wh(buf, &mut p, rdi);
-    w(buf, &mut p, b" r10=0x"); wh(buf, &mut p, r10);
-    w(buf, &mut p, b" ret=0x"); wh(buf, &mut p, ret);
+    fn hex(val: u64, out: &mut [u8]) { let d = b"0123456789abcdef"; let mut v = val; for i in (0..16).rev() { out[i] = d[(v & 0xf) as usize]; v >>= 4; } }
+    fn w(b: &mut [u8], p: &mut usize, s: &[u8]) { b[*p..*p+s.len()].copy_from_slice(s); *p += s.len(); }
+    fn wh(b: &mut [u8], p: &mut usize, v: u64) { hex(v, &mut b[*p..*p+16]); *p += 16; }
+    w(&mut buf, &mut p, b"SIGSEGV at=0x"); wh(&mut buf, &mut p, fault_addr);
+    w(&mut buf, &mut p, b" rip=0x"); wh(&mut buf, &mut p, rip);
+    w(&mut buf, &mut p, b"\n  rax=0x"); wh(&mut buf, &mut p, rax);
+    w(&mut buf, &mut p, b" rdx=0x"); wh(&mut buf, &mut p, rdx);
+    w(&mut buf, &mut p, b" rdi=0x"); wh(&mut buf, &mut p, rdi);
+    w(&mut buf, &mut p, b" rsi=0x"); wh(&mut buf, &mut p, rsi);
+    w(&mut buf, &mut p, b"\n  rsp=0x"); wh(&mut buf, &mut p, rsp);
     buf[p] = b'\n'; p += 1;
-    &buf[..p]
+    unsafe { libc::write(2, buf.as_ptr() as *const _, p) };
+    unsafe { libc::_exit(139) };
 }
 
 fn install_sigsys_handler() -> Result<(), LoaderError> {
@@ -400,7 +434,12 @@ fn install_sigsys_handler() -> Result<(), LoaderError> {
             )));
         }
 
-        // Let SIGSEGV produce a core dump for GDB analysis (default action)
+        // Install SIGSEGV handler for crash diagnostics
+        let mut sa2: libc::sigaction = std::mem::zeroed();
+        sa2.sa_sigaction = sigsegv_handler as *const () as usize;
+        sa2.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa2.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa2, std::ptr::null_mut());
     }
     Ok(())
 }
@@ -482,10 +521,10 @@ pub fn execute(entry_point: u64, argv: &[String], binary_path: &str, on_stack_re
     let (stack_base, stack_top) = alloc_stack().expect("failed to allocate stack");
     STACK_BASE_ADDR.store(stack_base as u64, std::sync::atomic::Ordering::Release);
     on_stack_ready(stack_base as u64, STACK_SIZE as u64);
-    let trampoline = alloc_trampoline().expect("failed to allocate trampoline");
+    let sel_ptr = selector_ptr(); // allocates main thread's per-thread selector
+    let trampoline = alloc_trampoline_for(sel_ptr).expect("failed to allocate trampoline");
+    THREAD_TRAMPOLINE.with(|c| c.set(trampoline));
     let stack_ptr = build_stack(stack_top, argv, binary_path);
-
-    unsafe { TRAMPOLINE_ADDR = trampoline };
 
     // Try to open /dev/grafted. If it fails, we continue without Mach trap support.
     let fd = unsafe {
@@ -518,8 +557,9 @@ pub fn execute(entry_point: u64, argv: &[String], binary_path: &str, on_stack_re
     // We need to pass argc, argv, envp, apple to the entry point in registers.
     // AND we need to put a return address on the stack that calls exit.
     
-    // Exit trampoline: xor edi,edi; mov eax,0x2000001 (Darwin exit); syscall
-    let exit_trampoline: [u8; 12] = [0x31, 0xff, 0xb8, 0x01, 0x00, 0x00, 0x02, 0x0f, 0x05, 0xcc, 0xcc, 0xcc];
+    // Exit trampoline: use Linux exit_group directly (works regardless of SUD selector state).
+    // mov edi, eax (preserve main's return value); mov eax, 231 (exit_group); syscall
+    let exit_trampoline: [u8; 12] = [0x89, 0xc7, 0xb8, 0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xcc, 0xcc, 0xcc];
     let exit_trampoline_addr = unsafe {
         let ptr = libc::mmap(
             std::ptr::null_mut(),
@@ -578,9 +618,16 @@ mod tests {
     }
 
     #[test]
-    fn test_process_syscall_mach_trap_unsupported_fd() {
-        // Mach trap 26 (mach_reply_port)
+    fn test_process_syscall_mach_reply_port() {
+        // Mach trap 26 (mach_reply_port) → returns fake port 0x307
         let res = unsafe { process_syscall(0x100001a, [0; 6], -1) };
-        assert_eq!(res, -38); // ENOSYS
+        assert_eq!(res, 0x307);
+    }
+
+    #[test]
+    fn test_process_syscall_mach_trap_unsupported_fd() {
+        // Unimplemented Mach trap 99 with fd=-1 → ENOSYS
+        let res = unsafe { process_syscall(0x1000063, [0; 6], -1) };
+        assert_eq!(res, -38);
     }
 }

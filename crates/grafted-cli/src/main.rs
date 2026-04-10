@@ -57,9 +57,18 @@ fn main() -> ExitCode {
         }
     };
 
-    grafted_dyld::shims::set_selector_ptr(grafted_loader::executor::selector_ptr());
-    // set_process_info is called below after argv is built
+    // Per-thread selectors are now managed automatically by executor + shims.
 
+    // Set up TLV init image from __thread_data section so thread-locals get
+    // correct initial values (not just zeros).
+    if let Some((data_addr, data_size, total_size)) = binary.tlv_init_image() {
+        log::debug!("TLV init image: addr={data_addr:#x} data_size={data_size:#x} total={total_size:#x}");
+        grafted_dyld::shims::set_tlv_init_image(
+            data_addr as *const u8,
+            data_size,
+            total_size,
+        );
+    }
 
     let mut linker = grafted_dyld::Linker::new();
     

@@ -184,6 +184,34 @@ impl MachOBinary {
     }
 }
 
+impl MachOBinary {
+    /// Find __thread_data and __thread_bss sections for TLV initialization.
+    /// Returns (thread_data_vmaddr, thread_data_size, total_tlv_size).
+    pub fn tlv_init_image(&self) -> Option<(u64, usize, usize)> {
+        use goblin::mach::MachO;
+        let macho = MachO::parse(&self.data, 0).ok()?;
+        let mut data_addr: u64 = 0;
+        let mut data_size: u64 = 0;
+        let mut bss_size: u64 = 0;
+        for seg in &macho.segments {
+            for section_res in seg {
+                if let Ok((section, _)) = section_res {
+                    match section.name().unwrap_or("") {
+                        "__thread_data" => { data_addr = section.addr; data_size = section.size; }
+                        "__thread_bss" => { bss_size = section.size; }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if data_size > 0 || bss_size > 0 {
+            Some((data_addr, data_size as usize, (data_size + bss_size) as usize))
+        } else {
+            None
+        }
+    }
+}
+
 struct ParsedInfo {
     file_type: u32,
     cpu_type: u32,

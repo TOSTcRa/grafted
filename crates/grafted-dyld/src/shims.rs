@@ -5,19 +5,11 @@
 
 use std::arch::asm;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::Ordering;
 
-static SELECTOR_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+const FILTER_ALLOW: u8 = grafted_loader::executor::SYSCALL_DISPATCH_FILTER_ALLOW;
+const FILTER_BLOCK: u8 = grafted_loader::executor::SYSCALL_DISPATCH_FILTER_BLOCK;
 
-const FILTER_ALLOW: u8 = 0;
-const FILTER_BLOCK: u8 = 1;
-
-
-pub fn set_selector_ptr(ptr: *mut u8) {
-    SELECTOR_PTR.store(ptr, Ordering::Release);
-}
-
-/// Set process info globals (_NSGetArgc/Argv/Environ/ExecutablePath)
 /// Set process info globals: executable path + argc/argv for _NSGetArgc/v
 pub fn set_process_info(binary_path: &str, argv: &[String]) {
     unsafe {
@@ -44,14 +36,14 @@ pub fn set_process_info(binary_path: &str, argv: &[String]) {
 }
 
 fn selector_allow() {
-    let ptr = SELECTOR_PTR.load(Ordering::Acquire);
+    let ptr = grafted_loader::executor::selector_ptr();
     if !ptr.is_null() {
         unsafe { ptr.write_volatile(FILTER_ALLOW) };
     }
 }
 
 fn selector_block() {
-    let ptr = SELECTOR_PTR.load(Ordering::Acquire);
+    let ptr = grafted_loader::executor::selector_ptr();
     if !ptr.is_null() {
         unsafe { ptr.write_volatile(FILTER_BLOCK) };
     }
@@ -213,26 +205,20 @@ unsafe fn setup_darwin_stdio() {
     }
 }
 
-/// Generate an executable trampoline that wraps a function pointer:
-///   mov byte [selector_ptr], ALLOW
-///   movabs rax, <target_fn>
-///   call rax
-///   mov byte [selector_ptr], BLOCK
-///   ret
+/// Generate an executable trampoline that wraps a libc function pointer:
+///   save argument registers
+///   call grafted_selector_allow()   ; per-thread ALLOW
+///   restore argument registers
+///   jmp <target_fn>                 ; tail call
 /// Returns the trampoline's address. All trampolines are allocated from
 /// a single mmap'd executable page pool.
 fn gen_trampoline(target: u64) -> u64 {
     use std::sync::Mutex;
-    // Wrap raw pointer in a Send-able newtype for the static Mutex
     struct PoolPtr(*mut u8);
     unsafe impl Send for PoolPtr {}
     static POOL: Mutex<Option<(PoolPtr, usize)>> = Mutex::new(None);
     const PAGE_SIZE: usize = 4096 * 16;
-    const TRAMP_SIZE: usize = 120; // pre + post + 8-byte saved_ret slot at end
-
-    // Use the address of SELECTOR_PTR itself (an AtomicPtr), not its current value.
-    // The trampoline will load the actual selector address at runtime via double indirection.
-    let selector_ptr_addr = (&raw const SELECTOR_PTR) as u64;
+    const TRAMP_SIZE: usize = 48;
 
     let mut pool = POOL.lock().unwrap();
     let (base, offset) = pool.get_or_insert_with(|| {
@@ -253,69 +239,43 @@ fn gen_trampoline(target: u64) -> u64 {
     let tramp = unsafe { base.0.add(*offset) };
     *offset += TRAMP_SIZE;
 
-    // Trampoline with return-address swap.
-    // Each trampoline has its own 8-byte slot for the saved return address
-    // at the END of the trampoline (byte 88..95). This avoids the nested-call
-    // problem of a single global.
-
-    let spa = selector_ptr_addr.to_le_bytes();
+    // Per-thread ALLOW trampoline: call grafted_selector_allow() then jmp to target.
+    // Saves/restores all argument registers so the libc function sees correct args.
+    // 7 pushes for 16-byte stack alignment before the call.
+    let afn = (grafted_loader::executor::grafted_selector_allow as *const () as u64).to_le_bytes();
     let tgt = target.to_le_bytes();
-    // saved_ret is embedded at the end of this trampoline's slot (offset 112)
-    let saved_ret_addr = (tramp as u64) + 112;
-    let sra = saved_ret_addr.to_le_bytes();
 
-    // Layout: PRE (set ALLOW, swap ret, jmp) + POST (set BLOCK, jmp to saved ret)
-    // POST is at a fixed offset within this trampoline slot.
-    let mut code = [0u8; TRAMP_SIZE];
+    let mut code = [0u8; 48];
     let mut p = 0;
 
-    // --- PRE ---
-    // Save [rsp] (original ret addr) into SAVED_RET global
-    code[p]=0x4c; code[p+1]=0x8b; code[p+2]=0x1c; code[p+3]=0x24; p+=4; // mov r11, [rsp]
-    code[p]=0x49; code[p+1]=0xba; p+=2;                                    // movabs r10, &SAVED_RET
-    code[p..p+8].copy_from_slice(&sra); p+=8;
-    code[p]=0x4d; code[p+1]=0x89; code[p+2]=0x1a; p+=3;                    // mov [r10], r11
+    // Save argument registers (7 pushes = 56 bytes → aligns stack for call)
+    code[p] = 0x50; p += 1;                       // push rax (al = SSE arg count for variadics)
+    code[p] = 0x57; p += 1;                       // push rdi
+    code[p] = 0x56; p += 1;                       // push rsi
+    code[p] = 0x52; p += 1;                       // push rdx
+    code[p] = 0x51; p += 1;                       // push rcx
+    code[p] = 0x41; code[p+1] = 0x50; p += 2;    // push r8
+    code[p] = 0x41; code[p+1] = 0x51; p += 2;    // push r9
 
-    // Replace [rsp] with address of POST stub (rip-relative lea)
-    code[p]=0x4c; code[p+1]=0x8d; code[p+2]=0x1d; p+=3;                    // lea r11, [rip+disp32]
-    let lea_patch = p; p+=4;                                                 // disp32 placeholder
+    // call grafted_selector_allow (sets this thread's selector to ALLOW)
+    code[p] = 0x48; code[p+1] = 0xb8; p += 2;    // movabs rax, imm64
+    code[p..p+8].copy_from_slice(&afn); p += 8;
+    code[p] = 0xff; code[p+1] = 0xd0; p += 2;    // call rax
 
-    code[p]=0x4c; code[p+1]=0x89; code[p+2]=0x1c; code[p+3]=0x24; p+=4; // mov [rsp], r11
+    // Restore argument registers (reverse order)
+    code[p] = 0x41; code[p+1] = 0x59; p += 2;    // pop r9
+    code[p] = 0x41; code[p+1] = 0x58; p += 2;    // pop r8
+    code[p] = 0x59; p += 1;                       // pop rcx
+    code[p] = 0x5a; p += 1;                       // pop rdx
+    code[p] = 0x5e; p += 1;                       // pop rsi
+    code[p] = 0x5f; p += 1;                       // pop rdi
+    code[p] = 0x58; p += 1;                       // pop rax
 
-    // Set ALLOW
-    code[p]=0x49; code[p+1]=0xbb; p+=2;
-    code[p..p+8].copy_from_slice(&spa); p+=8;
-    code[p]=0x4d; code[p+1]=0x8b; code[p+2]=0x1b; p+=3; // mov r11,[r11]
-    code[p]=0x4d; code[p+1]=0x85; code[p+2]=0xdb; p+=3; // test r11,r11
-    code[p]=0x74; code[p+1]=0x04; p+=2;                  // jz +4
-    code[p]=0x41; code[p+1]=0xc6; code[p+2]=0x03; code[p+3]=0x00; p+=4;
+    // jmp target (tail call — perfect stack preservation)
+    code[p] = 0x49; code[p+1] = 0xbb; p += 2;    // movabs r11, imm64
+    code[p..p+8].copy_from_slice(&tgt); p += 8;
+    code[p] = 0x41; code[p+1] = 0xff; code[p+2] = 0xe3; p += 3; // jmp r11
 
-    // jmp target
-    code[p]=0x49; code[p+1]=0xba; p+=2;
-    code[p..p+8].copy_from_slice(&tgt); p+=8;
-    code[p]=0x41; code[p+1]=0xff; code[p+2]=0xe2; p+=3; // jmp r10
-
-    // --- POST --- (target `ret`s here)
-    let post_offset = p;
-    // Patch lea displacement
-    let rel = (post_offset as i32) - (lea_patch as i32 + 4);
-    code[lea_patch..lea_patch+4].copy_from_slice(&rel.to_le_bytes());
-
-    // Set BLOCK (use r11 — callee already returned so we can clobber it)
-    code[p]=0x49; code[p+1]=0xbb; p+=2;
-    code[p..p+8].copy_from_slice(&spa); p+=8;
-    code[p]=0x4d; code[p+1]=0x8b; code[p+2]=0x1b; p+=3;
-    code[p]=0x4d; code[p+1]=0x85; code[p+2]=0xdb; p+=3;
-    code[p]=0x74; code[p+1]=0x04; p+=2;
-    code[p]=0x41; code[p+1]=0xc6; code[p+2]=0x03; code[p+3]=0x01; p+=4;
-
-    // jmp to saved ret addr: movabs r11, &SAVED_RET; mov r11, [r11]; jmp r11
-    code[p]=0x49; code[p+1]=0xbb; p+=2;
-    code[p..p+8].copy_from_slice(&sra); p+=8;
-    code[p]=0x4d; code[p+1]=0x8b; code[p+2]=0x1b; p+=3; // mov r11, [r11]
-    code[p]=0x41; code[p+1]=0xff; code[p+2]=0xe3; p+=3; // jmp r11
-
-    assert!(p <= TRAMP_SIZE, "trampoline too large: {p} > {TRAMP_SIZE}");
     unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), tramp, p) };
     tramp as u64
 }
@@ -764,7 +724,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg!("_dispatch_release", shim_noop);
 
     // TLS bootstrap — Darwin Thread Local Variables
-    reg!("__tlv_bootstrap", shim_tlv_bootstrap);
+    reg!("__tlv_bootstrap", shim_tlv_bootstrap_asm);
     reg!("__tlv_atexit", shim_noop);
 
     // More Unwind stubs
@@ -779,6 +739,27 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_strnlen", libc::strnlen);
     reg_libc!("_strncat", libc::strncat);
     reg_libc!("_strtok", libc::strtok);
+    reg_libc!("_strcasecmp", libc::strcasecmp);
+    reg_libc!("_strncasecmp", libc::strncasecmp);
+    reg_libc!("_utimes", libc::utimes);
+    reg_libc!("_chmod", libc::chmod);
+    reg_libc!("_fsync", libc::fsync);
+    reg_libc!("_link", libc::link);
+    reg_libc!("_pread", libc::pread);
+    reg_libc!("_readlink", libc::readlink);
+    reg_libc!("_getpgid", libc::getpgid);
+    reg_libc!("_getppid", libc::getppid);
+    reg_libc!("_getsid", libc::getsid);
+    reg_libc!("_pthread_rwlock_init", libc::pthread_rwlock_init);
+    reg_libc!("_pthread_rwlock_destroy", libc::pthread_rwlock_destroy);
+    reg_libc!("_pthread_rwlock_rdlock", libc::pthread_rwlock_rdlock);
+    reg_libc!("_pthread_rwlock_wrlock", libc::pthread_rwlock_wrlock);
+    reg_libc!("_pthread_rwlock_unlock", libc::pthread_rwlock_unlock);
+    reg_libc!("_pthread_key_delete", libc::pthread_key_delete);
+    reg!("_readdir$INODE64", shim_readdir);
+    reg!("_mach_absolute_time", shim_mach_absolute_time);
+    reg!("_mach_timebase_info", shim_mach_timebase_info);
+    reg!("dyld_stub_binder", shim_noop);
     reg!("__setjmp", _setjmp);
     reg!("__longjmp", _longjmp);
 
@@ -987,14 +968,10 @@ unsafe impl Send for ThreadStartCtx {}
 
 extern "C" fn thread_start_wrapper(ctx_ptr: *mut libc::c_void) -> *mut libc::c_void {
     let ctx = unsafe { Box::from_raw(ctx_ptr as *mut ThreadStartCtx) };
-    // Install SUD for this new thread
-    let sel_ptr = SELECTOR_PTR.load(Ordering::Acquire);
-    if !sel_ptr.is_null() {
-        unsafe {
-            libc::prctl(59, 1, 0usize, 0usize, sel_ptr as usize);
-            sel_ptr.write_volatile(1); // BLOCK
-        }
-    }
+    // Allocate a per-thread SUD selector byte and install SUD with correct range.
+    // Each thread gets its own selector → no races with other threads.
+    let sel_ptr = grafted_loader::executor::alloc_thread_selector();
+    grafted_loader::executor::setup_thread_sud(sel_ptr);
     (ctx.real_start)(ctx.real_arg)
 }
 
@@ -1486,9 +1463,52 @@ unsafe extern "C" fn shim_nsgetexecutablepath(buf: *mut i8, bufsize: *mut u32) -
 // All TLV descriptors in an image share ONE pthread key. The key is stored
 // in each descriptor at offset 8. On first call, we create the key and
 // allocate a large block. Each TLV variable lives at its own offset within the block.
+//
+// IMPORTANT: Apple's __tlv_bootstrap is a tiny leaf function that only clobbers rax.
+// The compiler relies on this and does NOT save caller-saved registers around the call.
+// Our Rust implementation calls libc functions (clobbering rcx/rdx/rsi/r8-r11), so we
+// wrap it with an assembly shim that preserves all caller-saved registers except rax.
 static TLV_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static TLV_KEY_INIT: std::sync::Once = std::sync::Once::new();
-const TLV_BLOCK_SIZE: usize = 1024 * 1024; // 1MB — generous for Rust TLS
+
+// TLV init image: __thread_data contains non-zero initial values for thread-locals.
+// When allocating a new TLV block, we must copy these initial values (not just calloc).
+static mut TLV_INIT_IMAGE: *const u8 = std::ptr::null();
+static mut TLV_INIT_SIZE: usize = 0;
+static mut TLV_TOTAL_SIZE: usize = 0;
+
+/// Set the TLV initialization image from the binary's __thread_data and __thread_bss sections.
+pub fn set_tlv_init_image(image_addr: *const u8, image_size: usize, total_size: usize) {
+    unsafe {
+        TLV_INIT_IMAGE = image_addr;
+        TLV_INIT_SIZE = image_size;
+        TLV_TOTAL_SIZE = total_size;
+    }
+}
+
+std::arch::global_asm!(
+    "shim_tlv_bootstrap_asm:",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "call {fn}",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "ret",
+    fn = sym shim_tlv_bootstrap,
+);
+unsafe extern "C" {
+    fn shim_tlv_bootstrap_asm(descriptor: *mut u64) -> *mut u8;
+}
 
 unsafe extern "C" fn shim_tlv_bootstrap(descriptor: *mut u64) -> *mut u8 {
     let offset = unsafe { *descriptor.add(2) } as usize;
@@ -1507,8 +1527,17 @@ unsafe extern "C" fn shim_tlv_bootstrap(descriptor: *mut u64) -> *mut u8 {
 
     let mut block = unsafe { libc::pthread_getspecific(key) } as *mut u8;
     if block.is_null() {
-        block = unsafe { libc::calloc(1, TLV_BLOCK_SIZE) } as *mut u8;
+        // Allocate TLV block and initialize from __thread_data image.
+        // Darwin copies __thread_data (non-zero init) then zeros __thread_bss.
+        let total = unsafe { TLV_TOTAL_SIZE };
+        let alloc_size = if total > 0 { total } else { 1024 * 1024 };
+        block = unsafe { libc::calloc(1, alloc_size) } as *mut u8;
         if !block.is_null() {
+            let img = unsafe { TLV_INIT_IMAGE };
+            let img_size = unsafe { TLV_INIT_SIZE };
+            if !img.is_null() && img_size > 0 {
+                unsafe { std::ptr::copy_nonoverlapping(img, block, img_size) };
+            }
             unsafe { libc::pthread_setspecific(key, block as *const libc::c_void) };
         }
     }
@@ -1521,6 +1550,71 @@ unsafe extern "C" fn shim_tlv_bootstrap(descriptor: *mut u64) -> *mut u8 {
 // Mach stubs for Rust std
 // sysctl — translate Darwin MIBs to Linux values
 // Go runtime uses: CTL_HW(6)+HW_NCPU(3), CTL_HW(6)+HW_PAGESIZE(7), CTL_HW(6)+HW_MEMSIZE(24)
+// readdir — Darwin dirent has different layout from Linux.
+// For simplicity, call Linux readdir and translate the result pointer.
+// Darwin dirent64: d_ino(u64), d_seekoff(u64), d_reclen(u16), d_namlen(u16), d_type(u8), d_name[1024]
+#[repr(C)]
+struct DarwinDirent {
+    d_ino: u64,
+    d_seekoff: u64,
+    d_reclen: u16,
+    d_namlen: u16,
+    d_type: u8,
+    d_name: [u8; 1024],
+}
+
+static mut DARWIN_DIRENT_BUF: DarwinDirent = DarwinDirent {
+    d_ino: 0, d_seekoff: 0, d_reclen: 0, d_namlen: 0, d_type: 0, d_name: [0; 1024],
+};
+
+unsafe extern "C" fn shim_readdir(dirp: *mut libc::DIR) -> *mut DarwinDirent {
+    selector_allow();
+    let linux_ent = unsafe { libc::readdir(dirp) };
+    selector_block();
+    if linux_ent.is_null() { return std::ptr::null_mut(); }
+    let ent = unsafe { &*linux_ent };
+    let buf = &raw mut DARWIN_DIRENT_BUF;
+    unsafe {
+        (*buf).d_ino = ent.d_ino;
+        (*buf).d_seekoff = 0;
+        (*buf).d_type = ent.d_type;
+        let name_ptr = ent.d_name.as_ptr() as *const u8;
+        let mut len = 0;
+        while len < 1023 && *name_ptr.add(len) != 0 { len += 1; }
+        (*buf).d_namlen = len as u16;
+        (*buf).d_reclen = (21 + len + 1) as u16; // header + name + null
+        std::ptr::copy_nonoverlapping(name_ptr, (*buf).d_name.as_mut_ptr(), len);
+        (*buf).d_name[len] = 0;
+    }
+    buf as *mut DarwinDirent
+}
+
+// Mach time — use Linux clock_gettime(CLOCK_MONOTONIC) as nanoseconds.
+unsafe extern "C" fn shim_mach_absolute_time() -> u64 {
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    selector_allow();
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    selector_block();
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+// Darwin mach_timebase_info: on x86_64 macOS, numer=denom=1 (ticks = nanoseconds).
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+unsafe extern "C" fn shim_mach_timebase_info(info: *mut MachTimebaseInfo) -> i32 {
+    if !info.is_null() {
+        unsafe {
+            (*info).numer = 1;
+            (*info).denom = 1;
+        }
+    }
+    0 // KERN_SUCCESS
+}
+
 unsafe extern "C" fn shim_sysctl(
     name: *const i32, namelen: u32, oldp: *mut u8, oldlenp: *mut usize,
     _newp: *const u8, _newlen: usize,
