@@ -1068,12 +1068,22 @@ unsafe extern "C" fn shim_exit(code: i32) -> ! {
     unreachable!()
 }
 
+// Convert raw syscall return (negative = -errno) to libc convention (-1 + set errno)
+fn syscall_ret(raw: i64) -> i64 {
+    if raw < 0 {
+        unsafe { *libc::__errno_location() = (-raw) as i32 };
+        -1
+    } else {
+        raw
+    }
+}
+
 unsafe extern "C" fn shim_write(fd: i32, buf: *const u8, count: usize) -> i64 {
-    linux_syscall!(1, fd, buf, count)
+    syscall_ret(linux_syscall!(1, fd, buf, count))
 }
 
 unsafe extern "C" fn shim_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
-    linux_syscall!(0, fd, buf, count)
+    syscall_ret(linux_syscall!(0, fd, buf, count))
 }
 
 // Darwin open() flags differ from Linux:
@@ -1094,7 +1104,7 @@ fn translate_open_flags(darwin: i32) -> i32 {
 
 unsafe extern "C" fn shim_open(path: *const i8, flags: i32, mode: i32) -> i64 {
     let linux_flags = translate_open_flags(flags);
-    linux_syscall!(2, path, linux_flags, mode)
+    syscall_ret(linux_syscall!(2, path, linux_flags, mode))
 }
 
 // Darwin vs Linux addrinfo: ai_canonname and ai_addr are swapped.
@@ -1232,23 +1242,23 @@ unsafe extern "C" fn shim_lstat(path: *const i8, buf: *mut DarwinStat) -> i32 {
 }
 
 unsafe extern "C" fn shim_close(fd: i32) -> i64 {
-    linux_syscall!(3, fd)
+    syscall_ret(linux_syscall!(3, fd))
 }
 
 unsafe extern "C" fn shim_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
-    linux_syscall!(8, fd, offset, whence)
+    syscall_ret(linux_syscall!(8, fd, offset, whence))
 }
 
 unsafe extern "C" fn shim_dup(fd: i32) -> i64 {
-    linux_syscall!(32, fd)
+    syscall_ret(linux_syscall!(32, fd))
 }
 
 unsafe extern "C" fn shim_dup2(fd: i32, fd2: i32) -> i64 {
-    linux_syscall!(33, fd, fd2)
+    syscall_ret(linux_syscall!(33, fd, fd2))
 }
 
 unsafe extern "C" fn shim_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
-    linux_syscall!(72, fd, cmd, arg)
+    syscall_ret(linux_syscall!(72, fd, cmd, arg))
 }
 
 unsafe extern "C" fn shim_isatty(fd: i32) -> i32 {

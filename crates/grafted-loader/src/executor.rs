@@ -209,11 +209,7 @@ unsafe fn process_syscall(
             }
             ret
         }
-        DarwinSyscall::Unix { darwin_nr, .. } => {
-            // Log unimplemented syscalls for debugging
-            let d = b"0123456789abcdef";
-            -38
-        }
+        DarwinSyscall::Unix { .. } => -38,
         DarwinSyscall::MachTrap { trap_nr } => {
             match trap_nr {
                 26 => 0x307,  // mach_reply_port
