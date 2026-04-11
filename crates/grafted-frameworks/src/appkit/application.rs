@@ -42,33 +42,78 @@ pub unsafe extern "C" fn ns_application_run(
     _sel: *mut u8,
 ) {
     APP_RUNNING.store(true, Ordering::Release);
+
+    // If no windows were created by the app (SwiftUI stubs), create a default one.
+    // This goes through the proper WindowServer bridge → X11 path.
+    let main_window = display::create_window(100, 100, 800, 600, "Grafted App");
+    if let Some(wid) = main_window {
+        // Create backing CGContext for this window
+        let ctx = unsafe {
+            crate::cg::context::CGBitmapContextCreate(
+                std::ptr::null_mut(), 800, 600, 8, 800 * 4,
+                std::ptr::null(), 0,
+            )
+        };
+
+        // Draw initial background: light gray
+        if !ctx.is_null() {
+            unsafe {
+                crate::cg::context::CGContextSetRGBFillColor(ctx, 0.93, 0.93, 0.93, 1.0);
+                crate::cg::context::CGContextFillRect(ctx, crate::cg::geometry::CGRect {
+                    origin: crate::cg::geometry::CGPoint { x: 0.0, y: 0.0 },
+                    size: crate::cg::geometry::CGSize { width: 800.0, height: 600.0 },
+                });
+                // Draw a dark title bar area
+                crate::cg::context::CGContextSetRGBFillColor(ctx, 0.85, 0.85, 0.85, 1.0);
+                crate::cg::context::CGContextFillRect(ctx, crate::cg::geometry::CGRect {
+                    origin: crate::cg::geometry::CGPoint { x: 0.0, y: 0.0 },
+                    size: crate::cg::geometry::CGSize { width: 800.0, height: 28.0 },
+                });
+            }
+        }
+
+        display::show_window(wid);
+        if !ctx.is_null() {
+            display::flush_window(wid, ctx);
+        }
+
+        MAIN_WINDOW_ID.store(wid, std::sync::atomic::Ordering::Release);
+        MAIN_WINDOW_CTX.store(ctx as *mut u8, std::sync::atomic::Ordering::Release);
+        log::info!("NSApplication: default window created and shown (800x600)");
+    }
+
     log::info!("NSApplication: entering main run loop");
 
     while !APP_TERMINATED.load(Ordering::Acquire) {
-        // Poll X11 events and dispatch them
+        // Poll X11 events and translate to NSEvents
         let events = display::poll_events();
         for event in &events {
             match event {
-                display::DisplayEvent::WindowClose { window: _ } => {
-                    // Default behavior: terminate on window close
+                display::DisplayEvent::WindowClose { .. } => {
                     APP_TERMINATED.store(true, Ordering::Release);
                 }
                 display::DisplayEvent::Expose { window } => {
-                    // TODO: dispatch to NSWindow's display method
-                    log::trace!("NSApplication: expose event for window {}", window);
+                    // Redraw: blit the CGContext to the X11 window
+                    let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
+                    if !ctx.is_null() {
+                        display::flush_window(*window, ctx as crate::cg::context::CGContextRef);
+                    }
                 }
-                display::DisplayEvent::KeyDown { window, keycode } => {
-                    log::trace!("NSApplication: keyDown {} in window {}", keycode, window);
+                display::DisplayEvent::KeyDown { keycode, .. } => {
+                    log::debug!("NSApplication: keyDown {}", keycode);
+                    if *keycode == 9 { // Escape → quit
+                        APP_TERMINATED.store(true, Ordering::Release);
+                    }
                 }
                 _ => {}
             }
         }
 
-        // Run one iteration of the CF run loop (handles timers, sources)
+        // Run one iteration of the CF run loop
         unsafe {
             runloop::CFRunLoopRunInMode(
                 runloop::kCFRunLoopDefaultMode.as_ptr() as *const core::ffi::c_void,
-                0.016, // ~60fps
+                0.016,
                 0,
             );
         }
@@ -77,6 +122,9 @@ pub unsafe extern "C" fn ns_application_run(
     APP_RUNNING.store(false, Ordering::Release);
     log::info!("NSApplication: exited main run loop");
 }
+
+static MAIN_WINDOW_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static MAIN_WINDOW_CTX: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
 /// ObjC method: -[NSApplication terminate:]
 pub unsafe extern "C" fn ns_application_terminate(
