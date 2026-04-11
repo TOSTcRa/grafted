@@ -56,9 +56,25 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
         swift_runtime_symbols()
     } else {
         log::info!("Swift runtime: {} real symbols loaded from Linux toolchain", real_swift.len());
-        // Merge: real symbols override stubs
-        let mut merged = swift_runtime_symbols();
+        // Merge: real symbols override stubs, except metadata resolution
+        // functions that spin on our fake Mach-O metadata
+        let stubs_only = swift_runtime_symbols();
+        let mut merged = stubs_only.clone();
         merged.extend(real_swift);
+        // Keep our implementations for functions that spin on fake metadata
+        for sym_name in [
+            "_swift_getSingletonMetadata", "swift_getSingletonMetadata",
+            "_swift_conformsToProtocol", "swift_conformsToProtocol",
+            "_swift_getWitnessTable", "swift_getWitnessTable",
+            "_swift_getAssociatedTypeWitness", "swift_getAssociatedTypeWitness",
+            "_swift_getAssociatedConformanceWitness", "swift_getAssociatedConformanceWitness",
+            "_swift_checkMetadataState", "swift_checkMetadataState",
+            "_swift_getGenericMetadata", "swift_getGenericMetadata",
+        ] {
+            if let Some(addr) = stubs_only.get(sym_name) {
+                merged.insert(sym_name.into(), *addr);
+            }
+        }
         merged
     };
 
@@ -698,11 +714,44 @@ unsafe extern "C" fn swift_get_singleton_metadata(
         return ptr;
     }
 
-    // Allocate metadata: kind + descriptor pointer
-    let metadata = unsafe { libc::calloc(1, 256) } as *mut u64;
+    // Allocate a realistic metadata struct with value witness table.
+    // Swift metadata layout:
+    //   metadata[-1] = pointer to value witness table (VWT)
+    //   metadata[0]  = kind (1=struct, 0=class, 2=enum)
+    //   metadata[1]  = nominal type descriptor
+    //
+    // The VWT contains size, alignment, stride, and function pointers
+    // for copy/destroy/etc.
+
+    // First allocate a minimal VWT
+    let vwt = unsafe { libc::calloc(1, 256) } as *mut u64;
     unsafe {
-        *metadata = 0x1;                    // kind: struct
-        *metadata.add(1) = descriptor as u64; // descriptor back-pointer
+        // VWT layout (see swift/ABI/ValueWitness.def):
+        // [0]: initializeBufferWithCopyOfBuffer
+        // [1]: destroy
+        // [2]: initializeWithCopy
+        // [3]: assignWithCopy
+        // [4]: initializeWithTake
+        // [5]: assignWithTake
+        // [6]: getEnumTagSinglePayload
+        // [7]: storeEnumTagSinglePayload
+        // [8]: size (in bytes)
+        // [9]: stride
+        // [10]: flags (alignment - 1 in lower bits, other flags in upper)
+        // [11]: extraInhabitantCount
+        *vwt.add(8) = 8;     // size = 8 bytes
+        *vwt.add(9) = 8;     // stride = 8 bytes
+        *vwt.add(10) = 7;    // flags: alignment=8 (alignment-1 = 7)
+        *vwt.add(11) = 0;    // no extra inhabitants
+    }
+
+    // Allocate metadata with VWT pointer at [-1]
+    let raw = unsafe { libc::calloc(1, 512) } as *mut u64;
+    let metadata = unsafe { raw.add(2) }; // metadata[0] starts here, [-1] = VWT
+    unsafe {
+        *metadata.sub(1) = vwt as u64;        // VWT pointer
+        *metadata = 0x200;                     // kind: struct nominal type descriptor
+        *metadata.add(1) = descriptor as u64;  // nominal type descriptor
     }
     let ptr = metadata as *mut u8;
     log::info!("swift_getSingletonMetadata: descriptor={:#x} → metadata={:p}", key, ptr);
