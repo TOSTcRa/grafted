@@ -8,5 +8,6 @@ pub mod cf;
 pub mod cg;
 pub mod ct;
 pub mod ws;
+pub mod foundation;
 pub mod appkit;
 pub mod registry;

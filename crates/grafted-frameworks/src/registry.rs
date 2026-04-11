@@ -296,6 +296,7 @@ fn core_graphics_symbols() -> HashMap<String, u64> {
 fn appkit_symbols() -> HashMap<String, u64> {
     let mut s = HashMap::new();
     use crate::appkit::application;
+    crate::foundation::register_classes();
     crate::appkit::register_classes();
     sym!(s, "_NSApplicationMain", application::NSApplicationMain);
     sym!(s, "_NSApp", noop_ptr);
