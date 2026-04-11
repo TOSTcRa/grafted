@@ -8,6 +8,8 @@ pub mod application;
 pub mod window;
 pub mod view;
 pub mod event;
+pub mod menu;
+pub mod pasteboard;
 pub mod register;
 
 /// Register all AppKit classes with the ObjC runtime.
