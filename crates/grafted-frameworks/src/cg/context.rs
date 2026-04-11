@@ -45,7 +45,7 @@ impl CGContextInner {
         y * self.stride + x * 4
     }
 
-    fn set_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8, a: u8) {
+    pub fn set_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8, a: u8) {
         if x >= self.width || y >= self.height { return; }
         let off = self.pixel_offset(x, y);
         if off + 3 < self.pixels.len() {

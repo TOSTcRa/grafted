@@ -55,21 +55,42 @@ pub unsafe extern "C" fn ns_application_run(
             )
         };
 
-        // Draw initial background: light gray
+        // Draw window content using CGContext → bitmap font text rendering
         if !ctx.is_null() {
+            use crate::cg::context::*;
+            use crate::cg::geometry::*;
+            use crate::ct::font::draw_text_bitmap;
+
             unsafe {
-                crate::cg::context::CGContextSetRGBFillColor(ctx, 0.93, 0.93, 0.93, 1.0);
-                crate::cg::context::CGContextFillRect(ctx, crate::cg::geometry::CGRect {
-                    origin: crate::cg::geometry::CGPoint { x: 0.0, y: 0.0 },
-                    size: crate::cg::geometry::CGSize { width: 800.0, height: 600.0 },
+                // Background: light gray
+                CGContextSetRGBFillColor(ctx, 0.93, 0.93, 0.93, 1.0);
+                CGContextFillRect(ctx, CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize { width: 800.0, height: 600.0 },
                 });
-                // Draw a dark title bar area
-                crate::cg::context::CGContextSetRGBFillColor(ctx, 0.85, 0.85, 0.85, 1.0);
-                crate::cg::context::CGContextFillRect(ctx, crate::cg::geometry::CGRect {
-                    origin: crate::cg::geometry::CGPoint { x: 0.0, y: 0.0 },
-                    size: crate::cg::geometry::CGSize { width: 800.0, height: 28.0 },
+                // Title bar: darker gray
+                CGContextSetRGBFillColor(ctx, 0.78, 0.78, 0.78, 1.0);
+                CGContextFillRect(ctx, CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize { width: 800.0, height: 28.0 },
                 });
+                // Traffic light buttons
+                CGContextSetRGBFillColor(ctx, 1.0, 0.38, 0.34, 1.0); // red
+                CGContextFillRect(ctx, CGRect { origin: CGPoint { x: 8.0, y: 8.0 }, size: CGSize { width: 12.0, height: 12.0 } });
+                CGContextSetRGBFillColor(ctx, 1.0, 0.74, 0.17, 1.0); // yellow
+                CGContextFillRect(ctx, CGRect { origin: CGPoint { x: 28.0, y: 8.0 }, size: CGSize { width: 12.0, height: 12.0 } });
+                CGContextSetRGBFillColor(ctx, 0.21, 0.78, 0.35, 1.0); // green
+                CGContextFillRect(ctx, CGRect { origin: CGPoint { x: 48.0, y: 8.0 }, size: CGSize { width: 12.0, height: 12.0 } });
             }
+
+            // Title text
+            draw_text_bitmap(ctx, "Grafted App", 320.0, 6.0, [0.2, 0.2, 0.2, 1.0], 1.0);
+
+            // App info text
+            draw_text_bitmap(ctx, "Darwin binary running on Linux via Grafted", 40.0, 60.0, [0.1, 0.1, 0.1, 1.0], 1.5);
+            draw_text_bitmap(ctx, "CoreFoundation + CoreGraphics + AppKit + SwiftUI", 40.0, 100.0, [0.3, 0.3, 0.3, 1.0], 1.0);
+            draw_text_bitmap(ctx, "CGContext -> software renderer -> XImage -> X11", 40.0, 120.0, [0.3, 0.3, 0.3, 1.0], 1.0);
+            draw_text_bitmap(ctx, "Press ESC to quit, close window button works", 40.0, 160.0, [0.0, 0.0, 0.6, 1.0], 1.0);
         }
 
         display::show_window(wid);
