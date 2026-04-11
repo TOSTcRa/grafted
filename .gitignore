@@ -30,3 +30,4 @@ Thumbs.db
 tests/fixtures/*.macho
 tests/fixtures/lua/
 tests/fixtures/jq-macos-amd64
+swift-runtime/

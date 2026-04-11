@@ -47,7 +47,21 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
         core_services_symbols(),
     );
 
-    // Swift runtime
+    // Swift runtime: try loading real libswiftCore.so from Linux Swift toolchain.
+    // If available, ALL Swift metadata/dispatch/memory functions work natively.
+    // Fall back to stubs if not found.
+    let real_swift = crate::swift_runtime::swift_symbols();
+    let swift_syms = if real_swift.is_empty() {
+        log::info!("Swift runtime: using stubs (install Swift toolchain for full support)");
+        swift_runtime_symbols()
+    } else {
+        log::info!("Swift runtime: {} real symbols loaded from Linux toolchain", real_swift.len());
+        // Merge: real symbols override stubs
+        let mut merged = swift_runtime_symbols();
+        merged.extend(real_swift);
+        merged
+    };
+
     for lib in &[
         "/usr/lib/swift/libswiftCore.dylib",
         "/usr/lib/swift/libswiftFoundation.dylib",
@@ -75,7 +89,7 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
         "/usr/lib/swift/libswiftUniformTypeIdentifiers.dylib",
         "/usr/lib/swift/libswift_Concurrency.dylib",
     ] {
-        reg.insert((*lib).into(), swift_runtime_symbols());
+        reg.insert((*lib).into(), swift_syms.clone());
     }
 
     // Other system libraries

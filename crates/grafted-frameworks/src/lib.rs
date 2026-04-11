@@ -10,4 +10,5 @@ pub mod ct;
 pub mod ws;
 pub mod foundation;
 pub mod appkit;
+pub mod swift_runtime;
 pub mod registry;
