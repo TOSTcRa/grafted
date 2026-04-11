@@ -12,8 +12,7 @@ unsafe extern "C" fn shim_unresolved_trap() -> ! {
     unsafe { libc::_exit(127) };
 }
 
-/// Soft stub: returns 0/NULL instead of aborting. Used for Swift symbols
-/// and other non-critical unresolved symbols during early framework bringup.
+/// Soft stub: returns 0/NULL instead of aborting.
 unsafe extern "C" fn shim_unresolved_soft() -> u64 { 0 }
 
 #[derive(Debug, thiserror::Error)]

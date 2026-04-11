@@ -85,9 +85,22 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
     reg.insert("/usr/lib/libSystem.B.dylib".into(), system_extras());
     reg.insert("self".into(), system_extras());
 
+    // SwiftUI — minimal implementation to get apps into the event loop
+    {
+        let mut swiftui = HashMap::new();
+        // App.main() → our NSApplicationMain (enters the run loop)
+        swiftui.insert("_$s7SwiftUI3AppPAAE4mainyyFZ".into(),
+            crate::appkit::application::NSApplicationMain as *const () as u64);
+        // App delegate adaptor stubs
+        swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVMa".into(), swift_noop_ptr as *const () as u64);
+        swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVMn".into(), swift_noop_ptr as *const () as u64);
+        swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVyACyxGxmcfC".into(), swift_noop_ptr as *const () as u64);
+        reg.insert("/System/Library/Frameworks/SwiftUI.framework/Versions/A/SwiftUI".into(), swiftui);
+    }
+
     // Stub frameworks with empty symbol tables (prevents load errors)
     for path in &[
-        "/System/Library/Frameworks/SwiftUI.framework/Versions/A/SwiftUI",
+        // SwiftUI is registered above with actual implementation
         "/System/Library/Frameworks/SwiftData.framework/Versions/A/SwiftData",
         "/System/Library/Frameworks/_SwiftData_SwiftUI.framework/Versions/A/_SwiftData_SwiftUI",
         "/System/Library/Frameworks/Combine.framework/Versions/A/Combine",
