@@ -473,8 +473,8 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     sym!(s, "_swift_unknownObjectRetain", swift_noop_ptr);
     sym!(s, "_swift_unknownObjectRelease", swift_noop);
     sym!(s, "_swift_deletedMethodError", swift_deleted_method);
-    sym!(s, "_swift_getTypeByMangledNameInContext", swift_noop_ptr);
-    sym!(s, "_swift_getTypeByMangledNameInContextInMetadataState", swift_noop_ptr);
+    sym!(s, "_swift_getTypeByMangledNameInContext", swift_get_type_by_mangled_name);
+    sym!(s, "_swift_getTypeByMangledNameInContextInMetadataState", swift_get_type_by_mangled_name);
     sym!(s, "_swift_getExistentialTypeMetadata", swift_noop_ptr);
     sym!(s, "_swift_getGenericMetadata", swift_noop_ptr);
     sym!(s, "_swift_getObjCClassMetadata", swift_noop_ptr);
@@ -539,7 +539,7 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     // Metadata
     sym!(s, "_swift_allocateGenericClassMetadata", swift_noop_ptr);
     sym!(s, "_swift_allocateGenericValueMetadata", swift_noop_ptr);
-    sym!(s, "_swift_getSingletonMetadata", swift_noop_ptr);
+    sym!(s, "_swift_getSingletonMetadata", swift_get_singleton_metadata);
     sym!(s, "_swift_getForeignTypeMetadata", swift_noop_ptr);
     sym!(s, "_swift_getFunctionTypeMetadata0", swift_noop_ptr);
     sym!(s, "_swift_getFunctionTypeMetadata2", swift_noop_ptr);
@@ -663,7 +663,95 @@ unsafe extern "C" fn swift_task_create(
 unsafe extern "C" fn swift_task_alloc(size: usize) -> *mut u8 {
     unsafe { libc::malloc(size) as *mut u8 }
 }
+/// swift_getSingletonMetadata(request, descriptor) → (metadata, state)
+/// The metadata accessor calls this to create/get singleton type metadata.
+/// We create a minimal metadata struct from the descriptor.
+unsafe extern "C" fn swift_get_singleton_metadata(
+    _request: usize,
+    descriptor: *const u8,
+) -> *mut u8 {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    struct Cache(HashMap<usize, *mut u8>);
+    unsafe impl Send for Cache {}
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+    let key = descriptor as usize;
+    let mut cache = CACHE.lock().unwrap();
+    let map = &mut cache.get_or_insert_with(|| Cache(HashMap::new())).0;
+
+    if let Some(&ptr) = map.get(&key) {
+        return ptr;
+    }
+
+    // Allocate metadata: kind + descriptor pointer
+    let metadata = unsafe { libc::calloc(1, 256) } as *mut u64;
+    unsafe {
+        *metadata = 0x1;                    // kind: struct
+        *metadata.add(1) = descriptor as u64; // descriptor back-pointer
+    }
+    let ptr = metadata as *mut u8;
+    log::info!("swift_getSingletonMetadata: descriptor={:#x} → metadata={:p}", key, ptr);
+    map.insert(key, ptr);
+    ptr
+}
+
 unsafe extern "C" fn swift_isa_mask_val() -> u64 { 0x0000_7FFF_FFFF_FFF8 }
+
+/// swift_getTypeByMangledNameInContext — look up Swift type metadata.
+/// Returns a minimal valid metadata struct so callers don't get NULL.
+/// The metadata is cached per mangled name string.
+unsafe extern "C" fn swift_get_type_by_mangled_name(
+    mangled_name: *const u8,
+    mangled_name_length: i32,
+    _generic_env: *const u8,
+    _generic_args: *const *const u8,
+) -> *mut u8 {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    struct SendPtr(HashMap<Vec<u8>, *mut u8>);
+    unsafe impl Send for SendPtr {}
+    static CACHE: Mutex<Option<SendPtr>> = Mutex::new(None);
+
+    // Extract mangled name for caching
+    let key = if !mangled_name.is_null() && mangled_name_length > 0 {
+        unsafe { std::slice::from_raw_parts(mangled_name, mangled_name_length as usize) }.to_vec()
+    } else if !mangled_name.is_null() {
+        // Null-terminated
+        let mut v = Vec::new();
+        let mut p = mangled_name;
+        unsafe {
+            while *p != 0 && v.len() < 256 { v.push(*p); p = p.add(1); }
+        }
+        v
+    } else {
+        vec![0]
+    };
+
+    let mut cache = CACHE.lock().unwrap();
+    let map = &mut cache.get_or_insert_with(|| SendPtr(HashMap::new())).0;
+
+    if let Some(&ptr) = map.get(&key) {
+        return ptr;
+    }
+
+    // Create a minimal valid metadata struct:
+    // HeapMetadata { kind/vwt_ptr, superclass_or_flags }
+    // For struct metadata: kind = 0x200 (struct), followed by type descriptor
+    // We allocate enough for callers to read fields without crashing
+    let metadata = unsafe { libc::calloc(1, 256) } as *mut u64;
+    unsafe {
+        *metadata = 0x1;         // kind: struct metadata (non-null)
+        *metadata.add(1) = 0;    // description pointer (null = opaque)
+    }
+
+    let ptr = metadata as *mut u8;
+    let name_str = String::from_utf8_lossy(&key).into_owned();
+    log::info!("swift_getTypeByMangledNameInContext: '{}' → {:p}", name_str, ptr);
+    map.insert(key, ptr);
+    ptr
+}
 unsafe extern "C" fn swift_slow_alloc(size: usize, align: usize) -> *mut u8 {
     unsafe { libc::memalign(align.max(1), size) as *mut u8 }
 }

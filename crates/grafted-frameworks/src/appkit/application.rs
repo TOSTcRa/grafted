@@ -157,11 +157,39 @@ pub unsafe extern "C" fn ns_application_set_activation_policy(
 }
 
 /// C entry point: NSApplicationMain (called from main() in Cocoa apps)
+/// Also used as SwiftUI App.main() — receives Swift type metadata + witness table
+/// instead of argc/argv. We detect which calling convention based on arg values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn NSApplicationMain(
-    _argc: i32,
-    _argv: *const *const i8,
+    arg0: u64,  // argc (C) or type_metadata (Swift)
+    arg1: u64,  // argv (C) or witness_table (Swift)
 ) -> i32 {
+    log::info!("NSApplicationMain called: arg0={:#x} arg1={:#x}", arg0, arg1);
+
+    // Detect Swift vs C calling convention
+    let is_swift = arg0 > 0x1000; // Swift metadata is a pointer, C argc is small
+
+    if is_swift {
+        log::info!("NSApplicationMain: Swift App.main() — metadata={:#x} conformance={:#x}", arg0, arg1);
+
+        // Parse the conformance descriptor (relative pointers)
+        // Layout: protocol(+0), type(+4), witness_table(+8), flags(+12)
+        let conf = arg1 as *const i32;
+        let wt_rel = unsafe { *conf.add(2) }; // witness table relative pointer
+        let wt_addr = (arg1 as i64 + 8 + wt_rel as i64) as *const i32;
+        log::info!("  witness table at {:p}", wt_addr);
+
+        // Witness table entries are relative pointers.
+        // For App protocol: wt[4] is likely the body getter.
+        // Let's find the first entry that points into __TEXT (executable code).
+        for i in 0..8 {
+            let rel = unsafe { *wt_addr.add(i) };
+            let abs_addr = wt_addr as u64 + (i as u64 * 4) + rel as u64;
+            let in_text = abs_addr >= 0x100001000 && abs_addr < 0x100100000;
+            log::info!("  wt[{i}]: rel={rel:+} → {abs_addr:#x} {}", if in_text { "← CODE" } else { "" });
+        }
+    }
+
     let app = unsafe { ns_application_shared(std::ptr::null_mut(), std::ptr::null_mut()) };
     unsafe { ns_application_run(app, std::ptr::null_mut()) };
     0

@@ -117,17 +117,58 @@ pub extern "C" fn grafted_lookup_method(receiver: id, selector: SEL) -> IMP {
     }
 
     let sel_name = unsafe { std::ffi::CStr::from_ptr(selector as *const i8).to_string_lossy() };
-    if sel_name == "alloc" {
+    if sel_name == "alloc" || sel_name == "allocWithZone:" {
         return Some(unsafe { std::mem::transmute(grafted_alloc as *const ()) });
     }
-    if sel_name == "init" {
+    if sel_name == "init" || sel_name == "new" {
         return Some(unsafe { std::mem::transmute(grafted_init as *const ()) });
     }
+    if sel_name == "retain" || sel_name == "autorelease" || sel_name == "self" {
+        return Some(unsafe { std::mem::transmute(grafted_init as *const ()) }); // returns self
+    }
+    if sel_name == "release" || sel_name == "dealloc" {
+        return Some(unsafe { std::mem::transmute(grafted_noop as *const ()) });
+    }
+    if sel_name == "respondsToSelector:" || sel_name == "conformsToProtocol:"
+        || sel_name == "isKindOfClass:" || sel_name == "isMemberOfClass:" {
+        return Some(unsafe { std::mem::transmute(grafted_returns_false as *const ()) });
+    }
+    if sel_name == "class" || sel_name == "superclass" || sel_name == "description"
+        || sel_name == "debugDescription" {
+        return Some(unsafe { std::mem::transmute(grafted_returns_null as *const ()) });
+    }
+    if sel_name == "hash" || sel_name == "count" || sel_name == "length" {
+        return Some(unsafe { std::mem::transmute(grafted_returns_zero as *const ()) });
+    }
 
-    let msg = b"grafted-objc: unhandled selector sent to instance\n";
-    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
-    unsafe { libc::_exit(127) };
+    // Log unknown selectors for debugging (first N)
+    static UNHANDLED_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = UNHANDLED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 20 {
+        // Get class name if possible
+        let cls_name = get_class_name(cls);
+        log::warn!("objc: unhandled [{cls_name} {sel_name}]");
+    }
+
+    // Return a soft no-op stub instead of crashing
+    Some(unsafe { std::mem::transmute(grafted_returns_null as *const ()) })
 }
+
+fn get_class_name(cls: Class) -> String {
+    if cls.is_null() { return "?".into(); }
+    let reg = CLASS_REGISTRY.read().unwrap();
+    for (name, &addr) in reg.iter() {
+        if addr == cls as usize {
+            return name.clone();
+        }
+    }
+    format!("{:p}", cls)
+}
+
+unsafe extern "C" fn grafted_noop(_self: id, _sel: SEL) {}
+unsafe extern "C" fn grafted_returns_false(_self: id, _sel: SEL) -> i32 { 0 }
+unsafe extern "C" fn grafted_returns_null(_self: id, _sel: SEL) -> *mut u8 { std::ptr::null_mut() }
+unsafe extern "C" fn grafted_returns_zero(_self: id, _sel: SEL) -> u64 { 0 }
 
 // objc_msgSend implementation in naked assembly.
 // Must save argument registers, call grafted_lookup_method, restore registers,
