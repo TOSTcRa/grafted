@@ -43,64 +43,38 @@ pub unsafe extern "C" fn ns_application_run(
 ) {
     APP_RUNNING.store(true, Ordering::Release);
 
-    // If no windows were created by the app (SwiftUI stubs), create a default one.
-    // This goes through the proper WindowServer bridge → X11 path.
-    let main_window = display::create_window(100, 100, 800, 600, "Grafted App");
-    if let Some(wid) = main_window {
-        // Create backing CGContext for this window
-        let ctx = unsafe {
-            crate::cg::context::CGBitmapContextCreate(
-                std::ptr::null_mut(), 800, 600, 8, 800 * 4,
-                std::ptr::null(), 0,
-            )
-        };
-
-        // Draw window content using CGContext → bitmap font text rendering
-        if !ctx.is_null() {
-            use crate::cg::context::*;
-            use crate::cg::geometry::*;
-            use crate::ct::font::draw_text_bitmap;
-
-            unsafe {
-                // Background: light gray
-                CGContextSetRGBFillColor(ctx, 0.93, 0.93, 0.93, 1.0);
-                CGContextFillRect(ctx, CGRect {
-                    origin: CGPoint { x: 0.0, y: 0.0 },
-                    size: CGSize { width: 800.0, height: 600.0 },
-                });
-                // Title bar: darker gray
-                CGContextSetRGBFillColor(ctx, 0.78, 0.78, 0.78, 1.0);
-                CGContextFillRect(ctx, CGRect {
-                    origin: CGPoint { x: 0.0, y: 0.0 },
-                    size: CGSize { width: 800.0, height: 28.0 },
-                });
-                // Traffic light buttons
-                CGContextSetRGBFillColor(ctx, 1.0, 0.38, 0.34, 1.0); // red
-                CGContextFillRect(ctx, CGRect { origin: CGPoint { x: 8.0, y: 8.0 }, size: CGSize { width: 12.0, height: 12.0 } });
-                CGContextSetRGBFillColor(ctx, 1.0, 0.74, 0.17, 1.0); // yellow
-                CGContextFillRect(ctx, CGRect { origin: CGPoint { x: 28.0, y: 8.0 }, size: CGSize { width: 12.0, height: 12.0 } });
-                CGContextSetRGBFillColor(ctx, 0.21, 0.78, 0.35, 1.0); // green
-                CGContextFillRect(ctx, CGRect { origin: CGPoint { x: 48.0, y: 8.0 }, size: CGSize { width: 12.0, height: 12.0 } });
+    // Apps create windows via NSWindow API → our X11 bridge.
+    // SwiftUI apps: WindowGroup not yet implemented, so show a diagnostic window.
+    // AppKit apps: their [NSWindow init] calls go through our implementation.
+    if MAIN_WINDOW_ID.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        if let Some(wid) = display::create_window(200, 200, 640, 200, "Grafted") {
+            let ctx = unsafe {
+                crate::cg::context::CGBitmapContextCreate(
+                    std::ptr::null_mut(), 640, 200, 8, 640 * 4,
+                    std::ptr::null(), 0,
+                )
+            };
+            if !ctx.is_null() {
+                use crate::cg::context::*;
+                use crate::cg::geometry::*;
+                use crate::ct::font::draw_text_bitmap;
+                unsafe {
+                    CGContextSetRGBFillColor(ctx, 0.15, 0.15, 0.18, 1.0);
+                    CGContextFillRect(ctx, CGRect {
+                        origin: CGPoint { x: 0.0, y: 0.0 },
+                        size: CGSize { width: 640.0, height: 200.0 },
+                    });
+                }
+                draw_text_bitmap(ctx, "App loaded — SwiftUI render not yet wired", 20.0, 20.0, [1.0, 0.8, 0.2, 1.0], 1.5);
+                draw_text_bitmap(ctx, "AppKit [NSWindow] calls translate to X11 properly", 20.0, 60.0, [0.7, 0.7, 0.7, 1.0], 1.0);
+                draw_text_bitmap(ctx, "Need SwiftUI WindowGroup -> NSWindow bridge", 20.0, 85.0, [0.7, 0.7, 0.7, 1.0], 1.0);
+                draw_text_bitmap(ctx, "Press ESC to quit", 20.0, 130.0, [0.4, 0.8, 1.0, 1.0], 1.0);
+                display::show_window(wid);
+                display::flush_window(wid, ctx);
             }
-
-            // Title text
-            draw_text_bitmap(ctx, "Grafted App", 320.0, 6.0, [0.2, 0.2, 0.2, 1.0], 1.0);
-
-            // App info text
-            draw_text_bitmap(ctx, "Darwin binary running on Linux via Grafted", 40.0, 60.0, [0.1, 0.1, 0.1, 1.0], 1.5);
-            draw_text_bitmap(ctx, "CoreFoundation + CoreGraphics + AppKit + SwiftUI", 40.0, 100.0, [0.3, 0.3, 0.3, 1.0], 1.0);
-            draw_text_bitmap(ctx, "CGContext -> software renderer -> XImage -> X11", 40.0, 120.0, [0.3, 0.3, 0.3, 1.0], 1.0);
-            draw_text_bitmap(ctx, "Press ESC to quit, close window button works", 40.0, 160.0, [0.0, 0.0, 0.6, 1.0], 1.0);
+            MAIN_WINDOW_ID.store(wid, std::sync::atomic::Ordering::Release);
+            MAIN_WINDOW_CTX.store(ctx as *mut u8, std::sync::atomic::Ordering::Release);
         }
-
-        display::show_window(wid);
-        if !ctx.is_null() {
-            display::flush_window(wid, ctx);
-        }
-
-        MAIN_WINDOW_ID.store(wid, std::sync::atomic::Ordering::Release);
-        MAIN_WINDOW_CTX.store(ctx as *mut u8, std::sync::atomic::Ordering::Release);
-        log::info!("NSApplication: default window created and shown (800x600)");
     }
 
     log::info!("NSApplication: entering main run loop");
