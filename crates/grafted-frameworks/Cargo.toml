@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 grafted-objc.workspace = true
+goblin.workspace = true
 thiserror.workspace = true
 log.workspace = true
 libc = "0.2"

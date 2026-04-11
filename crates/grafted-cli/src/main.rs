@@ -115,6 +115,9 @@ fn main() -> ExitCode {
             }
         }
 
+        // Register Swift metadata sections with the Linux Swift runtime
+        grafted_frameworks::swift_sections::register_swift_sections(&binary.data);
+
         if let Err(e) = linker.run_all_initializers(&binary) {
             eprintln!("grafted: failed to run initializers: {e}");
             return ExitCode::FAILURE;

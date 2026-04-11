@@ -173,6 +173,7 @@ dependencies = [
  "clap",
  "env_logger",
  "grafted-dyld",
+ "grafted-frameworks",
  "grafted-kernel",
  "grafted-loader",
  "libc",
@@ -197,6 +198,7 @@ dependencies = [
 name = "grafted-frameworks"
 version = "0.1.0"
 dependencies = [
+ "goblin",
  "grafted-objc",
  "libc",
  "log",

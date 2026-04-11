@@ -12,6 +12,7 @@ path = "src/main.rs"
 grafted-loader.workspace = true
 grafted-kernel.workspace = true
 grafted-dyld.workspace = true
+grafted-frameworks.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 log.workspace = true
