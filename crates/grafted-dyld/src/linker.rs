@@ -306,47 +306,8 @@ impl Linker {
                 }
             }
         }
-        // Initialize class_data pointers for Swift class metadata in the main binary.
-        // The full register_objc_metadata hangs on complex method lists. Instead, just
-        // scan __objc_classlist and ensure each class has a non-NULL data pointer
-        // (needed by the Swift runtime's isCanonicalStaticallySpecializedGenericMetadata).
-        {
-            let macho = MachO::parse(&main_binary.data, 0).ok();
-            if let Some(ref macho) = macho {
-                for seg in &macho.segments {
-                    for section_res in seg {
-                        if let Ok((section, _)) = section_res {
-                            if section.name().unwrap_or("") == "__objc_classlist" {
-                                let count = section.size / 8;
-                                let ptrs = section.addr as *const u64;
-                                for i in 0..count {
-                                    let cls_addr = unsafe { std::ptr::read_unaligned(ptrs.add(i as usize)) };
-                                    if cls_addr == 0 { continue; }
-                                    // Check if class_data (at cls+24) is NULL
-                                    let data_ptr_addr = (cls_addr + 24) as *mut u64;
-                                    let data_val = unsafe { std::ptr::read_unaligned(data_ptr_addr) };
-                                    if data_val == 0 {
-                                        // Create a minimal class_ro_t
-                                        let ro = unsafe { libc::calloc(1, 128) } as *mut u64;
-                                        unsafe {
-                                            *ro = 0;  // flags
-                                            // instance_size at offset 8
-                                            *(ro.add(1)) = 256; // generous instance size
-                                        }
-                                        let page = (data_ptr_addr as usize & !0xFFF) as *mut libc::c_void;
-                                        unsafe {
-                                            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE);
-                                            std::ptr::write_unaligned(data_ptr_addr, ro as u64);
-                                        }
-                                    }
-                                }
-                                log::info!("Initialized class_data for {} ObjC classes", count);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // ObjC class_data fixup is now handled by swift_metadata_translate.rs
+        // which runs before section registration in the pipeline.
 
         // In Darwin, initializers are called in bottom-up order (dependencies first).
         // Skip slid libraries for now (init funcs also use pre-slide addresses).

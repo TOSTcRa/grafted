@@ -115,6 +115,11 @@ fn main() -> ExitCode {
             }
         }
 
+        // Translate Swift metadata layout (Mach-O → Linux compatible)
+        // Must run AFTER fixups (which resolve absolute pointers) but BEFORE
+        // section registration (which hands metadata to the runtime).
+        grafted_frameworks::swift_metadata_translate::translate_swift_metadata(&binary.data);
+
         // Register Swift metadata sections with the Linux Swift runtime
         grafted_frameworks::swift_sections::register_swift_sections(&binary.data);
 

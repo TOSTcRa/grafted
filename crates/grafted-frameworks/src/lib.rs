@@ -12,4 +12,5 @@ pub mod foundation;
 pub mod appkit;
 pub mod swift_runtime;
 pub mod swift_sections;
+pub mod swift_metadata_translate;
 pub mod registry;

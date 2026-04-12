@@ -89,54 +89,8 @@ pub fn load_swift_runtime() -> usize {
                 handles.push(handle);
                 log::info!("Swift runtime: loaded {}", lib_name);
 
-                // Patch isCanonicalStaticallySpecializedGenericMetadata to return false.
-                // This function crashes on Mach-O metadata because it follows pointers
-                // that aren't valid in our hybrid runtime. Returning false just means
-                // the runtime creates metadata from scratch (slower but correct).
-                // The function is a local symbol (not exported), so we compute its
-                // address from the library base + known offset.
-                if *lib_name == "libswiftCore.so" {
-                    // Find base address using a known exported symbol
-                    let known = CString::new("swift_retain").unwrap();
-                    let known_addr = unsafe { libc::dlsym(handle, known.as_ptr()) };
-                    if !known_addr.is_null() {
-                        // swift_retain is at offset in the .so — get it from nm
-                        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-                        if unsafe { libc::dladdr(known_addr, &mut info) } != 0 {
-                            let base = info.dli_fbase as usize;
-                            // isCanonicalStaticallySpecializedGenericMetadata at offset 0x40f0b0
-                            let func = (base + 0x40f0b0) as *mut u8;
-                            let page = (func as usize & !0xFFF) as *mut libc::c_void;
-                            unsafe {
-                                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC);
-                                // xor eax, eax; ret = 31 c0 c3
-                                *func = 0x31;
-                                *func.add(1) = 0xc0;
-                                *func.add(2) = 0xc3;
-                                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
-                            }
-                            log::info!("Swift runtime: patched isCanonicalStaticallySpecializedGenericMetadata at {:#x}", func as usize);
-
-                            // Also patch areAllTransitiveMetadataComplete_cheap → return true
-                            // Same issue: walks Mach-O metadata transitively, hits NULL pointers.
-                            for offset in [0x420850_usize, 0x420b00] {
-                                let func2 = (base + offset) as *mut u8;
-                                let page2 = (func2 as usize & !0xFFF) as *mut libc::c_void;
-                                unsafe {
-                                    libc::mprotect(page2, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC);
-                                    *func2 = 0xb8;
-                                    *func2.add(1) = 0x01;
-                                    *func2.add(2) = 0x00;
-                                    *func2.add(3) = 0x00;
-                                    *func2.add(4) = 0x00;
-                                    *func2.add(5) = 0xc3;
-                                    libc::mprotect(page2, 8192, libc::PROT_READ | libc::PROT_EXEC);
-                                }
-                                log::info!("Swift runtime: patched metadata check at {:#x}", func2 as usize);
-                            }
-                        }
-                    }
-                }
+                // No binary patches — the metadata translation layer
+                // (swift_metadata_translate.rs) fixes the data at load time.
             } // end for lib_name in SWIFT_LIBS
 
             if handles.is_empty() {
