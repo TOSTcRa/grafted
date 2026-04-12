@@ -61,21 +61,42 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
         let stubs_only = swift_runtime_symbols();
         let mut merged = stubs_only.clone();
         merged.extend(real_swift);
-        // Keep our stubs for metadata functions that cause spin loops.
-        // The real runtime + patches handle memory ops natively, but metadata
-        // resolution loops because Mach-O descriptors can't be fully resolved.
-        for sym_name in [
-            "_swift_getSingletonMetadata", "swift_getSingletonMetadata",
-            "_swift_conformsToProtocol", "swift_conformsToProtocol",
-            "_swift_getWitnessTable", "swift_getWitnessTable",
-            "_swift_getAssociatedTypeWitness", "swift_getAssociatedTypeWitness",
-            "_swift_getAssociatedConformanceWitness", "swift_getAssociatedConformanceWitness",
-            "_swift_checkMetadataState", "swift_checkMetadataState",
-            "_swift_getGenericMetadata", "swift_getGenericMetadata",
-        ] {
-            if let Some(addr) = stubs_only.get(sym_name) {
-                merged.insert(sym_name.into(), *addr);
+        // With the metadata translation layer (swift_metadata_translate.rs),
+        // all class metadata has valid layout. Let the real runtime handle
+        // everything. Only keep conformsToProtocol stub as fallback
+        // (protocol conformance scanning doesn't work across Mach-O/ELF boundary).
+        // Set GRAFTED_SWIFT_STUBS=1 to restore all stubs for debugging.
+        if std::env::var("GRAFTED_SWIFT_STUBS").is_ok() {
+            log::info!("GRAFTED_SWIFT_STUBS: keeping all metadata stubs");
+            for sym_name in [
+                "_swift_getSingletonMetadata", "swift_getSingletonMetadata",
+                "_swift_conformsToProtocol", "swift_conformsToProtocol",
+                "_swift_getWitnessTable", "swift_getWitnessTable",
+                "_swift_getAssociatedTypeWitness", "swift_getAssociatedTypeWitness",
+                "_swift_getAssociatedConformanceWitness", "swift_getAssociatedConformanceWitness",
+                "_swift_checkMetadataState", "swift_checkMetadataState",
+                "_swift_getGenericMetadata", "swift_getGenericMetadata",
+            ] {
+                if let Some(addr) = stubs_only.get(sym_name) {
+                    merged.insert(sym_name.into(), *addr);
+                }
             }
+        } else {
+            // Only swift_conformsToProtocol stays as stub — it scans ALL
+            // loaded images for protocol conformances, which spins when
+            // it finds conformance records referencing types from incomplete
+            // framework stubs. All other metadata functions use the real runtime.
+            // conformsToProtocol + getWitnessTable: both scan cross-image
+            // and spin on incomplete framework types
+            for sym_name in [
+                "_swift_conformsToProtocol", "swift_conformsToProtocol",
+                "_swift_getWitnessTable", "swift_getWitnessTable",
+            ] {
+                if let Some(addr) = stubs_only.get(sym_name) {
+                    merged.insert(sym_name.into(), *addr);
+                }
+            }
+            log::info!("Swift runtime: real metadata functions (1 stub: conformsToProtocol)");
         }
         merged
     };

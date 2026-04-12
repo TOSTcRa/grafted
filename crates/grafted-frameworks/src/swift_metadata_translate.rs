@@ -102,86 +102,84 @@ fn fix_class_descriptor(descriptor_addr: u64) -> Option<u32> {
     Some(0) // descriptor itself doesn't need fixing — the metadata records do
 }
 
-/// Fix the ObjC class prefix layout for a class at the given address.
-/// Darwin objc_class layout:
-///   +0:  isa (metaclass pointer)
-///   +8:  superclass
-///   +16: cache (cache_t: buckets(8) + mask/occupied(8))
-///   +32: data (class_ro_t* with low bits as flags)
+/// Translate Darwin class metadata layout to Linux layout.
 ///
-/// Returns true if any fix was applied.
+/// The key difference: Darwin has ObjC cache_t (16 bytes) at +16, which
+/// shifts ALL subsequent fields by 24 bytes compared to Linux:
+///
+///   Field                  Darwin offset   Linux offset
+///   isa                    +0              +0
+///   superclass             +8              +8
+///   cache_t (ObjC)         +16 (16 bytes)  (not present)
+///   class_data_bits        +32             (not present)
+///   Swift Flags            +40             +16
+///   InstanceAddressPoint   +44             +20
+///   InstanceSize           +48             +24
+///   InstanceAlignMask      +52             +28
+///   Reserved               +54             +30
+///   ClassSize              +56             +32
+///   ClassAddressPoint      +60             +36
+///   Description            +64             +40
+///
+/// The translation copies Swift-specific fields from Darwin offsets to
+/// Linux offsets IN-PLACE so the Linux runtime reads correct values.
 fn fix_objc_class_prefix(cls_addr: u64) -> bool {
     if cls_addr < 0x1000 { return false; }
-    let mut fixed = false;
 
-    // Read the data pointer at +32 (NOT +24 — class_t.data is after the 16-byte cache_t)
-    let data_ptr_addr = (cls_addr + 32) as *mut u64;
-    let data_val = unsafe { std::ptr::read_unaligned(data_ptr_addr) };
+    // Check if this is Swift class metadata by looking for the description
+    // pointer at Darwin offset +64 (should be a valid address in __TEXT/__DATA)
+    let darwin_desc_addr = (cls_addr + 64) as *const u64;
+    let desc_val = unsafe { std::ptr::read_unaligned(darwin_desc_addr) };
 
-    // Strip the low 3 bits (flags) to get the actual pointer
-    let data_ptr = data_val & !0x7;
+    // Only translate if there's a valid-looking description pointer
+    if desc_val < 0x100000000 || desc_val > 0x200000000 { return false; }
 
-    if data_ptr == 0 {
-        // Data pointer is NULL — create a minimal class_ro_t
-        let ro = unsafe { libc::calloc(1, 128) } as *mut u64;
-        unsafe {
-            *ro = 0x80; // flags: RO_IS_SWIFT_STABLE (bit 7)
-            *ro.add(1) = 256; // instance start
-            *ro.add(2) = 256; // instance size
-        }
-        let page = (data_ptr_addr as usize & !0xFFF) as *mut libc::c_void;
-        unsafe {
-            libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE);
-            std::ptr::write_unaligned(data_ptr_addr, ro as u64 | (data_val & 0x7));
-            libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE);
-        }
-        fixed = true;
-        log::debug!("  fixed class_data at {:#x}", cls_addr);
+    // Verify it's actually a class descriptor (kind = 16)
+    let flags = unsafe { std::ptr::read_unaligned(desc_val as *const u32) };
+    let kind = flags & 0x1F;
+    if kind != 16 { return false; }
+
+    let page = (cls_addr as usize & !0xFFF) as *mut libc::c_void;
+    unsafe { libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE) };
+
+    // Copy Swift fields from Darwin offsets to Linux offsets (shift by -24)
+    // Darwin +40 → Linux +16 (Flags, 4 bytes)
+    // Darwin +44 → Linux +20 (InstanceAddressPoint, 4 bytes)
+    // Darwin +48 → Linux +24 (InstanceSize, 4 bytes)
+    // Darwin +52 → Linux +28 (InstanceAlignMask, 2 bytes)
+    // Darwin +54 → Linux +30 (Reserved, 2 bytes)
+    // Darwin +56 → Linux +32 (ClassSize, 4 bytes)
+    // Darwin +60 → Linux +36 (ClassAddressPoint, 4 bytes)
+    // Darwin +64 → Linux +40 (Description, 8 bytes)
+    // Darwin +72 → Linux +48 (IVarDestroyer?, 8 bytes)
+    //
+    // We copy the 40-byte block from +40 to +16 (shifting left by 24)
+    unsafe {
+        let src = (cls_addr + 40) as *const u8;
+        let dst = (cls_addr + 16) as *mut u8;
+        // Copy 40 bytes: flags(4) + addressPoint(4) + instanceSize(4) +
+        // alignMask(2) + reserved(2) + classSize(4) + classAddressPoint(4) +
+        // description(8) + ivarDestroyer(8)
+        std::ptr::copy(src, dst, 40);
     }
 
-    // Also fix the metaclass (pointed to by isa at +0)
+    log::debug!("  translated class metadata at {:#x} (Darwin→Linux layout shift -24)", cls_addr);
+
+    // Also translate the metaclass
     let isa = unsafe { std::ptr::read_unaligned(cls_addr as *const u64) };
-    if isa > 0x1000 {
-        let meta_data_ptr_addr = (isa + 32) as *mut u64;
-        let meta_data_val = unsafe { std::ptr::read_unaligned(meta_data_ptr_addr) };
-        let meta_data_ptr = meta_data_val & !0x7;
-
-        if meta_data_ptr == 0 {
-            let meta_ro = unsafe { libc::calloc(1, 128) } as *mut u64;
+    if isa > 0x100000000 && isa < 0x200000000 {
+        let meta_desc = unsafe { std::ptr::read_unaligned((isa + 64) as *const u64) };
+        if meta_desc >= 0x100000000 && meta_desc < 0x200000000 {
+            let meta_page = (isa as usize & !0xFFF) as *mut libc::c_void;
             unsafe {
-                *meta_ro = 0x81; // flags: RO_META | RO_IS_SWIFT_STABLE
-                *meta_ro.add(1) = 40; // meta instance start
-                *meta_ro.add(2) = 40; // meta instance size
+                libc::mprotect(meta_page, 8192, libc::PROT_READ | libc::PROT_WRITE);
+                let src = (isa + 40) as *const u8;
+                let dst = (isa + 16) as *mut u8;
+                std::ptr::copy(src, dst, 40);
             }
-            let page = (meta_data_ptr_addr as usize & !0xFFF) as *mut libc::c_void;
-            unsafe {
-                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE);
-                std::ptr::write_unaligned(meta_data_ptr_addr, meta_ro as u64 | (meta_data_val & 0x7));
-            }
-            fixed = true;
-            log::debug!("  fixed metaclass_data for isa at {:#x}", isa);
+            log::debug!("  translated metaclass at {:#x}", isa);
         }
     }
 
-    // Check and fix the Swift description pointer
-    // For Swift class metadata, the description is at a variable offset after
-    // the ObjC prefix. The exact offset depends on the class hierarchy.
-    // For most Swift classes: offset +64 or +72 from the metadata start.
-    // We scan for a value that looks like a type descriptor address.
-    for desc_offset in [64_u64, 72, 80, 40, 48] {
-        let desc_ptr_addr = (cls_addr + desc_offset) as *const u64;
-        let desc_val = unsafe { std::ptr::read_unaligned(desc_ptr_addr) };
-        // Check if this looks like a valid descriptor (in the binary's address range)
-        if desc_val >= 0x100100000 && desc_val < 0x100200000 {
-            // Verify it starts with valid ContextDescriptor flags
-            let flags = unsafe { *(desc_val as *const u32) };
-            let kind = flags & 0x1F;
-            if kind == 16 { // class descriptor
-                log::trace!("  description at +{}: {:#x} → valid class descriptor", desc_offset, desc_val);
-                break;
-            }
-        }
-    }
-
-    fixed
+    true
 }
