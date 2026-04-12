@@ -118,6 +118,88 @@ pub unsafe extern "C" fn ns_application_run(
     log::info!("NSApplication: exited main run loop");
 }
 
+/// Find the body getter function by scanning the conformance descriptor's
+/// witness table pattern for relative pointers that resolve to __TEXT addresses.
+/// `search_addr` can be either a conformance descriptor or a metadata address.
+fn find_body_getter(search_addr: u64) -> Option<u64> {
+    if search_addr < 0x1000 { return None; }
+
+    // Determine if this is a conformance descriptor (in __DATA_CONST range)
+    // or metadata (on heap or in __DATA)
+    let conf_addr = if search_addr >= 0x100100000 && search_addr < 0x100140000 {
+        // Likely in __DATA_CONST — treat as conformance descriptor
+        search_addr
+    } else {
+        // Metadata address — scan __swift5_proto to find matching conformance.
+        // Each entry in __swift5_proto is a 4-byte relative pointer to a conformance.
+        // We scan for one whose type descriptor matches our metadata's descriptor.
+
+        // Read the type descriptor from metadata (for struct: at +8 after Darwin→Linux translation)
+        // For struct metadata (kind=0x200): descriptor at +8
+        let kind = unsafe { *(search_addr as *const u64) };
+        let type_desc = if kind == 0x200 {
+            unsafe { *((search_addr + 8) as *const u64) }
+        } else {
+            // For class metadata with Darwin→Linux translation: description at +40
+            unsafe { *((search_addr + 40) as *const u64) }
+        };
+
+        if type_desc < 0x100000000 || type_desc > 0x100200000 {
+            log::debug!("  type descriptor {:#x} out of range", type_desc);
+            return None;
+        }
+        log::info!("  searching __swift5_proto for type descriptor {:#x}", type_desc);
+
+        // Scan __swift5_proto section (range 0x1001268e0, size 0x5e8 from Maccy)
+        // Each entry is a 4-byte relative pointer to a conformance descriptor
+        let proto_start: u64 = 0x1001268e0;
+        let proto_count: u64 = 0x5e8 / 4;
+        let mut found = 0u64;
+
+        for i in 0..proto_count {
+            let entry_addr = proto_start + i * 4;
+            let rel = unsafe { *(entry_addr as *const i32) };
+            let conf = (entry_addr as i64 + rel as i64) as u64;
+
+            // Read the conformance's type relative pointer at +4
+            let type_rel = unsafe { *((conf + 4) as *const i32) };
+            let conf_type = (conf as i64 + 4 + type_rel as i64) as u64;
+
+            if conf_type == type_desc {
+                found = conf;
+                log::info!("  found conformance at {:#x} for type {:#x}", conf, type_desc);
+                break;
+            }
+        }
+
+        if found == 0 { return None; }
+        found
+    };
+
+    // Now scan the conformance's witness table pattern for the body getter
+    let conf = conf_addr as *const i32;
+    let wt_rel = unsafe { *conf.add(2) };
+    let wt_base = (conf_addr as i64 + 8 + wt_rel as i64) as u64;
+
+    for i in 0..60_usize {
+        let entry_addr = wt_base + (i as u64) * 4;
+        let rel = unsafe { *(entry_addr as *const i32) };
+        let abs_addr = entry_addr as i64 + rel as i64;
+
+        if abs_addr >= 0x100001000 && abs_addr < 0x100100000 {
+            let addr = abs_addr as u64;
+            let first_byte = unsafe { *(addr as *const u8) };
+            if first_byte == 0x55 || first_byte == 0x53 || first_byte == 0x48
+                || first_byte == 0x41 || first_byte == 0x50 {
+                log::info!("  wt[{i}] → {addr:#x} — body getter function!");
+                return Some(addr);
+            }
+        }
+    }
+
+    None
+}
+
 static MAIN_WINDOW_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static MAIN_WINDOW_CTX: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -189,6 +271,44 @@ pub extern "C" fn grafted_swiftui_create_window(title: *const i8, w: i32, h: i32
     }
 }
 
+/// Called from SwiftUI.swift App.main() to save the type metadata address.
+/// We use this to find the matching conformance descriptor in __swift5_proto.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafted_swiftui_save_conformance(metadata: u64) {
+    // Store the metadata addr. find_body_getter will search __swift5_proto
+    // for a conformance whose type descriptor matches.
+    SWIFT_CONFORMANCE_ADDR.store(metadata, std::sync::atomic::Ordering::Release);
+    log::info!("Saved Swift metadata at {:#x}", metadata);
+}
+
+/// Called from SwiftUI.swift App.main() to find and call the binary's body getter.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafted_swiftui_call_body(metadata: u64) -> i32 {
+    let conf_addr = SWIFT_CONFORMANCE_ADDR.load(std::sync::atomic::Ordering::Acquire);
+    if conf_addr == 0 {
+        log::warn!("grafted_swiftui_call_body: no conformance address");
+        return 0;
+    }
+
+    if let Some(body_fn) = find_body_getter(conf_addr) {
+        log::info!("Calling binary's body getter at {:#x}", body_fn);
+
+        let instance = unsafe { libc::calloc(1, 512) } as *mut u8;
+
+        type BodyGetter = unsafe extern "C" fn(*mut u8);
+        let getter: BodyGetter = unsafe { std::mem::transmute(body_fn) };
+        unsafe { getter(instance) };
+
+        log::info!("Body getter returned");
+        return 1;
+    }
+
+    log::warn!("Could not find body getter");
+    0
+}
+
+static SWIFT_CONFORMANCE_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Called from SwiftUI.swift App.main() after body is evaluated — enters the run loop.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafted_swiftui_run_loop() {
@@ -242,26 +362,37 @@ pub unsafe extern "C" fn NSApplicationMain(
     log::info!("NSApplicationMain called: arg0={:#x} arg1={:#x}", arg0, arg1);
 
     // Detect Swift vs C calling convention
-    let is_swift = arg0 > 0x1000; // Swift metadata is a pointer, C argc is small
+    let is_swift = arg0 > 0x1000;
 
     if is_swift {
-        log::info!("NSApplicationMain: Swift App.main() — metadata={:#x} conformance={:#x}", arg0, arg1);
+        log::info!("NSApplicationMain: Swift App.main() — metadata={:#x}", arg0);
 
-        // Parse the conformance descriptor (relative pointers)
-        // Layout: protocol(+0), type(+4), witness_table(+8), flags(+12)
-        let conf = arg1 as *const i32;
-        let wt_rel = unsafe { *conf.add(2) }; // witness table relative pointer
-        let wt_addr = (arg1 as i64 + 8 + wt_rel as i64) as *const i32;
-        log::info!("  witness table at {:p}", wt_addr);
+        // The metadata addr was saved by grafted_swiftui_save_conformance.
+        // Search __swift5_proto for a conformance descriptor whose type
+        // matches this metadata, then find and call the body getter.
+        let conf_addr = SWIFT_CONFORMANCE_ADDR.load(std::sync::atomic::Ordering::Acquire);
 
-        // Witness table entries are relative pointers.
-        // For App protocol: wt[4] is likely the body getter.
-        // Let's find the first entry that points into __TEXT (executable code).
-        for i in 0..8 {
-            let rel = unsafe { *wt_addr.add(i) };
-            let abs_addr = wt_addr as u64 + (i as u64 * 4) + rel as u64;
-            let in_text = abs_addr >= 0x100001000 && abs_addr < 0x100100000;
-            log::info!("  wt[{i}]: rel={rel:+} → {abs_addr:#x} {}", if in_text { "← CODE" } else { "" });
+        // If no conformance stored, search for it using the metadata address.
+        // The conformance's type field is a relative pointer to the type descriptor,
+        // which is at metadata[1] (struct) or metadata+64/+40 (class).
+        let search_addr = if conf_addr > 0 { conf_addr } else { arg0 };
+
+        if let Some(body_fn) = find_body_getter(search_addr) {
+            log::info!("  body getter at {:#x} — calling binary's own code!", body_fn);
+
+            let instance = unsafe { libc::calloc(1, 512) } as *mut u8;
+
+            // Call the body getter. Swift method witnesses use this convention:
+            //   fn(self: *mut App, metadata: *const Metadata, witness_table: *const WitnessTable)
+            // We pass our zeroed instance, the metadata, and a fake witness table.
+            let fake_wt = unsafe { libc::calloc(1, 256) } as *mut u8;
+            type BodyGetter = unsafe extern "C" fn(*mut u8, u64, *mut u8);
+            let getter: BodyGetter = unsafe { std::mem::transmute(body_fn) };
+            unsafe { getter(instance, arg0, fake_wt) };
+
+            log::info!("  body getter executed — app's own UI created");
+        } else {
+            log::warn!("  body getter not found — showing fallback window");
         }
     }
 

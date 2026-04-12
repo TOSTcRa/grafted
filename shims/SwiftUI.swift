@@ -12,13 +12,19 @@ import Foundation
 
 // Forward declarations for our C functions in grafted
 @_silgen_name("NSApplicationMain")
-func _NSApplicationMain(_ argc: Int32, _ argv: UnsafePointer<UnsafePointer<CChar>>?) -> Int32
+func _NSApplicationMain(_ arg0: UInt, _ arg1: UInt) -> Int32
 
 @_silgen_name("grafted_swiftui_create_window")
 func _grafted_create_window(_ title: UnsafePointer<CChar>, _ w: Int32, _ h: Int32) -> Int32
 
 @_silgen_name("grafted_swiftui_run_loop")
 func _grafted_run_loop()
+
+@_silgen_name("grafted_swiftui_save_conformance")
+func _grafted_save_conformance(_ conformance: UInt)
+
+@_silgen_name("grafted_swiftui_call_body")
+func _grafted_call_body(_ metadata: UInt) -> Int32
 
 // Core protocols
 public protocol Scene {
@@ -62,6 +68,30 @@ public struct MenuBarExtra<Label, Content>: Scene {
     }
 }
 
+// Extension for MenuBarExtra where Label == Text (used by Maccy)
+extension MenuBarExtra where Label == Text {
+    public init(_ titleKey: LocalizedStringKey, isInserted: Binding<Bool>, @ViewBuilder content: () -> Content) {
+        let str = titleKey.stringValue
+        let _ = str.withCString { ptr in
+            _grafted_create_window(ptr, 400, 500)
+        }
+    }
+
+    public init(_ titleKey: LocalizedStringKey, @ViewBuilder content: () -> Content) {
+        let str = titleKey.stringValue
+        let _ = str.withCString { ptr in
+            _grafted_create_window(ptr, 400, 500)
+        }
+    }
+}
+
+// LocalizedStringKey needs a way to extract the string
+public struct LocalizedStringKey: ExpressibleByStringLiteral {
+    public var stringValue: String
+    public init(stringLiteral value: String) { self.stringValue = value }
+    public init(_ value: String) { self.stringValue = value }
+}
+
 // View protocol
 public protocol View {
 }
@@ -98,6 +128,9 @@ public struct Text: View {
 @propertyWrapper
 public struct State<Value> {
     public var wrappedValue: Value
+    public var projectedValue: Binding<Value> {
+        Binding(get: { self.wrappedValue }, set: { _ in })
+    }
     public init(wrappedValue: Value) { self.wrappedValue = wrappedValue }
 }
 
@@ -132,13 +165,16 @@ public enum ScenePhase: Equatable {
 // This IS our SwiftUI implementation — not a hack.
 extension App {
     public static func main() {
-        // The binary passes us type metadata + conformance descriptor.
-        // We can't call Self() because the conformance's init witness
-        // uses Mach-O relative pointers incompatible with Linux runtime.
-        // Instead, create the app's window directly — this is what the
-        // real SwiftUI App.main() does internally (create scenes, enter loop).
-        _grafted_create_window("Maccy", 400, 500)
-        _grafted_run_loop()
+        // Get the type metadata for Self (our App conforming type)
+        let metadata = unsafeBitCast(Self.self, to: UInt.self)
+        // Save it so our Rust code can find the conformance + body getter
+        _grafted_save_conformance(metadata)
+        // Call our NSApplicationMain which will:
+        // 1. Search __swift5_proto for the conformance matching this metadata
+        // 2. Find the body getter function in the witness table pattern
+        // 3. Call the body getter directly (bypassing protocol dispatch)
+        // 4. Enter the event loop
+        let _ = _NSApplicationMain(metadata, 0)
     }
 }
 

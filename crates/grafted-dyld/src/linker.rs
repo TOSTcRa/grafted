@@ -12,8 +12,19 @@ unsafe extern "C" fn shim_unresolved_trap() -> ! {
     unsafe { libc::_exit(127) };
 }
 
-/// Soft stub: returns 0/NULL instead of aborting.
-unsafe extern "C" fn shim_unresolved_soft() -> u64 { 0 }
+/// Soft stub: returns a valid heap pointer instead of NULL.
+/// Returning 0 causes crashes when callers use the return value as
+/// a function pointer or type metadata. A valid allocation is safer.
+unsafe extern "C" fn shim_unresolved_soft() -> *mut u8 {
+    // Return a lazily-allocated zeroed page. All calls share the same page.
+    static STUB_PAGE: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let mut ptr = STUB_PAGE.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        ptr = unsafe { libc::calloc(1, 4096) } as *mut u8;
+        STUB_PAGE.store(ptr, std::sync::atomic::Ordering::Release);
+    }
+    ptr
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {

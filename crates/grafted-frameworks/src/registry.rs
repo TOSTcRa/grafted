@@ -86,8 +86,8 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
             // loaded images for protocol conformances, which spins when
             // it finds conformance records referencing types from incomplete
             // framework stubs. All other metadata functions use the real runtime.
-            // conformsToProtocol + getWitnessTable: both scan cross-image
-            // and spin on incomplete framework types
+            // conformsToProtocol + getWitnessTable: both involve cross-image
+            // scanning that spins on incomplete framework conformances.
             for sym_name in [
                 "_swift_conformsToProtocol", "swift_conformsToProtocol",
                 "_swift_getWitnessTable", "swift_getWitnessTable",
