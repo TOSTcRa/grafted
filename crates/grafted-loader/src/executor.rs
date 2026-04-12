@@ -431,6 +431,15 @@ unsafe extern "C" fn sigsegv_handler(
     w(&mut buf, &mut p, b" rdi=0x"); wh(&mut buf, &mut p, rdi);
     w(&mut buf, &mut p, b" rsi=0x"); wh(&mut buf, &mut p, rsi);
     w(&mut buf, &mut p, b"\n  rsp=0x"); wh(&mut buf, &mut p, rsp);
+    // Dump memory at rdi to debug metadata issues
+    if rdi > 0x10000 && rdi < 0x7FFF_FFFF_FFFF {
+        w(&mut buf, &mut p, b"\n  *rdi:");
+        for i in 0..10u64 {
+            let val = unsafe { *((rdi + i * 8) as *const u64) };
+            if i == 4 { w(&mut buf, &mut p, b"\n      "); }
+            w(&mut buf, &mut p, b" "); wh(&mut buf, &mut p, val);
+        }
+    }
     buf[p] = b'\n'; p += 1;
     unsafe { libc::write(2, buf.as_ptr() as *const _, p) };
     unsafe { libc::_exit(139) };

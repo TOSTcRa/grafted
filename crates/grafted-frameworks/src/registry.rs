@@ -61,7 +61,9 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
         let stubs_only = swift_runtime_symbols();
         let mut merged = stubs_only.clone();
         merged.extend(real_swift);
-        // Keep our implementations for functions that spin on fake metadata
+        // Keep our stubs for metadata functions that cause spin loops.
+        // The real runtime + patches handle memory ops natively, but metadata
+        // resolution loops because Mach-O descriptors can't be fully resolved.
         for sym_name in [
             "_swift_getSingletonMetadata", "swift_getSingletonMetadata",
             "_swift_conformsToProtocol", "swift_conformsToProtocol",
@@ -115,16 +117,23 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
     reg.insert("/usr/lib/libSystem.B.dylib".into(), system_extras());
     reg.insert("self".into(), system_extras());
 
-    // SwiftUI — minimal implementation to get apps into the event loop
+    // SwiftUI — use our compiled shim (shims/libSwiftUI.so) symbols if available,
+    // otherwise fall back to stubs.
     {
         let mut swiftui = HashMap::new();
-        // App.main() → our NSApplicationMain (enters the run loop)
+        // Start with stub defaults
         swiftui.insert("_$s7SwiftUI3AppPAAE4mainyyFZ".into(),
             crate::appkit::application::NSApplicationMain as *const () as u64);
-        // App delegate adaptor stubs
         swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVMa".into(), swift_noop_ptr as *const () as u64);
         swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVMn".into(), swift_noop_ptr as *const () as u64);
         swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVyACyxGxmcfC".into(), swift_noop_ptr as *const () as u64);
+        // Override with REAL shim symbols (from compiled libSwiftUI.so)
+        // These include App.main() that calls body getter → creates real windows
+        for (k, v) in &swift_syms {
+            if k.contains("SwiftUI") {
+                swiftui.insert(k.clone(), *v);
+            }
+        }
         reg.insert("/System/Library/Frameworks/SwiftUI.framework/Versions/A/SwiftUI".into(), swiftui);
     }
 

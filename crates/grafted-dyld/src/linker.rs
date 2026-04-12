@@ -296,13 +296,57 @@ impl Linker {
 
     /// Run initializers for all loaded libraries, then the main binary.
     pub fn run_all_initializers(&self, main_binary: &MachOBinary) -> Result<(), LinkError> {
-        // Register ObjC classes. Skip slid dylibs (vmaddr=0 → slid to random address)
-        // since their class pointers reference pre-slide addresses. Classes from slid
-        // libraries are auto-stubbed by the linker's resolve_external.
-        // ObjC metadata registration is skipped for now — auto-stub classes
-        // handle all _OBJC_CLASS_$_ symbols. Full metadata parsing needs slide-aware
-        // pointer resolution which is a future improvement.
-        log::info!("ObjC classes auto-stubbed by linker (metadata parsing skipped)");
+        // Register ObjC classes from the main binary (needed for Swift class metadata).
+        // Skip slid dylibs (vmaddr=0) — their pointers reference pre-slide addresses.
+        for lib in self.loaded_libraries.values() {
+            let text_vmaddr = lib.segments.iter().find(|s| s.name == "__TEXT").map(|s| s.vmaddr).unwrap_or(0);
+            if text_vmaddr > 0 {
+                if let Err(e) = self.register_objc_metadata(lib) {
+                    log::debug!("ObjC metadata for {}: {}", lib.path, e);
+                }
+            }
+        }
+        // Initialize class_data pointers for Swift class metadata in the main binary.
+        // The full register_objc_metadata hangs on complex method lists. Instead, just
+        // scan __objc_classlist and ensure each class has a non-NULL data pointer
+        // (needed by the Swift runtime's isCanonicalStaticallySpecializedGenericMetadata).
+        {
+            let macho = MachO::parse(&main_binary.data, 0).ok();
+            if let Some(ref macho) = macho {
+                for seg in &macho.segments {
+                    for section_res in seg {
+                        if let Ok((section, _)) = section_res {
+                            if section.name().unwrap_or("") == "__objc_classlist" {
+                                let count = section.size / 8;
+                                let ptrs = section.addr as *const u64;
+                                for i in 0..count {
+                                    let cls_addr = unsafe { std::ptr::read_unaligned(ptrs.add(i as usize)) };
+                                    if cls_addr == 0 { continue; }
+                                    // Check if class_data (at cls+24) is NULL
+                                    let data_ptr_addr = (cls_addr + 24) as *mut u64;
+                                    let data_val = unsafe { std::ptr::read_unaligned(data_ptr_addr) };
+                                    if data_val == 0 {
+                                        // Create a minimal class_ro_t
+                                        let ro = unsafe { libc::calloc(1, 128) } as *mut u64;
+                                        unsafe {
+                                            *ro = 0;  // flags
+                                            // instance_size at offset 8
+                                            *(ro.add(1)) = 256; // generous instance size
+                                        }
+                                        let page = (data_ptr_addr as usize & !0xFFF) as *mut libc::c_void;
+                                        unsafe {
+                                            libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE);
+                                            std::ptr::write_unaligned(data_ptr_addr, ro as u64);
+                                        }
+                                    }
+                                }
+                                log::info!("Initialized class_data for {} ObjC classes", count);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // In Darwin, initializers are called in bottom-up order (dependencies first).
         // Skip slid libraries for now (init funcs also use pre-slide addresses).
