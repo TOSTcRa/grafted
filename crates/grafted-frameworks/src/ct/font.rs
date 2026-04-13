@@ -91,7 +91,7 @@ pub fn draw_text_bitmap(ctx: CGContextRef, text: &str, x: f64, y: f64, color: [f
     let ab = (color[3] * 255.0) as u8;
 
     let char_w = (8.0 * scale) as usize;
-    let char_h = (16.0 * scale) as usize;
+    let _char_h = (16.0 * scale) as usize;
 
     for (ci, ch) in text.bytes().enumerate() {
         let bitmap = char_bitmap(ch);

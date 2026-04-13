@@ -102,7 +102,7 @@ impl Linker {
                 }
             };
 
-            let lib_binary = match MachOBinary::from_path(&linux_path) {
+            let mut lib_binary = match MachOBinary::from_path(&linux_path) {
                 Ok(b) => b,
                 Err(e) => {
                     log::warn!("failed to load {}: {e}", linux_path.display());
@@ -111,7 +111,8 @@ impl Linker {
                 }
             };
             
-            grafted_loader::mapper::map_binary(&lib_binary)?;
+            let (_entry, slide) = grafted_loader::mapper::map_binary(&lib_binary)?;
+            lib_binary.slide = slide;
 
             for dep in &lib_binary.dylib_deps {
                 to_load.push((dep.name.clone(), linux_path.clone(), lib_binary.rpaths.clone()));
@@ -310,7 +311,6 @@ impl Linker {
     /// Run initializers for all loaded libraries, then the main binary.
     pub fn run_all_initializers(&self, main_binary: &MachOBinary) -> Result<(), LinkError> {
         // ObjC class_data fixup is handled by swift_metadata_translate.rs.
-        // Full register_objc_metadata hangs on complex method lists in Maccy.
         // Skip slid dylibs (vmaddr=0) — their pointers reference pre-slide addresses.
         for lib in self.loaded_libraries.values() {
             let text_vmaddr = lib.segments.iter().find(|s| s.name == "__TEXT").map(|s| s.vmaddr).unwrap_or(0);
@@ -320,8 +320,8 @@ impl Linker {
                 }
             }
         }
-        // ObjC class_data fixup is now handled by swift_metadata_translate.rs
-        // which runs before section registration in the pipeline.
+        // ObjC class_data fixup handled by swift_metadata_translate.rs.
+        // register_objc_metadata hangs on Maccy's complex method lists.
 
         // In Darwin, initializers are called in bottom-up order (dependencies first).
         // Skip slid libraries for now (init funcs also use pre-slide addresses).
@@ -345,35 +345,47 @@ impl Linker {
                     let sect_name = section.name().unwrap_or("");
                     if sect_name == "__objc_classlist" {
                         let count = section.size / 8;
-                        let ptrs = section.addr as *const *mut grafted_objc::types::class_t;
-                        log::info!("grafted-dyld: processing {} classes in {}", count, binary.path);
+                        let ptrs = (section.addr + binary.slide) as *const *mut grafted_objc::types::class_t;
+                        log::info!("grafted-dyld: processing {} classes in {} (ptrs={:p}, slide={:#x})", count, binary.path, ptrs, binary.slide);
                         
                         for i in 0..count {
                             let cls_ptr = unsafe { std::ptr::read_unaligned(ptrs.add(i as usize)) };
                             if cls_ptr.is_null() { continue; }
                             
+                            log::info!("  [{}/{}] processing class at {:p}", i, count, cls_ptr);
+                            
                             unsafe {
-                                let data_ptr = std::ptr::read_unaligned((cls_ptr as *const u8).add(
+                                let data_field_ptr = (cls_ptr as *const u8).add(
                                     std::mem::offset_of!(grafted_objc::types::class_t, data)
-                                ) as *const *mut grafted_objc::types::class_ro_t);
-                                if data_ptr.is_null() { continue; }
+                                );
+                                log::info!("    reading data_ptr from {:p}", data_field_ptr);
+                                
+                                let data_ptr = std::ptr::read_unaligned(data_field_ptr as *const *mut grafted_objc::types::class_ro_t);
+                                if data_ptr.is_null() { 
+                                    log::info!("    data_ptr is NULL, skipping");
+                                    continue; 
+                                }
 
-                                let class_name_ptr = std::ptr::read_unaligned((data_ptr as *const u8).add(
+                                log::info!("    data_ptr={:p}", data_ptr);
+
+                                let name_field_ptr = (data_ptr as *const u8).add(
                                     std::mem::offset_of!(grafted_objc::types::class_ro_t, name)
-                                ) as *const *const i8);
+                                );
+                                let class_name_ptr = std::ptr::read_unaligned(name_field_ptr as *const *const i8);
+                                
                                 let class_name = if !class_name_ptr.is_null() {
+                                    log::info!("    class_name_ptr={:p}", class_name_ptr);
                                     std::ffi::CStr::from_ptr(class_name_ptr).to_string_lossy().into_owned()
                                 } else {
                                     "Unknown".to_string()
                                 };
 
-                                log::debug!("detected Objective-C class: {}", class_name);
+                                log::info!("    detected Objective-C class: {}", class_name);
 
                                 let raw_method_list_ptr = (*data_ptr).base_methods;
                                 
                                 // Modern ObjC tags the method_list_ptr in the lower bits
                                 let method_list_ptr = ((raw_method_list_ptr as usize) & !3) as *mut grafted_objc::types::method_list_t;
-                                log::debug!("  class_ro_t: flags={:#x}, name={:p}, base_methods_raw={:p}, base_methods_aligned={:p}", (*data_ptr).flags, (*data_ptr).name, raw_method_list_ptr, method_list_ptr);
                                 
                                 if !method_list_ptr.is_null() {
                                     let flags = std::ptr::read_unaligned(&mut (*method_list_ptr).entsize_and_flags);
@@ -382,8 +394,11 @@ impl Linker {
                                     let is_relative = (flags & 0x80000000) != 0;
                                     let entsize = flags & 0xFFFF;
                                     
-                                    log::debug!("  found {} methods in {} (relative: {}, entsize: {})", method_count, class_name, is_relative, entsize);
-                                    
+                                    if method_count > 1000 {
+                                        log::warn!("  skipping massive method list ({} methods) in {}", method_count, class_name);
+                                        continue;
+                                    }
+
                                     let first_method_ptr = (method_list_ptr as *const u8).add(8);
                                     
                                     for m in 0..method_count {
@@ -395,16 +410,15 @@ impl Linker {
                                             let types_offset = std::ptr::read_unaligned(method_base.add(4) as *const i32);
                                             let imp_offset = std::ptr::read_unaligned(method_base.add(8) as *const i32);
                                             
-                                            let name_ptr = method_base.offset(name_offset as isize);
-                                            let sel = grafted_objc::sel_registerName(name_ptr as *const i8);
+                                            let name_ptr = (method_base as *const i8).offset(name_offset as isize);
+                                            let sel = grafted_objc::sel_registerName(name_ptr);
                                             
-                                            let imp_ptr = method_base.add(8).offset(imp_offset as isize);
-                                            let types_ptr = method_base.add(4).offset(types_offset as isize) as *const i8;
+                                            let imp_ptr = (method_base.add(8) as *const i8).offset(imp_offset as isize);
+                                            let types_ptr = (method_base.add(4) as *const i8).offset(types_offset as isize);
                                             
                                             (sel, Some(std::mem::transmute(imp_ptr)), types_ptr)
                                         } else {
                                             // Absolute method list
-                                            // DO NOT cast to method_t reference if it's unaligned. Read fields manually.
                                             let name_ptr = std::ptr::read_unaligned(method_base as *const *const i8);
                                             let types_ptr = std::ptr::read_unaligned(method_base.add(8) as *const *const i8);
                                             let imp_ptr = std::ptr::read_unaligned(method_base.add(16) as *const *const ());
@@ -419,8 +433,6 @@ impl Linker {
                                             imp,
                                             types
                                         );
-                                        
-                                        log::trace!("    registered method at {:?}", imp);
                                     }
                                 }
 

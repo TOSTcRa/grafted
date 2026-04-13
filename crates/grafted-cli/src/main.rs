@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
-    let binary = match MachOBinary::from_path(&args.binary) {
+    let mut binary = match MachOBinary::from_path(&args.binary) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("grafted: {}: {e}", args.binary.display());
@@ -49,13 +49,14 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let entry_point = match grafted_loader::mapper::map_binary(&binary) {
-        Ok(ep) => ep,
+    let (entry_point, slide) = match grafted_loader::mapper::map_binary(&binary) {
+        Ok(res) => res,
         Err(e) => {
             eprintln!("grafted: failed to map binary: {e}");
             return ExitCode::FAILURE;
         }
     };
+    binary.slide = slide;
 
     // Per-thread selectors are now managed automatically by executor + shims.
 
@@ -115,18 +116,17 @@ fn main() -> ExitCode {
             }
         }
 
-        // Translate Swift metadata layout (Mach-O → Linux compatible)
-        // Must run AFTER fixups (which resolve absolute pointers) but BEFORE
-        // section registration (which hands metadata to the runtime).
-        grafted_frameworks::swift_metadata_translate::translate_swift_metadata(&binary.data);
-
-        // Register Swift metadata sections with the Linux Swift runtime
-        grafted_frameworks::swift_sections::register_swift_sections(&binary.data);
-
         if let Err(e) = linker.run_all_initializers(&binary) {
             eprintln!("grafted: failed to run initializers: {e}");
             return ExitCode::FAILURE;
         }
+
+        // Translate Swift metadata layout (Mach-O → Linux compatible)
+        // Must run AFTER fixups and ObjC registration but BEFORE register_swift_sections.
+        grafted_frameworks::swift_metadata_translate::translate_swift_metadata(&binary.data, binary.slide);
+
+        // Register Swift metadata sections with the Linux Swift runtime
+        grafted_frameworks::swift_sections::register_swift_sections(&binary.data, binary.slide);
     }
 
     // Patch Go runtime.settls if this is a Go binary (sets GS base for TLS)

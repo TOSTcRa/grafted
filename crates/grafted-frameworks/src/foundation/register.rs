@@ -61,17 +61,17 @@ fn register_nsstring() {
 fn register_nsnumber() {
     let cls = alloc_class("NSNumber", 32);
 
-    unsafe extern "C" fn ns_number_with_int(_cls: *mut u8, _sel: *mut u8, val: i32) -> *mut u8 {
+    unsafe extern "C" fn ns_number_with_int(_cls: *mut u8, _sel: *mut u8, val: i32) -> *mut u8 { unsafe {
         let obj = libc::calloc(1, 32) as *mut u8;
         *(obj.add(16) as *mut i64) = val as i64;
         obj
-    }
-    unsafe extern "C" fn ns_number_int_value(self_: *mut u8, _sel: *mut u8) -> i64 {
+    }}
+    unsafe extern "C" fn ns_number_int_value(self_: *mut u8, _sel: *mut u8) -> i64 { unsafe {
         if self_.is_null() { 0 } else { *(self_.add(16) as *const i64) }
-    }
-    unsafe extern "C" fn ns_number_bool_value(self_: *mut u8, _sel: *mut u8) -> bool {
+    }}
+    unsafe extern "C" fn ns_number_bool_value(self_: *mut u8, _sel: *mut u8) -> bool { unsafe {
         if self_.is_null() { false } else { *(self_.add(16) as *const i64) != 0 }
-    }
+    }}
 
     reg(cls, "numberWithInt:\0", ns_number_with_int as *const ());
     reg(cls, "numberWithInteger:\0", ns_number_with_int as *const ());
@@ -113,11 +113,11 @@ fn register_nsprocessinfo() {
         static mut PI: *mut u8 = std::ptr::null_mut();
         unsafe { if PI.is_null() { PI = libc::calloc(1, 256) as *mut u8; } PI }
     }
-    unsafe extern "C" fn process_name(_self: *mut u8, _sel: *mut u8) -> *mut u8 {
+    unsafe extern "C" fn process_name(_self: *mut u8, _sel: *mut u8) -> *mut u8 { unsafe {
         crate::cf::string::CFStringCreateWithCString(
             std::ptr::null(), b"Grafted\0".as_ptr() as *const i8, 0x0800_0100,
         ) as *mut u8
-    }
+    }}
     unsafe extern "C" fn os_version(_self: *mut u8, _sel: *mut u8) -> [i64; 3] {
         [14, 0, 0] // macOS 14 Sonoma
     }

@@ -4,7 +4,6 @@
 //! coordinate system. Subclasses override drawRect: to render content.
 
 use crate::cg::geometry::*;
-use crate::cg::context;
 
 /// Internal view data.
 #[repr(C)]
@@ -22,9 +21,9 @@ pub struct NSViewData {
 
 const VIEW_DATA_OFFSET: usize = 16;
 
-unsafe fn view_data(obj: *mut u8) -> *mut NSViewData {
+unsafe fn view_data(obj: *mut u8) -> *mut NSViewData { unsafe {
     obj.add(VIEW_DATA_OFFSET) as *mut NSViewData
-}
+}}
 
 /// ObjC method: -[NSView initWithFrame:]
 pub unsafe extern "C" fn ns_view_init_with_frame(

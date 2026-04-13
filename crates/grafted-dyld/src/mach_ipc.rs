@@ -182,7 +182,7 @@ impl PortSpace {
         }
     }
 
-    fn insert_right(&mut self, name: u32, poly: u32, poly_type: u32) -> i32 {
+    fn insert_right(&mut self, name: u32, _poly: u32, poly_type: u32) -> i32 {
         // If name doesn't exist and we're inserting a receive right, create it
         if !self.ports.contains_key(&name) {
             match poly_type {

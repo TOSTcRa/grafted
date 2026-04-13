@@ -75,6 +75,8 @@ where
     let starts_ptr = fixups_data.as_ptr().wrapping_add(header.starts_offset as usize);
     let starts_in_image = unsafe { &*(starts_ptr as *const dyld_chained_starts_in_image) };
 
+    let actual_load_address = preferred_load_address + binary.slide;
+
     for i in 0..starts_in_image.seg_count {
         let seg_info_offset = unsafe { *(starts_ptr.wrapping_add(4 + i as usize * 4) as *const u32) };
         if seg_info_offset == 0 { continue; }
@@ -86,7 +88,7 @@ where
         let mapped_seg = &binary.segments[i as usize];
         if mapped_seg.name == "__PAGEZERO" { continue; }
 
-        log::debug!("chained fixups seg {}: {} pages, page_size={}, format={}, seg_offset={:#x}, seg={}",
+        log::info!("chained fixups seg {}: {} pages, page_size={}, format={}, seg_offset={:#x}, seg={}",
             i, seg_starts.page_count, seg_starts.page_size, seg_starts.pointer_format,
             seg_starts.segment_offset, mapped_seg.name);
 
@@ -96,8 +98,8 @@ where
             let page_start_offset = unsafe { *(page_starts_ptr.wrapping_add(j as usize * 2) as *const u16) };
             if page_start_offset == 0xFFFF { continue; }
 
-            // Address of the first fixup on this page
-            let mut chain_ptr = (mapped_seg.vmaddr + (j as u64 * seg_starts.page_size as u64) + page_start_offset as u64) as *mut u64;
+            // Address of the first fixup on this page (slidden!)
+            let mut chain_ptr = (mapped_seg.vmaddr + binary.slide + (j as u64 * seg_starts.page_size as u64) + page_start_offset as u64) as *mut u64;
             
             let ptr_format = seg_starts.pointer_format;
 
@@ -116,13 +118,12 @@ where
                             let target = encoded & 0xFFFFFFFFF;
                             let high8 = (encoded >> 36) & 0xFF;
                             let unpacked = (high8 << 56) | target;
-                            if unpacked == 0 { 0 } else { preferred_load_address + unpacked }
+                            // Rebases in format 1 are relative to preferred load address
+                            if unpacked == 0 { 0 } else { actual_load_address + unpacked }
                         };
                         (bind, nxt, a)
                     }
                     // DYLD_CHAINED_PTR_64_OFFSET (format 6)
-                    // rebase: target:36, high8:8, next:12, bind(0):1  (high8 is unused/reserved)
-                    // bind:   ordinal:24, addend:8, next:12, bind(1):1
                     6 => {
                         let bind = (encoded >> 63) != 0;
                         let nxt = (encoded >> 51) & 0xFFF;
@@ -132,9 +133,9 @@ where
                             let base = resolved_imports.get(ordinal as usize).copied().unwrap_or(0);
                             if base == 0 { 0 } else { (base as i64 + addend) as u64 }
                         } else {
-                            // target is a 36-bit offset from mach header start
+                            // target is a 36-bit offset from mach header start (slidden base)
                             let target = encoded & 0xFFFFFFFFF;
-                            if target == 0 { 0 } else { preferred_load_address + target }
+                            if target == 0 { 0 } else { actual_load_address + target }
                         };
                         (bind, nxt, a)
                     }
@@ -144,7 +145,10 @@ where
                     }
                 };
 
-                log::trace!("fixup at {:p}: bind={} raw={:#x} → {:#x}", chain_ptr, is_bind, encoded, addr);
+                if (chain_ptr as u64) >= 0x10013e000 && (chain_ptr as u64) <= 0x100148000 {
+                    log::info!("patching {:p}: format={} bind={} raw={:#x} → {:#x}", chain_ptr, ptr_format, is_bind, encoded, addr);
+                }
+                
                 let page_base = (chain_ptr as usize & !0xFFF) as *mut libc::c_void;
                 unsafe {
                     libc::mprotect(page_base, 4096, libc::PROT_READ | libc::PROT_WRITE);
@@ -152,6 +156,7 @@ where
                 }
 
                 if next == 0 { break; }
+                // Stride is usually next * 4 bytes for most formats including format 6
                 chain_ptr = (chain_ptr as *mut u8).wrapping_add(next as usize * 4) as *mut u64;
             }
         }

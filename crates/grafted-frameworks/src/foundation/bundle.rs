@@ -14,9 +14,9 @@ pub struct NSBundleData {
 
 const BUNDLE_DATA_OFFSET: usize = 16;
 
-unsafe fn bundle_data(obj: *mut u8) -> *mut NSBundleData {
+unsafe fn bundle_data(obj: *mut u8) -> *mut NSBundleData { unsafe {
     obj.add(BUNDLE_DATA_OFFSET) as *mut NSBundleData
-}
+}}
 
 /// ObjC: +[NSBundle mainBundle]
 pub unsafe extern "C" fn ns_bundle_main(_cls: *mut u8, _sel: *mut u8) -> *mut u8 {

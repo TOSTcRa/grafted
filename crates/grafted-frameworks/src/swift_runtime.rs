@@ -125,10 +125,16 @@ pub fn load_swift_runtime() -> usize {
                         if parts.len() >= 3 {
                             let sym = parts[2];
                             if sym.starts_with("$s7SwiftUI") || sym.starts_with("_$s7SwiftUI") {
-                                let clean = sym.strip_prefix('_').unwrap_or(sym);
-                                let c_name = CString::new(clean).unwrap();
-                                let addr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
+                                // Try dlsym with original name first, then stripped
+                                let c_orig = CString::new(sym).unwrap();
+                                let mut addr = unsafe { libc::dlsym(handle, c_orig.as_ptr()) };
+                                if addr.is_null() {
+                                    let clean = sym.strip_prefix('_').unwrap_or(sym);
+                                    let c_clean = CString::new(clean).unwrap();
+                                    addr = unsafe { libc::dlsym(handle, c_clean.as_ptr()) };
+                                }
                                 if !addr.is_null() {
+                                    let clean = sym.strip_prefix('_').unwrap_or(sym);
                                     symbols.insert(format!("_{}", clean), addr as u64);
                                     symbols.insert(clean.to_string(), addr as u64);
                                     shim_count += 1;
@@ -174,6 +180,73 @@ pub fn load_swift_runtime() -> usize {
     });
 
     rt.as_ref().map(|r| r.symbols.len()).unwrap_or(0)
+}
+
+/// Bridge for SwiftUI's LocalizedStringKey.init(stringLiteral:)
+/// 
+/// Darwin binary calls this with Darwin String (in RDI, RSI).
+/// We translate to Linux String and call the real shim function.
+#[unsafe(no_mangle)]
+/// Bridge for SwiftUI's LocalizedStringKey.init(stringLiteral:)
+/// 
+/// Darwin binary calls this with Darwin String.
+/// Convention check:
+/// 1. If (RSI >> 60) == 0xE, then (RDI, RSI) is the String (Small struct).
+/// 2. If (RDX >> 60) == 0xE, then (RSI, RDX) is the String, RDI is result_ptr (Large struct).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bridge_SwiftUI_LocalizedStringKey_init(
+    rdi: u64, rsi: u64, rdx: u64,
+) -> u128 {
+    use crate::swift_string_abi::*;
+    
+    let (ls, result_ptr) = if (rsi >> 60) == 0xE || ((rsi >> 62) & 1 == 1 && rdi > 0x1000) {
+        // Case 1: (RDI, RSI) is the string
+        let ds = DarwinString { word0: rdi, word1: rsi };
+        (unsafe { ds.to_linux_string() }, None)
+    } else if (rdx >> 60) == 0xE || ((rdx >> 62) & 1 == 1 && rsi > 0x1000) {
+        // Case 2: (RSI, RDX) is the string, RDI is result_ptr
+        let ds = DarwinString { word0: rsi, word1: rdx };
+        (unsafe { ds.to_linux_string() }, Some(rdi))
+    } else {
+        // Fallback or unknown
+        log::warn!("LocalizedStringKey bridge: unknown layout rdi={:#x} rsi={:#x} rdx={:#x}", rdi, rsi, rdx);
+        let ds = DarwinString { word0: rdi, word1: rsi };
+        (unsafe { ds.to_linux_string() }, None)
+    };
+
+    // Resolve the real shim function (compiled for Linux, likely Small struct)
+    static REAL_FN_ADDR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let real_addr = REAL_FN_ADDR.get_or_init(|| {
+        let sym = "$s7SwiftUI18LocalizedStringKeyV13stringLiteralACSS_tcfC";
+        let c_name = std::ffi::CString::new(sym).unwrap();
+        if let Some(Some(rt)) = RUNTIME.get() {
+            for &handle in &rt.handles {
+                let addr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
+                if !addr.is_null() { return Some(addr as u64); }
+            }
+        }
+        None
+    });
+
+    if let Some(addr) = *real_addr {
+        type RealFnSmall = unsafe extern "C" fn(u64, u64) -> LinuxString;
+        let f: RealFnSmall = unsafe { std::mem::transmute(addr) };
+        let res = unsafe { f(ls.word0, ls.word1) };
+
+        if let Some(ptr) = result_ptr {
+            // Copy Linux result into the Darwin result buffer. 
+            unsafe {
+                *(ptr as *mut u64) = res.word0;
+                *(ptr as *mut u64).add(1) = res.word1;
+            }
+            return ptr as u128;
+        } else {
+            // Return 128 bits spread across RAX and RDX
+            return (res.word0 as u128) | ((res.word1 as u128) << 64);
+        }
+    }
+    
+    rdi as u128
 }
 
 /// Get the loaded Swift runtime symbol table for framework registry merging.

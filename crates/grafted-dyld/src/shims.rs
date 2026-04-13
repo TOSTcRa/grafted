@@ -934,19 +934,19 @@ unsafe extern "C" fn shim_noop_ret0() -> i64 { 0 }
 // ObjC ARC stubs
 unsafe extern "C" fn shim_objc_retain(obj: *mut u8) -> *mut u8 { obj }
 unsafe extern "C" fn shim_objc_release(_obj: *mut u8) {}
-unsafe extern "C" fn shim_objc_alloc_with_zone(cls: *mut u8, _zone: *mut u8) -> *mut u8 {
+unsafe extern "C" fn shim_objc_alloc_with_zone(cls: *mut u8, _zone: *mut u8) -> *mut u8 { unsafe {
     // Simplified alloc: calloc an instance
     let sel = grafted_objc::sel_registerName(b"alloc\0".as_ptr() as *const i8);
     grafted_objc::objc_msgSend(cls as *mut _, sel) as *mut u8
-}
+}}
 unsafe extern "C" fn shim_objc_msg_send_super2(
     super_: *mut u8, sel: *mut u8,
-) -> *mut u8 {
+) -> *mut u8 { unsafe {
     // Simplified: just dispatch on the receiver (super_->receiver)
     if super_.is_null() { return std::ptr::null_mut(); }
     let receiver = unsafe { *(super_ as *const *mut u8) };
     grafted_objc::objc_msgSend(receiver as *mut _, sel as *mut _) as *mut u8
-}
+}}
 unsafe extern "C" fn shim_issetugid() -> i32 { 0 } // not setuid
 
 // kqueue/kevent — BSD-only, emulate with epoll

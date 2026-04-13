@@ -4,7 +4,6 @@
 //! a title, key equivalent, and action selector.
 
 use crate::cf::string::CFStringInner;
-use crate::cf::types::*;
 
 const MENU_DATA_OFFSET: usize = 16;
 
@@ -30,12 +29,12 @@ pub struct NSMenuItemData {
     pub separator: bool,
 }
 
-unsafe fn menu_data(obj: *mut u8) -> *mut NSMenuData {
+unsafe fn menu_data(obj: *mut u8) -> *mut NSMenuData { unsafe {
     obj.add(MENU_DATA_OFFSET) as *mut NSMenuData
-}
-unsafe fn item_data(obj: *mut u8) -> *mut NSMenuItemData {
+}}
+unsafe fn item_data(obj: *mut u8) -> *mut NSMenuItemData { unsafe {
     obj.add(MENU_DATA_OFFSET) as *mut NSMenuItemData
-}
+}}
 
 // ---- NSMenu methods ----
 

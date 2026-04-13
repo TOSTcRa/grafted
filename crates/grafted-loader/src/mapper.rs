@@ -86,8 +86,8 @@ fn map_segment(seg: &Segment, file_data: &[u8], slide: u64) -> Result<(), Loader
     Ok(())
 }
 
-/// Returns the resolved entry point address.
-pub fn map_binary(binary: &MachOBinary) -> Result<u64, LoaderError> {
+/// Returns (entry_point, slide).
+pub fn map_binary(binary: &MachOBinary) -> Result<(u64, u64), LoaderError> {
     let text_seg = binary.segments.iter().find(|s| s.name == "__TEXT");
 
     // Dylibs have __TEXT at vmaddr=0 — need a slide to a free address range.
@@ -135,5 +135,5 @@ pub fn map_binary(binary: &MachOBinary) -> Result<u64, LoaderError> {
     };
 
     log::info!("binary mapped, entry point at {entry:#x} (slide={slide:#x})");
-    Ok(entry)
+    Ok((entry, slide))
 }

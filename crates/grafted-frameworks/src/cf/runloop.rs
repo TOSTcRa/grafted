@@ -4,8 +4,6 @@
 //! events (timers, sources, Mach ports) and dispatches them. On Darwin this
 //! uses kqueue/mach_msg; we use epoll + timerfd.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use super::types::*;
 use super::string::CFStringRef;
 
@@ -114,7 +112,7 @@ pub extern "C" fn CFRunLoopGetMain() -> CFRunLoopRef {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn CFRunLoopRun() {
-    let rl = get_or_create_runloop();
+    let _rl = get_or_create_runloop();
     loop {
         let result = unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode.as_ptr() as CFRunLoopMode, 1e10, 0) };
         if result == K_CF_RUNLOOP_RUN_STOPPED || result == K_CF_RUNLOOP_RUN_FINISHED {

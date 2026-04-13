@@ -40,6 +40,7 @@ pub struct MachOBinary {
     pub chained_fixups: Option<(u32, u32)>, // (offset, size)
     pub exports_trie: Option<(u32, u32)>,   // (offset, size)
     pub data: Vec<u8>,
+    pub slide: u64,
 }
 
 impl MachOBinary {
@@ -76,6 +77,7 @@ impl MachOBinary {
             chained_fixups: info.chained_fixups,
             exports_trie: info.exports_trie,
             data,
+            slide: 0,
         })
     }
 

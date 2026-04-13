@@ -33,9 +33,9 @@ pub struct NSWindowData {
 /// By convention, our NSWindow instances store NSWindowData starting at offset 16.
 const WINDOW_DATA_OFFSET: usize = 16;
 
-unsafe fn window_data(obj: *mut u8) -> *mut NSWindowData {
+unsafe fn window_data(obj: *mut u8) -> *mut NSWindowData { unsafe {
     obj.add(WINDOW_DATA_OFFSET) as *mut NSWindowData
-}
+}}
 
 /// ObjC method: -[NSWindow initWithContentRect:styleMask:backing:defer:]
 pub unsafe extern "C" fn ns_window_init(

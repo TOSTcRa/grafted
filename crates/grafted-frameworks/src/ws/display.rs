@@ -215,7 +215,7 @@ pub fn flush_window(id: WindowID, ctx: CGContextRef) -> bool {
         // Don't let XDestroyImage free our Vec's buffer
         // Set the data pointer to null before destroying
         // (XDestroyImage would free(data) which would corrupt our allocator)
-        let data_field = ximage as *mut u8;
+        let _data_field = ximage as *mut u8;
         // XImage struct: first fields are width, height, ... data is at offset ~16
         // Instead, just leak the pixels vec and let XDestroyImage handle it
         std::mem::forget(pixels);

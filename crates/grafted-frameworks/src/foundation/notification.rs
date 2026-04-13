@@ -1,7 +1,5 @@
 //! NSNotificationCenter — basic notification dispatch.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// ObjC: +[NSNotificationCenter defaultCenter]
 pub unsafe extern "C" fn ns_notification_center_default(

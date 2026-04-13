@@ -163,9 +163,29 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
         // These include App.main() that calls body getter → creates real windows
         for (k, v) in &swift_syms {
             if k.contains("SwiftUI") {
-                swiftui.insert(k.clone(), *v);
+                // Intercept symbols that require String ABI translation
+                if k == "$s7SwiftUI18LocalizedStringKeyV13stringLiteralACSS_tcfC" ||
+                   k == "_$s7SwiftUI18LocalizedStringKeyV13stringLiteralACSS_tcfC" {
+                    log::info!("Swift ABI: Intercepting LocalizedStringKey init");
+                    swiftui.insert(k.clone(), crate::swift_runtime::bridge_SwiftUI_LocalizedStringKey_init as *const () as u64);
+                } else {
+                    swiftui.insert(k.clone(), *v);
+                }
             }
         }
+        let target_sym = "_$s7SwiftUI12MenuBarExtraVA2A4TextVRszrlE_10isInserted7contentACyAEq_GAA18LocalizedStringKeyV_AA7BindingVySbGq_yXEtcfC";
+        let in_swift_syms = swift_syms.contains_key(target_sym);
+        let in_swiftui = swiftui.contains_key(target_sym);
+        // Also check partial match
+        let partial = swift_syms.keys().filter(|k| k.contains("MenuBarExtra") && k.contains("isInserted")).count();
+        for k in swift_syms.keys() {
+            if k.contains("MenuBarExtra") && k.contains("isInserted") {
+                log::info!("  FOUND: {}", k);
+            }
+        }
+        log::info!("  NEED:  {}", target_sym);
+        log::info!("MenuBarExtra.init: in_swift_syms={} in_swiftui={} partial={} total={}",
+            in_swift_syms, in_swiftui, partial, swiftui.len());
         reg.insert("/System/Library/Frameworks/SwiftUI.framework/Versions/A/SwiftUI".into(), swiftui);
     }
 

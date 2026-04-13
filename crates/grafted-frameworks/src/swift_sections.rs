@@ -44,7 +44,7 @@ impl Default for SectionRange {
 
 /// Register a Mach-O binary's Swift sections with the runtime.
 /// Call this after mapping the binary and before entering the entry point.
-pub fn register_swift_sections(binary_data: &[u8]) {
+pub fn register_swift_sections(binary_data: &[u8], slide: u64) {
     // Find swift_addNewDSOImage in the loaded runtime
     let func_name = CString::new("swift_addNewDSOImage").unwrap();
     let func_ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, func_name.as_ptr()) };
@@ -59,10 +59,12 @@ pub fn register_swift_sections(binary_data: &[u8]) {
     let Ok(macho) = goblin::mach::MachO::parse(binary_data, 0) else { return };
 
     // Find __TEXT vmaddr (= Mach header = __dso_handle equivalent)
-    let base_addr = macho.segments.iter()
+    let macho_base = macho.segments.iter()
         .find(|s| s.name().unwrap_or("") == "__TEXT")
-        .map(|s| s.vmaddr as *const u8)
-        .unwrap_or(std::ptr::null());
+        .map(|s| s.vmaddr)
+        .unwrap_or(0);
+    
+    let base_addr = (macho_base + slide) as *const u8;
 
     let mut sections = MetadataSections {
         version: 0,
@@ -90,7 +92,7 @@ pub fn register_swift_sections(binary_data: &[u8]) {
         for section_res in seg {
             if let Ok((section, _data)) = section_res {
                 let name = section.name().unwrap_or("");
-                let addr = section.addr as *const u8;
+                let addr = (section.addr + slide) as *const u8;
                 let size = section.size as usize;
 
                 match name {

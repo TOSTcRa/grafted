@@ -171,10 +171,10 @@ fn register_nscolor() {
         }
         obj
     }
-    unsafe extern "C" fn ns_color_named(_cls: *mut u8, _sel: *mut u8, _name: *mut u8) -> *mut u8 {
+    unsafe extern "C" fn ns_color_named(_cls: *mut u8, _sel: *mut u8, _name: *mut u8) -> *mut u8 { unsafe {
         // Return a default gray color
         ns_color_with_rgb(std::ptr::null_mut(), std::ptr::null_mut(), 0.5, 0.5, 0.5, 1.0)
-    }
+    }}
 
     reg(cls, "colorWithRed:green:blue:alpha:\0", ns_color_with_rgb as *const ());
     reg(cls, "colorNamed:\0", ns_color_named as *const ());

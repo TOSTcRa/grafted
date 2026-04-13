@@ -43,39 +43,9 @@ pub unsafe extern "C" fn ns_application_run(
 ) {
     APP_RUNNING.store(true, Ordering::Release);
 
-    // Apps create windows via NSWindow API → our X11 bridge.
-    // SwiftUI apps: WindowGroup not yet implemented, so show a diagnostic window.
-    // AppKit apps: their [NSWindow init] calls go through our implementation.
-    if MAIN_WINDOW_ID.load(std::sync::atomic::Ordering::Acquire) == 0 {
-        if let Some(wid) = display::create_window(200, 200, 640, 200, "Grafted") {
-            let ctx = unsafe {
-                crate::cg::context::CGBitmapContextCreate(
-                    std::ptr::null_mut(), 640, 200, 8, 640 * 4,
-                    std::ptr::null(), 0,
-                )
-            };
-            if !ctx.is_null() {
-                use crate::cg::context::*;
-                use crate::cg::geometry::*;
-                use crate::ct::font::draw_text_bitmap;
-                unsafe {
-                    CGContextSetRGBFillColor(ctx, 0.15, 0.15, 0.18, 1.0);
-                    CGContextFillRect(ctx, CGRect {
-                        origin: CGPoint { x: 0.0, y: 0.0 },
-                        size: CGSize { width: 640.0, height: 200.0 },
-                    });
-                }
-                draw_text_bitmap(ctx, "App loaded — SwiftUI render not yet wired", 20.0, 20.0, [1.0, 0.8, 0.2, 1.0], 1.5);
-                draw_text_bitmap(ctx, "AppKit [NSWindow] calls translate to X11 properly", 20.0, 60.0, [0.7, 0.7, 0.7, 1.0], 1.0);
-                draw_text_bitmap(ctx, "Need SwiftUI WindowGroup -> NSWindow bridge", 20.0, 85.0, [0.7, 0.7, 0.7, 1.0], 1.0);
-                draw_text_bitmap(ctx, "Press ESC to quit", 20.0, 130.0, [0.4, 0.8, 1.0, 1.0], 1.0);
-                display::show_window(wid);
-                display::flush_window(wid, ctx);
-            }
-            MAIN_WINDOW_ID.store(wid, std::sync::atomic::Ordering::Release);
-            MAIN_WINDOW_CTX.store(ctx as *mut u8, std::sync::atomic::Ordering::Release);
-        }
-    }
+    // No fallback window — the body getter creates the app's own window
+    // via grafted_swiftui_create_window. For non-SwiftUI apps, NSWindow.init
+    // calls go through our X11 bridge directly.
 
     log::info!("NSApplication: entering main run loop");
 
@@ -203,6 +173,11 @@ fn find_body_getter(search_addr: u64) -> Option<u64> {
 static MAIN_WINDOW_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static MAIN_WINDOW_CTX: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
+#[unsafe(no_mangle)]
+pub extern "C" fn grafted_log_raw(s1: u64, s2: u64) {
+    log::info!("SHIM RAW: s1={:#x} s2={:#x}", s1, s2);
+}
+
 /// Called from our compiled SwiftUI.swift when WindowGroup/MenuBarExtra creates a window.
 /// This is the REAL bridge: Swift code → grafted C function → X11 window.
 #[unsafe(no_mangle)]
@@ -212,6 +187,7 @@ pub extern "C" fn grafted_swiftui_create_window(title: *const i8, w: i32, h: i32
     } else {
         unsafe { std::ffi::CStr::from_ptr(title) }.to_string_lossy().into_owned()
     };
+    log::info!("grafted_swiftui_create_window: title='{}' size={}x{}", title_str, w, h);
 
     display::init_display();
 
@@ -283,7 +259,7 @@ pub extern "C" fn grafted_swiftui_save_conformance(metadata: u64) {
 
 /// Called from SwiftUI.swift App.main() to find and call the binary's body getter.
 #[unsafe(no_mangle)]
-pub extern "C" fn grafted_swiftui_call_body(metadata: u64) -> i32 {
+pub extern "C" fn grafted_swiftui_call_body(_metadata: u64) -> i32 {
     let conf_addr = SWIFT_CONFORMANCE_ADDR.load(std::sync::atomic::Ordering::Acquire);
     if conf_addr == 0 {
         log::warn!("grafted_swiftui_call_body: no conformance address");

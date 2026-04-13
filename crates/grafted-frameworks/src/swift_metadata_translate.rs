@@ -18,7 +18,7 @@
 
 /// Translate all Swift class metadata in a mapped Mach-O binary.
 /// Must be called AFTER apply_fixups and BEFORE register_swift_sections.
-pub fn translate_swift_metadata(binary_data: &[u8]) {
+pub fn translate_swift_metadata(binary_data: &[u8], slide: u64) {
     let Ok(macho) = goblin::mach::MachO::parse(binary_data, 0) else { return };
 
     let mut types_translated = 0;
@@ -32,7 +32,7 @@ pub fn translate_swift_metadata(binary_data: &[u8]) {
 
                 if name == "__swift5_types" {
                     let count = section.size / 4; // each entry is a 4-byte relative pointer
-                    let base = section.addr;
+                    let base = section.addr + slide;
 
                     for i in 0..count {
                         let entry_addr = base + i * 4;
@@ -50,7 +50,7 @@ pub fn translate_swift_metadata(binary_data: &[u8]) {
                 // Phase 2: Walk __objc_classlist to fix ObjC class prefix
                 if name == "__objc_classlist" {
                     let count = section.size / 8;
-                    let ptrs = section.addr as *const u64;
+                    let ptrs = (section.addr + slide) as *const u64;
 
                     for i in 0..count {
                         let cls_addr = unsafe { std::ptr::read_unaligned(ptrs.add(i as usize)) };

@@ -3,7 +3,7 @@
 //! Functions are loaded at runtime from libX11.so.6. If X11 is not available
 //! (headless server, Wayland-only), all operations gracefully return None.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::sync::OnceLock;
 
 // Opaque X11 types

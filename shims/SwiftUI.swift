@@ -66,33 +66,85 @@ public struct MenuBarExtra<Label, Content>: Scene {
     public init(@ViewBuilder content: () -> Content, @ViewBuilder label: () -> Label) {
         _grafted_create_window("App", 400, 500)
     }
-}
 
-// Extension for MenuBarExtra where Label == Text (used by Maccy)
-extension MenuBarExtra where Label == Text {
-    public init(_ titleKey: LocalizedStringKey, isInserted: Binding<Bool>, @ViewBuilder content: () -> Content) {
-        // This is the init Maccy calls — it MUST call create_window
-        let str = titleKey.stringValue
-        let _ = str.withCString { ptr in
-            let _ = _grafted_create_window(ptr, 400, 500)
-        }
-        // Also evaluate the content closure to trigger ContentView creation
-        let _ = content()
-    }
-
-    public init(_ titleKey: LocalizedStringKey, @ViewBuilder content: () -> Content) {
-        let str = titleKey.stringValue
-        let _ = str.withCString { ptr in
-            _grafted_create_window(ptr, 400, 500)
-        }
+    // DARWIN ABI OVERRIDES
+    // _$s7SwiftUI12MenuBarExtraVA2A4TextVRszrlE_10isInserted7contentACyAEq_GAA18LocalizedStringKeyV_AA7BindingVySbGq_yXEtcfC
+    @_silgen_name("_$s7SwiftUI12MenuBarExtraVA2A4TextVRszrlE_10isInserted7contentACyAEq_GAA18LocalizedStringKeyV_AA7BindingVySbGq_yXEtcfC")
+    public static func _init_menu_extra_is_inserted(_ k1: UInt64, _ k2: UInt64, _ b1: UInt64, _ b2: UInt64, _ c1: UInt64, _ c2: UInt64) -> MenuBarExtra<Text, Content> {
+        let title = _grafted_translate_darwin_string(k1, k2)
+        let _ = _grafted_create_window(title.isEmpty ? "Maccy" : title, 400, 500)
+        // Return zeroed struct — caller just needs a valid Scene value
+        return unsafeBitCast((0 as Int, 0 as Int), to: MenuBarExtra<Text, Content>.self)
     }
 }
+
+// Extension inits REMOVED — they conflict with @_silgen_name overrides above.
+// The @_silgen_name versions handle Darwin ABI (raw UInt64 args) correctly.
+
+@_silgen_name("grafted_log_raw")
+func _grafted_log_raw(_ s1: UInt64, _ s2: UInt64)
 
 // LocalizedStringKey needs a way to extract the string
 public struct LocalizedStringKey: ExpressibleByStringLiteral {
     public var stringValue: String
     public init(stringLiteral value: String) { self.stringValue = value }
     public init(_ value: String) { self.stringValue = value }
+
+    // DARWIN ABI OVERRIDES
+    // _$s7SwiftUI18LocalizedStringKeyVyACSScfC -> init(_ value: String)
+    @_silgen_name("_$s7SwiftUI18LocalizedStringKeyVyACSScfC")
+    public static func _init_from_string(_ s1: UInt64, _ s2: UInt64) -> LocalizedStringKey {
+        _grafted_log_raw(s1, s2)
+        let str = _grafted_translate_darwin_string(s1, s2)
+        let _ = _grafted_create_window("LSK.init: \(str)", 1, 1)
+        return LocalizedStringKey(str)
+    }
+
+    // _$s7SwiftUI18LocalizedStringKeyV13stringLiteralACSS_tcfC -> init(stringLiteral value: String)
+    @_silgen_name("_$s7SwiftUI18LocalizedStringKeyV13stringLiteralACSS_tcfC")
+    public static func _init_from_string_literal(_ s1: UInt64, _ s2: UInt64) -> LocalizedStringKey {
+        _grafted_log_raw(s1, s2)
+        let str = _grafted_translate_darwin_string(s1, s2)
+        let _ = _grafted_create_window("LSK.lit: \(str)", 1, 1)
+        return LocalizedStringKey(stringLiteral: str)
+    }
+}
+
+// Darwin String ABI Translator
+func _grafted_translate_darwin_string(_ s1: UInt64, _ s2: UInt64) -> String {
+    // Detect Darwin string format
+    // Try both s1 and s2 for tags as ABI can vary by register allocation
+    let tag1 = (s1 >> 60) & 0xF
+    let tag2 = (s2 >> 60) & 0xF
+    
+    if tag2 == 0xE {
+        // Word 2 has the tag - small string
+        let count = Int((s2 >> 56) & 0x0F)
+        var buffer = [UInt8](repeating: 0, count: 16)
+        for i in 0..<8 { buffer[i] = UInt8((s1 >> (i * 8)) & 0xFF) }
+        for i in 0..<7 { buffer[i + 8] = UInt8((s2 >> (i * 8)) & 0xFF) }
+        return String(decoding: buffer.prefix(count), as: UTF8.self)
+    } else if tag1 == 0xE {
+        // Word 1 has the tag - swapped or different ABI?
+        let count = Int((s1 >> 56) & 0x0F)
+        var buffer = [UInt8](repeating: 0, count: 16)
+        for i in 0..<7 { buffer[i] = UInt8((s1 >> (i * 8)) & 0xFF) }
+        for i in 0..<8 { buffer[i + 7] = UInt8((s2 >> (i * 8)) & 0xFF) }
+        return String(decoding: buffer.prefix(count), as: UTF8.self)
+    } else if tag1 == 0xD || tag2 == 0xD {
+        // Already looks like a Linux small string
+        return "AlreadyLinuxString"
+    } else if tag1 == 0xF || tag2 == 0xF {
+        // Bridged NSString - s1 is usually the pointer
+        return "NSString(\(String(s1, radix: 16)))"
+    }
+    
+    // Check if it's a large string pointer
+    if tag1 == 0 && s1 > 0x10000 && s2 > 0 {
+        return "LargeString(\(String(s1, radix: 16)))"
+    }
+
+    return "Unknown(\(String(s1, radix: 16)),\(String(s2, radix: 16)))"
 }
 
 // View protocol
@@ -123,8 +175,46 @@ public struct EmptyView: View {
 }
 
 public struct Text: View {
-    public init(_ key: String) {}
-    public init(verbatim: String) {}
+    public var key: String
+    public init(_ key: String) { self.key = key }
+    public init(verbatim: String) { self.key = verbatim }
+
+    // DARWIN ABI OVERRIDES
+    // _$s7SwiftUI4TextVyACxcSyRzlufC -> init<S>(_ content: S) where S : StringProtocol
+    @_silgen_name("_$s7SwiftUI4TextVyACxcSyRzlufC")
+    public static func _init_text_from_string_protocol(_ s1: UInt64, _ s2: UInt64) -> Text {
+        let str = _grafted_translate_darwin_string(s1, s2)
+        let _ = _grafted_create_window("Text.init(S): \(str)", 1, 1)
+        return Text(str)
+    }
+
+    // _$s7SwiftUI4TextV_9tableName6bundle7commentAcA18LocalizedStringKeyV_SSSgSo8NSBundleCSgs06StaticI0VSgtcfC
+    @_silgen_name("_$s7SwiftUI4TextV_9tableName6bundle7commentAcA18LocalizedStringKeyV_SSSgSo8NSBundleCSgs06StaticI0VSgtcfC")
+    public static func _init_text_full(_ k1: UInt64, _ k2: UInt64, _ t1: UInt64, _ t2: UInt64, _ b: UInt64, _ c1: UInt64, _ c2: UInt64) -> Text {
+        // This is a complex one, k1/k2 is LocalizedStringKey (which is String ABI)
+        let str = _grafted_translate_darwin_string(k1, k2)
+        let _ = _grafted_create_window("Text.init(full): \(str)", 1, 1)
+        return Text(str)
+    }
+}
+
+public struct Label<Title, Icon>: View {
+    public init(_ titleKey: LocalizedStringKey, systemImage: String) where Title == Text, Icon == Image {
+        let _ = _grafted_create_window("Label: \(titleKey.stringValue)", 1, 1)
+    }
+
+    // _$s7SwiftUI5LabelVA2A4TextVRszAA5ImageVRs_rlE_06systemE0ACyAeGGAA18LocalizedStringKeyV_SStcfC
+    @_silgen_name("_$s7SwiftUI5LabelVA2A4TextVRszAA5ImageVRs_rlE_06systemE0ACyAeGGAA18LocalizedStringKeyV_SStcfC")
+    public static func _init_label_system(_ k1: UInt64, _ k2: UInt64, _ i1: UInt64, _ i2: UInt64) -> Label<Text, Image> {
+        let str = _grafted_translate_darwin_string(k1, k2)
+        let img = _grafted_translate_darwin_string(i1, i2)
+        let _ = _grafted_create_window("Label.init: \(str) [\(img)]", 1, 1)
+        return Label<Text, Image>(LocalizedStringKey(str), systemImage: img)
+    }
+}
+
+public struct Image: View {
+    public init(systemName: String) {}
 }
 
 // Property wrappers
