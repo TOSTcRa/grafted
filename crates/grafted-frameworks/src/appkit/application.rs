@@ -382,6 +382,83 @@ pub unsafe extern "C" fn NSApplicationMain(
 
             let instance = unsafe { libc::calloc(1, 512) } as *mut u8;
 
+            // Initialize the @NSApplicationDelegateAdaptor field
+            let cls_name = std::ffi::CString::new("_TtC5Maccy11AppDelegate").unwrap();
+            let mut cls = grafted_objc::objc_getClass(cls_name.as_ptr());
+            if cls.is_null() {
+                log::warn!("Could not find _TtC5Maccy11AppDelegate, falling back to Maccy.AppDelegate");
+                let fallback = std::ffi::CString::new("Maccy.AppDelegate").unwrap();
+                cls = grafted_objc::objc_getClass(fallback.as_ptr());
+            }
+
+            let mut app_del = std::ptr::null_mut();
+            if !cls.is_null() {
+                let alloc_sel = grafted_objc::sel_registerName(b"alloc\0".as_ptr() as *const i8);
+                let init_sel = grafted_objc::sel_registerName(b"init\0".as_ptr() as *const i8);
+                app_del = unsafe { grafted_objc::objc_msgSend(cls as *mut _, alloc_sel) as *mut u8 };
+                if !app_del.is_null() {
+                    app_del = unsafe { grafted_objc::objc_msgSend(app_del as *mut _, init_sel) as *mut u8 };
+                    log::info!("Created AppDelegate: {:p}", app_del);
+                }
+            } else {
+                log::warn!("Could not find AppDelegate class! Creating fake HeapObject.");
+                let fake_app_del = unsafe { libc::calloc(1, 64) } as *mut u64;
+                unsafe {
+                    *fake_app_del = 0x1; // Fake metadata pointer (non-null)
+                    *fake_app_del.add(1) = 0x100000000; // Fake refCounts
+                }
+                app_del = fake_app_del as *mut u8;
+            }
+            unsafe { *(instance as *mut *mut u8) = app_del };
+
+            // Initialize _hiddenMenu (field[1]) State<Bool> to true.
+            // Read metadata to find field offsets. For struct metadata:
+            //   +0: kind (u64), +8: descriptor (u64)
+            //   +16: field offset vector (u32 per field)
+            let meta = arg0 as *const u8;
+            let kind = unsafe { *(meta as *const u64) };
+            let desc = unsafe { *((meta as *const u64).add(1)) };
+            log::info!("  metadata: kind={:#x} desc={:#x}", kind, desc);
+
+            // Dump first 40 bytes of metadata to see field offset vector
+            for i in 0..5u64 {
+                let val = unsafe { *((meta as *const u64).add(i as usize)) };
+                log::info!("  meta[{}] = {:#x}", i, val);
+            }
+
+            // Read field offsets from the type descriptor directly.
+            // Struct descriptor layout: base(20) + numFields(4) + fieldOffsetVectorOffset(4)
+            let desc_addr = unsafe { *((meta as *const u64).add(1)) };
+            let num_fields = unsafe { *((desc_addr + 20) as *const u32) };
+            let fov_offset = unsafe { *((desc_addr + 24) as *const u32) };
+            log::info!("  descriptor {:#x}: numFields={} fovOffset={}", desc_addr, num_fields, fov_offset);
+
+            // If field offsets in metadata are zero, populate them ourselves.
+            // MaccyApp has 2 fields: _appDelegate (ptr, 8 bytes) + _hiddenMenu (State<Bool>, 8 bytes)
+            if fov_offset > 0 && fov_offset < 100 && num_fields > 0 {
+                let fov_base = unsafe { meta.add(fov_offset as usize * 8) } as *mut u32;
+                let f0 = unsafe { *fov_base };
+                if f0 == 0 && num_fields >= 2 {
+                    // Populate: field0 at offset 0, field1 at offset 8
+                    unsafe {
+                        *fov_base = 0;  // _appDelegate offset
+                        *fov_base.add(1) = 8;  // _hiddenMenu offset
+                    }
+                    log::info!("  populated field offsets: [0, 8]");
+                }
+                let f1_off = unsafe { *fov_base.add(1) } as usize;
+                log::info!("  field offsets: f0={} f1={}", unsafe { *fov_base }, f1_off);
+                // Set _hiddenMenu State<Bool> wrappedValue to true
+                if f1_off > 0 && f1_off < 256 {
+                    unsafe { *instance.add(f1_off) = 1 };
+                    log::info!("  set _hiddenMenu = true at offset {}", f1_off);
+                }
+            } else {
+                // Direct fallback
+                unsafe { *instance.add(8) = 1 };
+                log::info!("  set _hiddenMenu = true at offset 8 (fallback)");
+            }
+
             // Call the body getter. Swift method witnesses use this convention:
             //   fn(self: *mut App, metadata: *const Metadata, witness_table: *const WitnessTable)
             // We pass our zeroed instance, the metadata, and a fake witness table.
@@ -391,6 +468,23 @@ pub unsafe extern "C" fn NSApplicationMain(
             unsafe { getter(instance, arg0, fake_wt) };
 
             log::info!("  body getter executed — app's own UI created");
+
+            // After SwiftUI evaluates the body, we must manually trigger applicationDidFinishLaunching:
+            // since we bypass the actual NSApplication lifecycle for the delegate.
+            if !app_del.is_null() && !cls.is_null() {
+                let did_finish_sel = grafted_objc::sel_registerName(b"applicationDidFinishLaunching:\0".as_ptr() as *const i8);
+                let notification = unsafe { libc::calloc(1, 8) } as *mut u8; // fake NSNotification
+                log::info!("Calling applicationDidFinishLaunching: on AppDelegate {:p}", app_del);
+                type DidFinishFn = unsafe extern "C" fn(*mut u8, *mut core::ffi::c_void, *mut u8);
+                
+                if let Some(imp) = grafted_objc::grafted_lookup_method(app_del as *mut _, did_finish_sel) {
+                    let func: DidFinishFn = unsafe { std::mem::transmute(imp) };
+                    unsafe { func(app_del, did_finish_sel as *mut _, notification) };
+                    log::info!("applicationDidFinishLaunching: executed successfully!");
+                } else {
+                    log::warn!("applicationDidFinishLaunching: method not found!");
+                }
+            }
         } else {
             log::warn!("  body getter not found — showing fallback window");
         }

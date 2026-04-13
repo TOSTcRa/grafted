@@ -12,15 +12,17 @@ unsafe extern "C" fn shim_unresolved_trap() -> ! {
     unsafe { libc::_exit(127) };
 }
 
-/// Soft stub: returns a valid heap pointer instead of NULL.
-/// Returning 0 causes crashes when callers use the return value as
-/// a function pointer or type metadata. A valid allocation is safer.
+/// Soft stub: returns a valid heap pointer that can be used as Swift metadata.
+/// The pointer is offset +64 into a zeroed page so that negative offsets
+/// (like [-8] for the VWT pointer) still access valid zeroed memory.
+/// This prevents crashes when callers treat the return as type metadata.
 unsafe extern "C" fn shim_unresolved_soft() -> *mut u8 {
-    // Return a lazily-allocated zeroed page. All calls share the same page.
     static STUB_PAGE: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
     let mut ptr = STUB_PAGE.load(std::sync::atomic::Ordering::Acquire);
     if ptr.is_null() {
-        ptr = unsafe { libc::calloc(1, 4096) } as *mut u8;
+        let page = unsafe { libc::calloc(1, 8192) } as *mut u8;
+        // Return a pointer 64 bytes in, so [-8], [-16], etc. are valid zeros
+        ptr = unsafe { page.add(64) };
         STUB_PAGE.store(ptr, std::sync::atomic::Ordering::Release);
     }
     ptr
@@ -307,7 +309,8 @@ impl Linker {
 
     /// Run initializers for all loaded libraries, then the main binary.
     pub fn run_all_initializers(&self, main_binary: &MachOBinary) -> Result<(), LinkError> {
-        // Register ObjC classes from the main binary (needed for Swift class metadata).
+        // ObjC class_data fixup is handled by swift_metadata_translate.rs.
+        // Full register_objc_metadata hangs on complex method lists in Maccy.
         // Skip slid dylibs (vmaddr=0) — their pointers reference pre-slide addresses.
         for lib in self.loaded_libraries.values() {
             let text_vmaddr = lib.segments.iter().find(|s| s.name == "__TEXT").map(|s| s.vmaddr).unwrap_or(0);

@@ -110,24 +110,34 @@ pub fn load_swift_runtime() -> usize {
                 handles.push(handle);
                 log::info!("SwiftUI shim: loaded {}", shim_path);
 
-                // Extract ALL symbols from the SwiftUI shim (including mangled Swift names)
-                // Use dlsym for known critical symbols
-                for sym_name in &[
-                    "$s7SwiftUI3AppPAAE4mainyyFZ",
-                    "$s7SwiftUI12SceneBuilderV10buildBlockyxxAA0C0RzlFZ",
-                    "$s7SwiftUI11WindowGroupVMa",
-                    "$s7SwiftUI12MenuBarExtraVMa",
-                ] {
-                    let c_name = CString::new(*sym_name).unwrap();
-                    let addr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
-                    if !addr.is_null() {
-                        symbols.insert(format!("_{}", sym_name), addr as u64);
-                        symbols.insert(sym_name.to_string(), addr as u64);
+                // Extract ALL exported SwiftUI symbols from the shim by
+                // running nm on the .so and dlsym'ing each one.
+                // This catches constrained extension inits and other symbols
+                // that a hardcoded list would miss.
+                let mut shim_count = 0;
+                if let Ok(output) = std::process::Command::new("nm")
+                    .args(&["-D", "--defined-only", shim_path])
+                    .output()
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 3 {
+                            let sym = parts[2];
+                            if sym.starts_with("$s7SwiftUI") || sym.starts_with("_$s7SwiftUI") {
+                                let clean = sym.strip_prefix('_').unwrap_or(sym);
+                                let c_name = CString::new(clean).unwrap();
+                                let addr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
+                                if !addr.is_null() {
+                                    symbols.insert(format!("_{}", clean), addr as u64);
+                                    symbols.insert(clean.to_string(), addr as u64);
+                                    shim_count += 1;
+                                }
+                            }
+                        }
                     }
                 }
-
-                // Bulk-extract all exported symbols by scanning the dynamic symbol table
-                // For the SwiftUI shim, just grab everything with $s7SwiftUI prefix
+                // Also resolve from the hardcoded list as fallback
                 for &known in SWIFTUI_SYMBOLS {
                     let c_name = CString::new(known).unwrap();
                     let addr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
@@ -136,6 +146,7 @@ pub fn load_swift_runtime() -> usize {
                         symbols.insert(known.to_string(), addr as u64);
                     }
                 }
+                log::info!("SwiftUI shim: resolved {} symbols via nm scan", shim_count);
 
                 break;
             }
@@ -300,12 +311,18 @@ const SWIFTUI_SYMBOLS: &[&str] = &[
     "$s7SwiftUI4TextVMa",
     "$s7SwiftUI4TextVAA4ViewAAMc",
     "$s7SwiftUI4TextVAA4ViewAAWP",
+    "$s7SwiftUI18LocalizedStringKeyV13stringLiteralACSS_tcfC",
+    "$s7SwiftUI18LocalizedStringKeyVMa",
+    "$s7SwiftUI18LocalizedStringKeyVMn",
+    "$s7SwiftUI18LocalizedStringKeyVN",
     "$s7SwiftUI9EmptyViewVACycfC",
     "$s7SwiftUI9EmptyViewVMa",
     "$s7SwiftUI9EmptyViewVAA0D0AAMc",
     "$s7SwiftUI5StateVMa",
     "$s7SwiftUI5StateV12wrappedValueACyxGx_tcfC",
     "$s7SwiftUI5StateV12wrappedValuexvg",
+    "$s7SwiftUI5StateV14projectedValueAA7BindingVyxGvg",
+    "$s7SwiftUI5StateV14projectedValueAA7BindingVyxGvpMV",
     "$s7SwiftUI7BindingVMa",
     "$s7SwiftUI7BindingV3get3setACyxGxyc_yxctcfC",
     "$s7SwiftUI11EnvironmentVMa",

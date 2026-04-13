@@ -71,10 +71,13 @@ public struct MenuBarExtra<Label, Content>: Scene {
 // Extension for MenuBarExtra where Label == Text (used by Maccy)
 extension MenuBarExtra where Label == Text {
     public init(_ titleKey: LocalizedStringKey, isInserted: Binding<Bool>, @ViewBuilder content: () -> Content) {
+        // This is the init Maccy calls — it MUST call create_window
         let str = titleKey.stringValue
         let _ = str.withCString { ptr in
-            _grafted_create_window(ptr, 400, 500)
+            let _ = _grafted_create_window(ptr, 400, 500)
         }
+        // Also evaluate the content closure to trigger ContentView creation
+        let _ = content()
     }
 
     public init(_ titleKey: LocalizedStringKey, @ViewBuilder content: () -> Content) {

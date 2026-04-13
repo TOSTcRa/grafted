@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 /// Returns a map: framework_path → { symbol_name → address }.
 /// The linker merges these into its symbol registry.
+static REAL_GET_TYPE_FN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
     let mut reg = HashMap::new();
 
@@ -51,6 +53,12 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
     // If available, ALL Swift metadata/dispatch/memory functions work natively.
     // Fall back to stubs if not found.
     let real_swift = crate::swift_runtime::swift_symbols();
+    if let Some(&addr) = real_swift.get("_swift_getTypeByMangledNameInContext2") {
+        log::info!("FOUND REAL SWIFT FN: {:x}", addr);
+        REAL_GET_TYPE_FN.store(addr, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        log::error!("DID NOT FIND REAL SWIFT FN in real_swift map!");
+    }
     let swift_syms = if real_swift.is_empty() {
         log::info!("Swift runtime: using stubs (install Swift toolchain for full support)");
         swift_runtime_symbols()
@@ -86,11 +94,14 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
             // loaded images for protocol conformances, which spins when
             // it finds conformance records referencing types from incomplete
             // framework stubs. All other metadata functions use the real runtime.
-            // conformsToProtocol + getWitnessTable: both involve cross-image
-            // scanning that spins on incomplete framework conformances.
+            // These functions involve cross-image protocol/witness scanning
+            // that spins on incomplete framework conformances.
+            // getGenericMetadata also fails when conformance checks are stubbed.
             for sym_name in [
                 "_swift_conformsToProtocol", "swift_conformsToProtocol",
                 "_swift_getWitnessTable", "swift_getWitnessTable",
+                "_swift_getGenericMetadata", "swift_getGenericMetadata",
+                "_swift_getTypeByMangledNameInContext2", "swift_getTypeByMangledNameInContext2",
             ] {
                 if let Some(addr) = stubs_only.get(sym_name) {
                     merged.insert(sym_name.into(), *addr);
@@ -536,7 +547,7 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     sym!(s, "_swift_getTypeByMangledNameInContext", swift_get_type_by_mangled_name);
     sym!(s, "_swift_getTypeByMangledNameInContextInMetadataState", swift_get_type_by_mangled_name);
     sym!(s, "_swift_getExistentialTypeMetadata", swift_noop_ptr);
-    sym!(s, "_swift_getGenericMetadata", swift_noop_ptr);
+    sym!(s, "_swift_getGenericMetadata", swift_get_generic_metadata_stub);
     sym!(s, "_swift_getObjCClassMetadata", swift_noop_ptr);
     sym!(s, "_swift_getWitnessTable", swift_noop_ptr);
     sym!(s, "_swift_getAssociatedTypeWitness", swift_noop_ptr);
@@ -610,8 +621,8 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     sym!(s, "_swift_getOpaqueTypeMetadata2", swift_noop_ptr);
     sym!(s, "_swift_getOpaqueTypeConformance", swift_noop_ptr);
     sym!(s, "_swift_getOpaqueTypeConformance2", swift_noop_ptr);
-    sym!(s, "_swift_getTypeByMangledNameInContext2", swift_noop_ptr);
-    sym!(s, "_swift_getTypeByMangledNameInContextInMetadataState2", swift_noop_ptr);
+    sym!(s, "_swift_getTypeByMangledNameInContext2", swift_get_type_by_mangled_name);
+    sym!(s, "_swift_getTypeByMangledNameInContextInMetadataState2", swift_get_type_by_mangled_name);
     sym!(s, "_swift_getAssociatedConformanceWitness", swift_noop_ptr);
     // Key paths
     sym!(s, "_swift_getKeyPath", swift_noop_ptr);
@@ -782,11 +793,82 @@ unsafe extern "C" fn swift_get_singleton_metadata(
         *metadata.sub(1) = vwt as u64;        // VWT pointer
         *metadata = 0x200;                     // kind: struct nominal type descriptor
         *metadata.add(1) = descriptor as u64;  // nominal type descriptor
+
+        // Read FieldOffsetVectorOffset from descriptor (+20 for struct descriptors)
+        // and populate field offsets assuming pointer-sized fields.
+        let desc_flags = *(descriptor as *const u32);
+        let desc_kind = desc_flags & 0x1F;
+        log::info!("  descriptor flags={:#x} kind={}", desc_flags, desc_kind);
+        // ContextDescriptorKind: Class=16, Struct=17, Enum=18
+        if desc_kind == 17 { // Struct
+            // Read field descriptor relative pointer at desc+16
+            let fields_rel = *((descriptor as *const i32).add(4));
+            let fields_addr = (descriptor as i64 + 16 + fields_rel as i64) as *const u8;
+            if fields_addr as u64 > 0x100000000 {
+                let num_fields = *((fields_addr.add(12)) as *const u32);
+                // FieldOffsetVectorOffset is at desc+20 for struct descriptors
+                let fov_offset_raw = *((descriptor.add(20)) as *const u32);
+                // Only for struct kind=17 (not class kind=16)
+                if fov_offset_raw > 0 && fov_offset_raw < 100 {
+                    let fov_start = fov_offset_raw as usize; // in pointer-sized words
+                    // Populate field offsets: assume 8 bytes per field (pointer-sized)
+                    let mut current_offset = 0u32;
+                    for fi in 0..num_fields.min(16) {
+                        let off_ptr = (metadata as *mut u32).add(fov_start * 2 + fi as usize);
+                        *off_ptr = current_offset;
+                        current_offset += 8; // each field is 8 bytes (pointer-sized)
+                    }
+                    // Update VWT size/stride to match total struct size
+                    let total_size = (num_fields * 8) as u64;
+                    *vwt.add(8) = total_size;     // size
+                    *vwt.add(9) = total_size;     // stride
+                    log::info!("  populated {} field offsets, total size={}", num_fields, total_size);
+                }
+            }
+        }
     }
     let ptr = metadata as *mut u8;
     log::info!("swift_getSingletonMetadata: descriptor={:#x} → metadata={:p}", key, ptr);
     map.insert(key, ptr);
     ptr
+}
+
+/// swift_getGenericMetadata stub: returns a valid metadata struct with VWT at [-8].
+/// The real runtime's version fails because it depends on swift_conformsToProtocol.
+unsafe extern "C" fn swift_get_generic_metadata_stub(
+    _request: usize,
+    descriptor: *const u8,
+    _args: *const *const u8,
+) -> *mut u8 {
+    // Allocate metadata with space for VWT at [-8]
+    let raw = unsafe { libc::calloc(1, 512) } as *mut u64;
+    let metadata = unsafe { raw.add(8) }; // leave 64 bytes before for negative offsets
+
+    // Create a minimal VWT at metadata[-1]
+    let vwt = unsafe { libc::calloc(1, 256) } as *mut u64;
+    unsafe extern "C" fn dummy_vwt_func(arg: *mut u8) -> *mut u8 { arg }
+    let dummy = dummy_vwt_func as *const () as u64;
+    unsafe {
+        *vwt.add(0) = dummy; // initializeBufferWithCopyOfBuffer
+        *vwt.add(1) = dummy; // destroy
+        *vwt.add(2) = dummy; // initializeWithCopy
+        *vwt.add(3) = dummy; // assignWithCopy
+        *vwt.add(4) = dummy; // initializeWithTake
+        *vwt.add(5) = dummy; // assignWithTake
+        *vwt.add(6) = dummy; // getEnumTagSinglePayload
+        *vwt.add(7) = dummy; // storeEnumTagSinglePayload
+        *vwt.add(8) = 8;     // size
+        *vwt.add(9) = 8;     // stride
+        *vwt.add(10) = 7;    // flags (alignment-1)
+    }
+
+    unsafe {
+        *metadata.sub(1) = vwt as u64;              // VWT at [-8]
+        *metadata = 0x200;                            // kind: struct
+        *metadata.add(1) = descriptor as u64;         // descriptor
+    }
+
+    metadata as *mut u8
 }
 
 unsafe extern "C" fn swift_isa_mask_val() -> u64 { 0x0000_7FFF_FFFF_FFF8 }
@@ -796,12 +878,23 @@ unsafe extern "C" fn swift_isa_mask_val() -> u64 { 0x0000_7FFF_FFFF_FFF8 }
 /// The metadata is cached per mangled name string.
 unsafe extern "C" fn swift_get_type_by_mangled_name(
     mangled_name: *const u8,
-    mangled_name_length: i32,
-    _generic_env: *const u8,
-    _generic_args: *const *const u8,
+    mangled_name_length: usize,
+    generic_env: *const u8,
+    generic_args: *const *const u8,
 ) -> *mut u8 {
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    // First try the REAL Swift runtime function if available
+    type RealFn = unsafe extern "C" fn(*const u8, usize, *const u8, *const *const u8) -> *mut u8;
+    let real_addr = REAL_GET_TYPE_FN.load(std::sync::atomic::Ordering::SeqCst);
+    if real_addr != 0 {
+        let real_fn: RealFn = unsafe { std::mem::transmute(real_addr) };
+        let real_meta = unsafe { real_fn(mangled_name, mangled_name_length, generic_env, generic_args) };
+        if !real_meta.is_null() {
+            return real_meta; // Real runtime succeeded!
+        }
+    }
 
     struct SendPtr(HashMap<Vec<u8>, *mut u8>);
     unsafe impl Send for SendPtr {}
@@ -830,18 +923,43 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
     }
 
     // Create a minimal valid metadata struct:
-    // HeapMetadata { kind/vwt_ptr, superclass_or_flags }
-    // For struct metadata: kind = 0x200 (struct), followed by type descriptor
-    // We allocate enough for callers to read fields without crashing
-    let metadata = unsafe { libc::calloc(1, 256) } as *mut u64;
+    // We allocate enough for callers to read fields without crashing.
+    // The VWT must be placed at `metadata[-1]` (which is `metadata_ptr - 8`).
+    let raw = unsafe { libc::calloc(1, 512) } as *mut u64;
+    let metadata = unsafe { raw.add(8) }; // Leave space for negative offsets
+
+    // Create a minimal VWT at metadata[-1]
+    let vwt = unsafe { libc::calloc(1, 256) } as *mut u64;
+    unsafe extern "C" fn dummy_vwt_func(arg: *mut u8) -> *mut u8 { arg }
+    let dummy = dummy_vwt_func as *const () as u64;
     unsafe {
-        *metadata = 0x1;         // kind: struct metadata (non-null)
-        *metadata.add(1) = 0;    // description pointer (null = opaque)
+        *vwt.add(0) = dummy; // initializeBufferWithCopyOfBuffer
+        *vwt.add(1) = dummy; // destroy
+        *vwt.add(2) = dummy; // initializeWithCopy
+        *vwt.add(3) = dummy; // assignWithCopy
+        *vwt.add(4) = dummy; // initializeWithTake
+        *vwt.add(5) = dummy; // assignWithTake
+        *vwt.add(6) = dummy; // getEnumTagSinglePayload
+        *vwt.add(7) = dummy; // storeEnumTagSinglePayload
+        *vwt.add(8) = 8;     // size
+        *vwt.add(9) = 8;     // stride
+        *vwt.add(10) = 7;    // flags (alignment-1)
+    }
+
+    unsafe {
+        let dummy_descriptor = libc::calloc(1, 256) as *mut u64;
+        *metadata.sub(1) = vwt as u64;              // VWT at [-1]
+        *metadata = 0x200;                            // kind: struct metadata
+        *metadata.add(1) = dummy_descriptor as u64;   // descriptor pointer (non-null)
+        // Fill generic arguments with self-reference so they are valid metadata pointers!
+        for i in 2..16 {
+            *metadata.add(i) = metadata as u64;
+        }
     }
 
     let ptr = metadata as *mut u8;
     let name_str = String::from_utf8_lossy(&key).into_owned();
-    log::info!("swift_getTypeByMangledNameInContext: '{}' → {:p}", name_str, ptr);
+    log::info!("swift_getTypeByMangledNameInContext fallback: '{}' → {:p}", name_str, ptr);
     map.insert(key, ptr);
     ptr
 }
