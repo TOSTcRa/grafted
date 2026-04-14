@@ -843,8 +843,11 @@ unsafe extern "C" fn safe_getAssociatedTypeWitness(
     MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 }
 }
 
-/// No-op witness function: returns its first argument (self).
-unsafe extern "C" fn witness_noop(obj: *mut u8, _wt: *mut u8) -> *mut u8 { obj }
+/// No-op witness function: returns stub metadata (valid VWT at [-1]).
+/// Witness table entries are protocol requirements that often return types/metadata.
+unsafe extern "C" fn witness_noop(_obj: *mut u8, _wt: *mut u8) -> *mut u8 {
+    shim_unresolved_soft_metadata()
+}
 
 /// Get a valid stub witness table filled with no-op function pointers.
 /// Witness tables contain function pointers (protocol requirements), so entries
