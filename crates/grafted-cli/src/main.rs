@@ -127,6 +127,10 @@ fn main() -> ExitCode {
 
         // Register Swift metadata sections with the Linux Swift runtime
         grafted_frameworks::swift_sections::register_swift_sections(&binary.data, binary.slide);
+
+        // Install safe retain/release hooks via Swift runtime's own hook mechanism.
+        // Must run AFTER Swift runtime is loaded (by framework_registry → swift_symbols).
+        grafted_frameworks::registry::install_swift_retain_hooks();
     }
 
     // Patch Go runtime.settls if this is a Go binary (sets GS base for TLS)

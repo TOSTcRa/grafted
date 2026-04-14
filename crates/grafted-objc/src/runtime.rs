@@ -81,7 +81,7 @@ extern "C" fn grafted_alloc(cls: id, _cmd: SEL) -> id {
         if !ptr.is_null() {
             (*ptr).isa = cls as Class;
             // Set Swift-compatible refcount at +8 (immortal so retain/release don't crash)
-            *((ptr as *mut u64).add(1)) = 0xFFFFFFFF00000000;
+            *((ptr as *mut u64).add(1)) = 0xFFFFFFFFFFFFFFFF; // immortal refcount
         }
         ptr
     }

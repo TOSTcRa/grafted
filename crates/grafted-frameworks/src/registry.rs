@@ -776,8 +776,7 @@ fn libcxx_symbols() -> HashMap<String, u64> {
 
 // ---- Stub implementations ----
 
-unsafe extern "C" fn swift_retain(obj: *mut u8) -> *mut u8 { obj }
-unsafe extern "C" fn swift_release(_obj: *mut u8) {}
+// swift_retain/release are defined below with safe interposition logic
 unsafe extern "C" fn swift_alloc_object(metadata: *mut u8, size: usize, _align: usize) -> *mut u8 {
     let obj = unsafe { libc::calloc(1, size.max(16)) } as *mut u8;
     if !obj.is_null() {
@@ -786,7 +785,7 @@ unsafe extern "C" fn swift_alloc_object(metadata: *mut u8, size: usize, _align: 
             *(obj as *mut *mut u8) = metadata;
             // Set refcount to "1 strong reference" (immortal-ish: high bits set
             // so retain/release don't underflow to dealloc)
-            *((obj as *mut u64).add(1)) = 0xFFFFFFFF00000000; // immortal refcount (high bits set)
+            *((obj as *mut u64).add(1)) = 0xFFFFFFFFFFFFFFFF; // immortal refcount: (rc & 0x80000000FFFFFFFF) == mask
         }
     }
     obj
@@ -1048,9 +1047,6 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
 
     unsafe {
         let dummy_descriptor = libc::calloc(1, 256) as *mut u64;
-        // Set immortal refcount on the raw allocation (in case it's treated as HeapObject)
-        *raw.add(0) = metadata as u64;                // isa → self (metadata)
-        *raw.add(1) = 0xFFFFFFFF00000000;             // immortal refcount at +8
         *metadata.sub(1) = vwt as u64;               // VWT at [-1]
         *metadata = 0x200;                            // kind: struct metadata
         *metadata.add(1) = dummy_descriptor as u64;   // descriptor pointer (non-null)
@@ -1071,6 +1067,137 @@ unsafe extern "C" fn swift_slow_alloc(size: usize, align: usize) -> *mut u8 {
 }
 unsafe extern "C" fn swift_slow_dealloc(ptr: *mut u8, _size: usize, _align: usize) {
     if !ptr.is_null() { unsafe { libc::free(ptr as *mut _) }; }
+}
+
+/// Install safe swift_retain/release hooks via the Swift runtime's own hook mechanism.
+/// libswiftCore.so has writable function pointer variables (_swift_retain, etc.)
+/// that swift_retain_n/release_n check before calling the default impl.
+pub fn install_swift_retain_hooks() {
+    unsafe {
+        for (var_name, hook_fn) in [
+            ("_swift_retain\0", safe_swift_retain as *const () as u64),
+            ("_swift_retain_n\0", safe_swift_retain_n as *const () as u64),
+            ("_swift_release\0", safe_swift_release as *const () as u64),
+            ("_swift_release_n\0", safe_swift_release_n as *const () as u64),
+        ] {
+            let ptr = libc::dlsym(libc::RTLD_DEFAULT, var_name.as_ptr() as *const i8);
+            if !ptr.is_null() {
+                *(ptr as *mut u64) = hook_fn;
+                log::info!("Swift hook: {} → {:#x}", &var_name[..var_name.len()-1], hook_fn);
+            }
+        }
+    }
+}
+
+// Real default implementations (resolved at first call via dlsym)
+static REAL_RETAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REAL_RETAIN_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REAL_RELEASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REAL_RELEASE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn resolve_real(name: &str, cache: &std::sync::atomic::AtomicU64) -> u64 {
+    let addr = cache.load(std::sync::atomic::Ordering::Relaxed);
+    if addr != 0 { return addr; }
+    // Look up the internal default impl (double underscore prefix)
+    let real_name = format!("__{}_\0", name);
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, real_name.as_ptr() as *const i8) };
+    let a = if p.is_null() { 1 } else { p as u64 };
+    cache.store(a, std::sync::atomic::Ordering::Relaxed);
+    a
+}
+
+// All retain/release are no-ops. This prevents crashes on stub objects
+// at the cost of memory leaks (acceptable for a compatibility layer).
+unsafe extern "C" fn safe_swift_retain(object: *mut u8) -> *mut u8 { object }
+unsafe extern "C" fn safe_swift_retain_n(object: *mut u8, _n: u32) -> *mut u8 { object }
+unsafe extern "C" fn safe_swift_release(_object: *mut u8) {}
+unsafe extern "C" fn safe_swift_release_n(_object: *mut u8, _n: u32) {}
+
+/// Safe swift_retain/release overrides via ELF symbol interposition.
+/// Check if the object has valid-looking refcounts before delegating to the real runtime.
+/// This prevents crashes when the binary retains stub/zeroed objects.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn swift_retain(object: *mut u8) -> *mut u8 {
+    if object.is_null() { return object; }
+    // Read refcount at +8. If it looks like our immortal marker or zero, skip.
+    let rc = unsafe { *((object as *const u64).add(1)) };
+    if rc == 0 || rc >= 0xFFFFFFFF00000000 { return object; }
+    // Delegate to real runtime via dlsym
+    type RetainFn = unsafe extern "C" fn(*mut u8) -> *mut u8;
+    static REAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut addr = REAL.load(std::sync::atomic::Ordering::Relaxed);
+    if addr == 0 {
+        let name = std::ffi::CString::new("swift_retain").unwrap();
+        let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
+        addr = if p.is_null() { 1 } else { p as u64 };
+        REAL.store(addr, std::sync::atomic::Ordering::Relaxed);
+    }
+    if addr > 1 {
+        let f: RetainFn = unsafe { std::mem::transmute(addr) };
+        return unsafe { f(object) };
+    }
+    object
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn swift_retain_n(object: *mut u8, n: u32) -> *mut u8 {
+    if object.is_null() { return object; }
+    let rc = unsafe { *((object as *const u64).add(1)) };
+    if rc == 0 || rc >= 0xFFFFFFFF00000000 { return object; }
+    type RetainNFn = unsafe extern "C" fn(*mut u8, u32) -> *mut u8;
+    static REAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut addr = REAL.load(std::sync::atomic::Ordering::Relaxed);
+    if addr == 0 {
+        let name = std::ffi::CString::new("swift_retain_n").unwrap();
+        let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
+        addr = if p.is_null() { 1 } else { p as u64 };
+        REAL.store(addr, std::sync::atomic::Ordering::Relaxed);
+    }
+    if addr > 1 {
+        let f: RetainNFn = unsafe { std::mem::transmute(addr) };
+        return unsafe { f(object, n) };
+    }
+    object
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn swift_release(object: *mut u8) {
+    if object.is_null() { return; }
+    let rc = unsafe { *((object as *const u64).add(1)) };
+    if rc == 0 || rc >= 0xFFFFFFFF00000000 { return; }
+    type ReleaseFn = unsafe extern "C" fn(*mut u8);
+    static REAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut addr = REAL.load(std::sync::atomic::Ordering::Relaxed);
+    if addr == 0 {
+        let name = std::ffi::CString::new("swift_release").unwrap();
+        let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
+        addr = if p.is_null() { 1 } else { p as u64 };
+        REAL.store(addr, std::sync::atomic::Ordering::Relaxed);
+    }
+    if addr > 1 {
+        let f: ReleaseFn = unsafe { std::mem::transmute(addr) };
+        unsafe { f(object) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn swift_release_n(object: *mut u8, n: u32) {
+    if object.is_null() { return; }
+    let rc = unsafe { *((object as *const u64).add(1)) };
+    if rc == 0 || rc >= 0xFFFFFFFF00000000 { return; }
+    type ReleaseNFn = unsafe extern "C" fn(*mut u8, u32);
+    static REAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut addr = REAL.load(std::sync::atomic::Ordering::Relaxed);
+    if addr == 0 {
+        let name = std::ffi::CString::new("swift_release_n").unwrap();
+        let p = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
+        addr = if p.is_null() { 1 } else { p as u64 };
+        REAL.store(addr, std::sync::atomic::Ordering::Relaxed);
+    }
+    if addr > 1 {
+        let f: ReleaseNFn = unsafe { std::mem::transmute(addr) };
+        unsafe { f(object, n) };
+    }
 }
 
 /// Override swift_allocateWitnessTablePack via ELF symbol interposition.
