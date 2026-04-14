@@ -58,11 +58,12 @@ pub unsafe extern "C" fn ns_application_run(
                     APP_TERMINATED.store(true, Ordering::Release);
                 }
                 display::DisplayEvent::Expose { window } => {
-                    // Re-render the Maccy UI and flush to X11
+                    // Re-render the Maccy UI with current clipboard history
                     let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
                     if !ctx.is_null() {
-                        let entries = super::maccy_ui::sample_entries();
-                        super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &entries, 0, "");
+                        if let Ok(h) = CLIPBOARD_HISTORY.lock() {
+                            super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &h.entries, 0, "");
+                        }
                         display::flush_window(*window, ctx as crate::cg::context::CGContextRef);
                     }
                 }
@@ -175,6 +176,14 @@ fn find_body_getter(search_addr: u64) -> Option<u64> {
 static MAIN_WINDOW_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static MAIN_WINDOW_CTX: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Global clipboard history, polled by background thread, rendered by UI.
+static CLIPBOARD_HISTORY: std::sync::LazyLock<std::sync::Arc<std::sync::Mutex<super::clipboard_history::ClipboardHistory>>> =
+    std::sync::LazyLock::new(|| {
+        let history = std::sync::Arc::new(std::sync::Mutex::new(super::maccy_ui::initial_history()));
+        super::clipboard_history::start_polling(history.clone());
+        history
+    });
+
 #[unsafe(no_mangle)]
 pub extern "C" fn grafted_log_raw(s1: u64, s2: u64) {
     log::info!("SHIM RAW: s1={:#x} s2={:#x}", s1, s2);
@@ -202,9 +211,11 @@ pub extern "C" fn grafted_swiftui_create_window(title: *const i8, w: i32, h: i32
         };
 
         if !ctx.is_null() {
-            // Render the dark Maccy-like clipboard UI
-            let entries = super::maccy_ui::sample_entries();
-            super::maccy_ui::render(ctx, &entries, 0, "");
+            // Render the dark Maccy clipboard UI with real clipboard history
+            let _ = &*CLIPBOARD_HISTORY; // Initialize lazy global
+            if let Ok(h) = CLIPBOARD_HISTORY.lock() {
+                super::maccy_ui::render(ctx, &h.entries, 0, "");
+            }
 
             display::show_window(wid);
             display::flush_window(wid, ctx);
@@ -441,12 +452,13 @@ fn render_view_tree() {
 /// Called from SwiftUI.swift App.main() after body is evaluated — enters the run loop.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafted_swiftui_run_loop() {
-    // Render the Maccy UI (replaces render_view_tree which was empty for this app)
+    // Render the Maccy UI with real clipboard history
     let wid = MAIN_WINDOW_ID.load(std::sync::atomic::Ordering::Acquire);
     let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
     if wid != 0 && !ctx.is_null() {
-        let entries = super::maccy_ui::sample_entries();
-        super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &entries, 0, "");
+        if let Ok(h) = CLIPBOARD_HISTORY.lock() {
+            super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &h.entries, 0, "");
+        }
         display::flush_window(wid, ctx as crate::cg::context::CGContextRef);
     }
 

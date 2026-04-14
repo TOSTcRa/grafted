@@ -27,15 +27,10 @@ const SEARCH_BAR_H: f64 = 36.0;
 const ROW_H: f64 = 32.0;
 const FOOTER_H: f64 = 28.0;
 
-/// A clipboard history entry for display
-pub struct ClipboardEntry {
-    pub text: String,
-    pub time_ago: String,
-    pub pinned: bool,
-}
+use super::clipboard_history;
 
 /// Render the full Maccy UI into a CGContext.
-pub fn render(ctx: CGContextRef, entries: &[ClipboardEntry], selected: usize, search_query: &str) {
+pub fn render(ctx: CGContextRef, entries: &[clipboard_history::ClipboardEntry], selected: usize, search_query: &str) {
     if ctx.is_null() { return; }
 
     let w = unsafe { CGBitmapContextGetWidth(ctx) } as f64;
@@ -120,8 +115,9 @@ pub fn render(ctx: CGContextRef, entries: &[ClipboardEntry], selected: usize, se
             draw_text_bitmap(ctx, &display_text, text_x, ry + 10.0, TEXT_PRIMARY, 1.0);
 
             // Time ago (right-aligned)
-            let time_w = entry.time_ago.len() as f64 * 6.0;
-            draw_text_bitmap(ctx, &entry.time_ago, w - time_w - 10.0, ry + 10.0, TEXT_SECONDARY, 0.9);
+            let time_str = entry.time_ago();
+            let time_w = time_str.len() as f64 * 6.0;
+            draw_text_bitmap(ctx, &time_str, w - time_w - 10.0, ry + 10.0, TEXT_SECONDARY, 0.9);
 
             // Divider between rows
             fill_rect(ctx, 0.0, ry + ROW_H - 1.0, w, 1.0, DIVIDER);
@@ -145,35 +141,11 @@ pub fn render(ctx: CGContextRef, entries: &[ClipboardEntry], selected: usize, se
     draw_text_bitmap(ctx, "Esc: quit", w - 60.0, fy + 8.0, TEXT_SECONDARY, 0.9);
 }
 
-/// Generate sample clipboard entries for initial display
-pub fn sample_entries() -> Vec<ClipboardEntry> {
-    vec![
-        ClipboardEntry {
-            text: "Welcome to Maccy on Linux via grafted!".into(),
-            time_ago: "now".into(),
-            pinned: true,
-        },
-        ClipboardEntry {
-            text: "This is a pre-compiled macOS binary running natively".into(),
-            time_ago: "1m".into(),
-            pinned: false,
-        },
-        ClipboardEntry {
-            text: "Swift App.main() -> body getter -> MenuBarExtra -> X11".into(),
-            time_ago: "2m".into(),
-            pinned: false,
-        },
-        ClipboardEntry {
-            text: "54 ObjC classes registered, 9 AppDelegate methods".into(),
-            time_ago: "3m".into(),
-            pinned: false,
-        },
-        ClipboardEntry {
-            text: "grafted: Darwin-on-Linux compatibility layer".into(),
-            time_ago: "5m".into(),
-            pinned: false,
-        },
-    ]
+/// Create initial history by reading the current system clipboard
+pub fn initial_history() -> clipboard_history::ClipboardHistory {
+    let mut history = clipboard_history::ClipboardHistory::new();
+    history.poll(); // Read current clipboard content
+    history
 }
 
 fn fill_rect(ctx: CGContextRef, x: f64, y: f64, w: f64, h: f64, color: (f64, f64, f64)) {
