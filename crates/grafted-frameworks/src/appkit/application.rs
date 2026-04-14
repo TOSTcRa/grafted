@@ -636,6 +636,21 @@ pub unsafe extern "C" fn NSApplicationMain(
                 if !app_del.is_null() {
                     app_del = unsafe { grafted_objc::objc_msgSend(app_del as *mut _, init_sel) as *mut u8 };
                     log::info!("Created AppDelegate: {:p}", app_del);
+                    // Fill stored property slots (+16..+256) with valid stub objects
+                    // so applicationDidFinishLaunching doesn't null-deref on self.property
+                    for offset in (16..256).step_by(8) {
+                        let field = unsafe { *((app_del as *const u64).add(offset / 8)) };
+                        if field == 0 {
+                            // Allocate a stub object with valid isa + immortal refcount
+                            let stub = unsafe { libc::calloc(1, 256) } as *mut u64;
+                            unsafe {
+                                *stub = cls as u64;                    // isa → AppDelegate class
+                                *stub.add(1) = 0xFFFFFFFFFFFFFFFF;     // immortal refcount
+                            }
+                            unsafe { *((app_del as *mut u64).add(offset / 8)) = stub as u64; }
+                        }
+                    }
+                    log::info!("  filled {} stored property slots with stubs", (256 - 16) / 8);
                 }
                 // Save globally so grafted_swiftui_run_loop can call lifecycle methods
                 APP_DELEGATE_PTR.store(app_del, std::sync::atomic::Ordering::Release);

@@ -627,8 +627,8 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     sym!(s, "_swift_getExistentialTypeMetadata", swift_noop_ptr);
     sym!(s, "_swift_getGenericMetadata", swift_get_generic_metadata_stub);
     sym!(s, "_swift_getObjCClassMetadata", swift_noop_ptr);
-    sym!(s, "_swift_getWitnessTable", swift_noop_ptr);
-    sym!(s, "_swift_getAssociatedTypeWitness", swift_noop_ptr);
+    sym!(s, "_swift_getWitnessTable", swift_get_witness_table_stub);
+    sym!(s, "_swift_getAssociatedTypeWitness", swift_get_witness_table_stub);
     sym!(s, "_swift_checkMetadataState", swift_check_metadata);
     sym!(s, "_swift_getFunctionTypeMetadata", swift_noop_ptr);
     sym!(s, "_swift_getTupleTypeMetadata", swift_noop_ptr);
@@ -1106,6 +1106,21 @@ fn resolve_real(name: &str, cache: &std::sync::atomic::AtomicU64) -> u64 {
     a
 }
 
+/// Stub for swift_getWitnessTable/swift_getAssociatedTypeWitness: returns a valid
+/// witness table pointer (self-referencing entries) instead of NULL.
+unsafe extern "C" fn swift_get_witness_table_stub(_a: *mut u8, _b: *mut u8, _c: *mut u8) -> *mut u8 {
+    static STUB_WT: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let mut wt = STUB_WT.load(std::sync::atomic::Ordering::Acquire);
+    if wt.is_null() {
+        let p = unsafe { libc::calloc(1, 512) } as *mut u64;
+        // Fill with self-referencing pointers so any dereference is valid
+        unsafe { for i in 0..64 { *p.add(i) = p as u64; } }
+        wt = p as *mut u8;
+        STUB_WT.store(wt, std::sync::atomic::Ordering::Release);
+    }
+    wt
+}
+
 // All retain/release are no-ops. This prevents crashes on stub objects
 // at the cost of memory leaks (acceptable for a compatibility layer).
 unsafe extern "C" fn safe_swift_retain(object: *mut u8) -> *mut u8 { object }
@@ -1216,13 +1231,19 @@ pub unsafe extern "C" fn swift_allocateWitnessTablePack(
         std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
     let mut pack = STUB_PACK.load(std::sync::atomic::Ordering::Acquire);
     if pack.is_null() {
-        // Allocate an array of 32 stub witness table pointers
+        // Allocate an array of 32 stub witness table pointers.
+        // Each must point to a valid-looking witness table (non-null entries)
+        // so swift_getAssociatedTypeWitness doesn't null-deref.
         let arr = unsafe { libc::calloc(32, 8) } as *mut *const u8;
-        // Fill with pointer to our soft stub metadata (which has valid VWT)
-        // Use a calloc'd page with valid VWT as stub witness table
-        let stub = unsafe { libc::calloc(1, 256) } as *const u8;
+        let stub_wt = unsafe { libc::calloc(1, 512) } as *mut u64;
+        unsafe {
+            // Fill witness table entries with self-referencing pointers
+            for j in 0..64 {
+                *stub_wt.add(j) = stub_wt as u64;
+            }
+        }
         for i in 0..32 {
-            unsafe { *arr.add(i) = stub; }
+            unsafe { *arr.add(i) = stub_wt as *const u8; }
         }
         STUB_PACK.store(arr, std::sync::atomic::Ordering::Release);
         pack = arr;
