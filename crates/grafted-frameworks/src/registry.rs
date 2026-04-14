@@ -866,6 +866,9 @@ fn get_stub_witness_table() -> *mut u8 {
     wt
 }
 
+/// No-op function for patching init functions that corrupt our stub metadata.
+unsafe extern "C" fn safe_noop_return() {}
+
 /// Safe swift_conformsToProtocol: always returns NULL (no conformance found).
 unsafe extern "C" fn safe_conformsToProtocol(
     _type: *const u8,
@@ -1046,7 +1049,20 @@ unsafe extern "C" fn smart_checkMetadataState(metadata: *mut u8, request: usize)
     if trampoline != 0 {
         type RealFn = unsafe extern "C" fn(*mut u8, usize) -> MetadataResponse;
         let f: RealFn = std::mem::transmute(trampoline);
-        return f(metadata, request);
+        let resp = f(metadata, request);
+        // After the real function processes metadata, the VWT at [-1] may have been
+        // overwritten by swift_initStructMetadata with a garbage computed value.
+        // Validate and fix it before returning.
+        if !resp.metadata.is_null() && (resp.metadata as usize) > 0x1000 {
+            let vwt = *((resp.metadata as *const u64).sub(1));
+            if vwt < 0x1000 || vwt >= 0x800000000000 {
+                // VWT is garbage — replace with our universal VWT
+                let stub = shim_unresolved_soft_metadata();
+                let good_vwt = *((stub as *const u64).sub(1));
+                *((resp.metadata as *mut u64).sub(1)) = good_vwt;
+            }
+        }
+        return resp;
     }
     MetadataResponse { metadata, state: 0 }
 }
@@ -1330,6 +1346,11 @@ pub fn install_swift_retain_hooks() {
             }
         }
 
+        // Re-install our SIGSEGV handler — the Swift runtime may have overridden it
+        // with its own crash handler during initialization.
+        unsafe extern "C" { fn grafted_reinstall_sigsegv_handler(); }
+        unsafe { grafted_reinstall_sigsegv_handler(); }
+
         // NOTE: Binary patches for swift_checkMetadataState, swift_getAssociatedTypeWitness
         // etc. are applied TEMPORARILY by apply_lifecycle_patches() / restore_lifecycle_patches()
         // only during applicationDidFinishLaunching. Permanent patches break the body getter.
@@ -1360,6 +1381,10 @@ fn save_original_bytes() {
         ("swift_conformsToProtocol2", 12, safe_conformsToProtocol as *const u8),
         ("swift_conformsToProtocolCommon", 12, safe_conformsToProtocol as *const u8),
         ("swift_getWitnessTable", 12, swift_get_witness_table_stub as *const u8),
+        ("swift_getGenericMetadata", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_getSingletonMetadata", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_initStructMetadata", 12, safe_noop_return as *const u8),
+        ("swift_initStructMetadataWithLayoutString", 12, safe_noop_return as *const u8),
     ];
 
     let mut sites = PATCH_SITES.lock().unwrap();
@@ -1400,6 +1425,43 @@ fn save_original_bytes() {
                 std::ptr::write_unaligned(t.add(24) as *mut u64, ret);
                 *t.add(32) = 0xFF; *t.add(33) = 0xE0;
                 REAL_CHECK_METADATA.store(t as u64, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Patch specific crashing instructions in the Maccy binary.
+/// These are compiler-generated helpers that read VWT from metadata that may
+/// have corrupted VWT pointers after Darwin→Linux translation.
+pub fn patch_binary_crash_sites() {
+    // Patch binary sites that read VWT from metadata[-1] where VWT may be 0x211
+    // (corrupted by runtime metadata initialization on our stubs).
+    // Pattern: mov -0x8(%reg),%rax; mov 0xNN(%rax),%rax → crash
+    // Fix: replace the VWT load with loading our universal stub VWT directly.
+    let stub_meta = shim_unresolved_soft_metadata();
+    let good_vwt = unsafe { *((stub_meta as *const u64).sub(1)) };
+
+    // Site 1: binary+0x10827: mov -0x8(%rsi),%rcx; mov 0x50(%rcx),%ecx
+    // Replace with: xor %ecx,%ecx; nop*5  (ecx=0 → takes simple path)
+    for &addr in &[0x100010827u64, 0x1000e42a6u64] {
+        let target = addr as *mut u8;
+        let page = (target as usize & !0xFFF) as *mut libc::c_void;
+        unsafe {
+            if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
+                // NOP out the VWT load + access (7 bytes for site1, 12 bytes for site2)
+                // Site 1: 48 8b 4e f8 (4) + 8b 49 50 (3) = 7 bytes → xor ecx,ecx + 5 nops
+                // Site 2: 49 8b 45 f8 (4) + 48 89 45 b0 (4) + 48 8b 40 40 (4) = 12 bytes
+                if addr == 0x100010827 {
+                    *target = 0x31; *target.add(1) = 0xC9; // xor ecx,ecx
+                    for i in 2..7 { *target.add(i) = 0x90; } // nop
+                } else {
+                    // mov rax, <good_vwt>; nop; nop
+                    *target = 0x48; *target.add(1) = 0xB8; // mov rax, imm64
+                    std::ptr::write_unaligned(target.add(2) as *mut u64, good_vwt);
+                    *target.add(10) = 0x90; *target.add(11) = 0x90; // nop nop
+                }
+                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
+                log::info!("Patched binary crash site at {:#x}", addr);
             }
         }
     }

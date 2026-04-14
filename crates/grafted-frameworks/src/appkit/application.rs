@@ -496,7 +496,8 @@ pub extern "C" fn grafted_swiftui_run_loop() {
                 if real_impl >= 0x100000000 && real_impl < 0x100200000 {
                     let notif_buf = unsafe { libc::calloc(1, 256) } as *mut u8;
                     log::info!("  calling applicationDidFinishLaunching at {:#x} (with crash recovery + temp patches)...", real_impl);
-                    // Temporarily apply binary patches, call, then restore originals.
+                    // Patch binary crash sites + apply temporary runtime patches
+                    crate::registry::patch_binary_crash_sites();
                     crate::registry::LIFECYCLE_PATCHES_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
                     crate::registry::apply_lifecycle_patches();
                     type RealImplFn = unsafe extern "C" fn(*mut u8, *mut u8);

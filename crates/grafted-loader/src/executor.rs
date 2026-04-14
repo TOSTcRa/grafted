@@ -453,8 +453,14 @@ unsafe extern "C" fn sigsegv_handler(
         fn w(b: &mut [u8], p: &mut usize, s: &[u8]) { b[*p..*p+s.len()].copy_from_slice(s); *p += s.len(); }
         fn hex(v: u64, o: &mut [u8]) { let d = b"0123456789abcdef"; let mut v=v; for i in (0..16).rev() { o[i]=d[(v&0xf)as usize]; v>>=4; } }
         fn wh(b: &mut [u8], p: &mut usize, v: u64) { hex(v, &mut b[*p..*p+16]); *p += 16; }
+        let r13 = uctx.uc_mcontext.gregs[libc::REG_R13 as usize] as u64;
+        let rsi = uctx.uc_mcontext.gregs[libc::REG_RSI as usize] as u64;
+        let rax = uctx.uc_mcontext.gregs[libc::REG_RAX as usize] as u64;
         w(&mut b, &mut p, b"  [recovery] at=0x"); wh(&mut b, &mut p, fault);
         w(&mut b, &mut p, b" rip=0x"); wh(&mut b, &mut p, rip);
+        w(&mut b, &mut p, b" r13=0x"); wh(&mut b, &mut p, r13);
+        w(&mut b, &mut p, b" rsi=0x"); wh(&mut b, &mut p, rsi);
+        w(&mut b, &mut p, b" rax=0x"); wh(&mut b, &mut p, rax);
         if has_dl && !dli.dli_fbase.is_null() {
             w(&mut b, &mut p, b" off=0x"); wh(&mut b, &mut p, rip - dli.dli_fbase as u64);
             if !dli.dli_fname.is_null() {
@@ -538,13 +544,36 @@ fn install_sigsys_handler() -> Result<(), LoaderError> {
         }
 
         // Install SIGSEGV handler for crash diagnostics
-        let mut sa2: libc::sigaction = std::mem::zeroed();
-        sa2.sa_sigaction = sigsegv_handler as *const () as usize;
-        sa2.sa_flags = libc::SA_SIGINFO;
-        libc::sigemptyset(&mut sa2.sa_mask);
-        libc::sigaction(libc::SIGSEGV, &sa2, std::ptr::null_mut());
+        install_sigsegv();
     }
     Ok(())
+}
+
+fn install_sigsegv() {
+    unsafe {
+        // Set up alternate signal stack so handler works even on stack overflow
+        static mut ALT_STACK: [u8; 65536] = [0u8; 65536];
+        let ss = libc::stack_t {
+            ss_sp: std::ptr::addr_of_mut!(ALT_STACK) as *mut _,
+            ss_flags: 0,
+            ss_size: 65536,
+        };
+        libc::sigaltstack(&ss, std::ptr::null_mut());
+
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigsegv_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Re-install our SIGSEGV handler (Swift runtime may override it).
+#[unsafe(no_mangle)]
+pub extern "C" fn grafted_reinstall_sigsegv_handler() {
+    install_sigsegv();
+    log::info!("Re-installed SIGSEGV handler after Swift runtime init");
 }
 
 // ---- Go runtime patching ----
