@@ -965,14 +965,24 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    // First try the REAL Swift runtime function if available
+    // Try the REAL Swift runtime function if available, but only for names
+    // that don't contain Mach-O symbolic references (bytes 0x01-0x1F).
+    // Symbolic refs point into Mach-O sections the Linux runtime can't resolve.
     type RealFn = unsafe extern "C" fn(*const u8, usize, *const u8, *const *const u8) -> *mut u8;
     let real_addr = REAL_GET_TYPE_FN.load(std::sync::atomic::Ordering::SeqCst);
-    if real_addr != 0 {
-        let real_fn: RealFn = unsafe { std::mem::transmute(real_addr) };
-        let real_meta = unsafe { real_fn(mangled_name, mangled_name_length, generic_env, generic_args) };
-        if !real_meta.is_null() {
-            return real_meta; // Real runtime succeeded!
+    if real_addr != 0 && !mangled_name.is_null() {
+        let len = if mangled_name_length > 0 { mangled_name_length }
+            else { let mut n = 0; while unsafe { *mangled_name.add(n) } != 0 && n < 256 { n += 1; } n };
+        let has_symbolic_ref = (0..len).any(|i| {
+            let b = unsafe { *mangled_name.add(i) };
+            b >= 0x01 && b <= 0x1F
+        });
+        if !has_symbolic_ref {
+            let real_fn: RealFn = unsafe { std::mem::transmute(real_addr) };
+            let real_meta = unsafe { real_fn(mangled_name, mangled_name_length, generic_env, generic_args) };
+            if !real_meta.is_null() {
+                return real_meta;
+            }
         }
     }
 

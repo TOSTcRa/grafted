@@ -138,6 +138,25 @@ pub fn load_swift_runtime() -> usize {
                                     symbols.insert(format!("_{}", clean), addr as u64);
                                     symbols.insert(clean.to_string(), addr as u64);
                                     shim_count += 1;
+
+                                    // Darwin↔Linux module path aliases:
+                                    // CGFloat lives in CoreGraphics on Darwin, Foundation on Linux.
+                                    // NSObject comes from ObjectiveC on Darwin, different on Linux.
+                                    // Create aliases so Darwin-mangled imports find Linux-compiled code.
+                                    let aliases: &[(&str, &str)] = &[
+                                        ("10Foundation7CGFloatV", "12CoreGraphics7CGFloatV"),
+                                        ("10Foundation7CGFloatV", "14CoreFoundation7CGFloatV"),
+                                        ("10Foundation6CGRectV", "12CoreGraphics6CGRectV"),
+                                        ("10Foundation7CGPointV", "12CoreGraphics7CGPointV"),
+                                        ("10Foundation6CGSizeV", "12CoreGraphics6CGSizeV"),
+                                    ];
+                                    for &(linux, darwin) in aliases {
+                                        if clean.contains(linux) {
+                                            let darwin_sym = clean.replace(linux, darwin);
+                                            symbols.insert(format!("_{}", darwin_sym), addr as u64);
+                                            symbols.insert(darwin_sym, addr as u64);
+                                        }
+                                    }
                                 }
                             }
                         }

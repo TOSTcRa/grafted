@@ -436,13 +436,24 @@ unsafe extern "C" fn sigsegv_handler(
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
-    // If recovery is active, longjmp back to the setjmp point
-    if RECOVERY_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-        unsafe { siglongjmp(std::ptr::addr_of_mut!(RECOVERY_BUF) as *mut u8, 1) };
-    }
-
     let info = unsafe { &*info };
     let uctx = unsafe { &*(context as *const libc::ucontext_t) };
+
+    // If recovery is active, log briefly then longjmp back
+    if RECOVERY_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        let rip = uctx.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
+        let fault_addr = unsafe { info.si_addr() } as u64;
+        fn hex(val: u64, out: &mut [u8]) { let d = b"0123456789abcdef"; let mut v = val; for i in (0..16).rev() { out[i] = d[(v & 0xf) as usize]; v >>= 4; } }
+        fn w(b: &mut [u8], p: &mut usize, s: &[u8]) { b[*p..*p+s.len()].copy_from_slice(s); *p += s.len(); }
+        fn wh(b: &mut [u8], p: &mut usize, v: u64) { hex(v, &mut b[*p..*p+16]); *p += 16; }
+        let mut buf2 = [0u8; 128];
+        let mut p2 = 0;
+        w(&mut buf2, &mut p2, b"  [recovery] at=0x"); wh(&mut buf2, &mut p2, fault_addr);
+        w(&mut buf2, &mut p2, b" rip=0x"); wh(&mut buf2, &mut p2, rip);
+        buf2[p2] = b'\n'; p2 += 1;
+        unsafe { libc::write(2, buf2.as_ptr() as *const _, p2) };
+        unsafe { siglongjmp(std::ptr::addr_of_mut!(RECOVERY_BUF) as *mut u8, 1) };
+    }
     let rip = uctx.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
     let rsp = uctx.uc_mcontext.gregs[libc::REG_RSP as usize] as u64;
     let rax = uctx.uc_mcontext.gregs[libc::REG_RAX as usize] as u64;
