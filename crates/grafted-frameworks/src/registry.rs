@@ -627,7 +627,7 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     sym!(s, "_swift_getExistentialTypeMetadata", swift_noop_ptr);
     sym!(s, "_swift_getGenericMetadata", swift_get_generic_metadata_stub);
     sym!(s, "_swift_getObjCClassMetadata", swift_noop_ptr);
-    sym!(s, "_swift_getWitnessTable", swift_noop_ptr);
+    sym!(s, "_swift_getWitnessTable", smart_getWitnessTable);
     sym!(s, "_swift_getAssociatedTypeWitness", swift_noop_ptr);
     sym!(s, "_swift_checkMetadataState", swift_check_metadata);
     sym!(s, "_swift_getFunctionTypeMetadata", swift_noop_ptr);
@@ -843,16 +843,21 @@ unsafe extern "C" fn safe_getAssociatedTypeWitness(
     MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 }
 }
 
-/// Get a valid stub witness table filled with universal metadata pointers.
+/// No-op witness function: returns its first argument (self).
+unsafe extern "C" fn witness_noop(obj: *mut u8, _wt: *mut u8) -> *mut u8 { obj }
+
+/// Get a valid stub witness table filled with no-op function pointers.
+/// Witness tables contain function pointers (protocol requirements), so entries
+/// must be callable. Each entry is a no-op that returns its first argument.
 fn get_stub_witness_table() -> *mut u8 {
     static STUB_WT: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
     let wt = STUB_WT.load(std::sync::atomic::Ordering::Acquire);
     if !wt.is_null() { return wt; }
 
-    let meta = shim_unresolved_soft_metadata();
     let p = unsafe { libc::calloc(1, 512) } as *mut u64;
-    // Fill ALL entries with valid metadata pointers (not self-referencing)
-    unsafe { for i in 0..64 { *p.add(i) = meta as u64; } }
+    let func = witness_noop as *const () as u64;
+    // Fill ALL entries with the no-op function pointer
+    unsafe { for i in 0..64 { *p.add(i) = func; } }
     let wt = p as *mut u8;
     STUB_WT.store(wt, std::sync::atomic::Ordering::Release);
     wt
@@ -1448,6 +1453,15 @@ fn resolve_real(name: &str, cache: &std::sync::atomic::AtomicU64) -> u64 {
     let a = if p.is_null() { 1 } else { p as u64 };
     cache.store(a, std::sync::atomic::Ordering::Relaxed);
     a
+}
+
+/// Smart swift_getWitnessTable: during lifecycle calls, returns a proper witness
+/// table with valid function pointers. Otherwise, pass through (for body getter).
+unsafe extern "C" fn smart_getWitnessTable(a: *mut u8, _b: *mut u8, _c: *mut u8) -> *mut u8 {
+    if LIFECYCLE_PATCHES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return get_stub_witness_table();
+    }
+    a // pass through (body getter compatibility)
 }
 
 /// Stub for swift_getWitnessTable: returns a witness table with valid metadata pointers.
