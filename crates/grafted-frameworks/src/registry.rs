@@ -107,6 +107,8 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
                 "_swift_getWitnessTable", "swift_getWitnessTable",
                 "_swift_getGenericMetadata", "swift_getGenericMetadata",
                 "_swift_getTypeByMangledNameInContext2", "swift_getTypeByMangledNameInContext2",
+                "_swift_allocateWitnessTablePack", "swift_allocateWitnessTablePack",
+                "_swift_deallocateWitnessTablePack", "swift_deallocateWitnessTablePack",
             ] {
                 if let Some(addr) = stubs_only.get(sym_name) {
                     merged.insert(sym_name.into(), *addr);
@@ -630,6 +632,8 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     sym!(s, "_swift_checkMetadataState", swift_check_metadata);
     sym!(s, "_swift_getFunctionTypeMetadata", swift_noop_ptr);
     sym!(s, "_swift_getTupleTypeMetadata", swift_noop_ptr);
+    sym!(s, "_swift_allocateWitnessTablePack", swift_noop_ptr);
+    sym!(s, "_swift_deallocateWitnessTablePack", swift_noop);
     sym!(s, "_swift_getMetatypeMetadata", swift_noop_ptr);
     sym!(s, "_swift_allocBox", swift_alloc_box);
     sym!(s, "_swift_projectBox", swift_noop_ptr);

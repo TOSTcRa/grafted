@@ -520,12 +520,20 @@ pub extern "C" fn grafted_swiftui_run_loop() {
                 log::info!("  real Swift impl at {:#x} (rel={})", real_impl, rel);
 
                 // Verify the computed address is in the binary range
-                // The real impl needs the full Swift generic type system:
-                // swift_allocateWitnessTablePack crashes because our stub
-                // metadata lacks protocol conformance records for generic
-                // SwiftUI view construction. Skipping lifecycle until
-                // witness table packs are implemented.
-                log::info!("  applicationDidFinishLaunching: real impl at {:#x} (needs witness table pack support)", real_impl);
+                if real_impl >= 0x100000000 && real_impl < 0x100200000 {
+                    let notif_buf = unsafe { libc::calloc(1, 256) } as *mut u8;
+                    log::info!("  calling applicationDidFinishLaunching at {:#x} (with crash recovery)...", real_impl);
+                    type RealImplFn = unsafe extern "C" fn(*mut u8, *mut u8);
+                    let f: RealImplFn = unsafe { std::mem::transmute(real_impl) };
+                    unsafe extern "C" { fn grafted_try_call(f: unsafe extern "C" fn(*mut u8, *mut u8), a: *mut u8, b: *mut u8) -> bool; }
+                    let ok = unsafe { grafted_try_call(f, app_del, notif_buf) };
+                    unsafe { libc::free(notif_buf as *mut libc::c_void) };
+                    if ok {
+                        log::info!("applicationDidFinishLaunching: completed!");
+                    } else {
+                        log::warn!("applicationDidFinishLaunching: crashed (recovered via longjmp)");
+                    }
+                }
             } else {
                 // Not a trampoline — call through ObjC dispatch as fallback
                 log::info!("  not a trampoline (bytes: {:02x} {:02x} {:02x}), calling via ObjC", byte4, byte5, byte6);

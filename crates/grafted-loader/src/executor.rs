@@ -403,11 +403,44 @@ fn enable_sud() -> Result<(), LoaderError> {
     Ok(())
 }
 
+// Recovery point for graceful SIGSEGV handling during lifecycle calls.
+static mut RECOVERY_BUF: [u8; 256] = [0u8; 256]; // sigjmp_buf
+static RECOVERY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "C" {
+    fn __sigsetjmp(buf: *mut u8, save_sigs: libc::c_int) -> libc::c_int;
+    fn siglongjmp(buf: *mut u8, val: libc::c_int) -> !;
+}
+
+/// Try to call a function, recovering from SIGSEGV if it crashes.
+/// Returns true if the call succeeded, false if it crashed.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafted_try_call(func: unsafe extern "C" fn(*mut u8, *mut u8), a: *mut u8, b: *mut u8) -> bool {
+    unsafe {
+        RECOVERY_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ret = __sigsetjmp(std::ptr::addr_of_mut!(RECOVERY_BUF) as *mut u8, 1);
+        if ret == 0 {
+            func(a, b);
+            RECOVERY_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+            true
+        } else {
+            // Recovered from SIGSEGV
+            RECOVERY_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
+}
+
 unsafe extern "C" fn sigsegv_handler(
     _sig: libc::c_int,
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
+    // If recovery is active, longjmp back to the setjmp point
+    if RECOVERY_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        unsafe { siglongjmp(std::ptr::addr_of_mut!(RECOVERY_BUF) as *mut u8, 1) };
+    }
+
     let info = unsafe { &*info };
     let uctx = unsafe { &*(context as *const libc::ucontext_t) };
     let rip = uctx.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
