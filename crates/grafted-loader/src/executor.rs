@@ -566,6 +566,7 @@ fn install_sigsegv() {
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGABRT, &sa, std::ptr::null_mut());
     }
 }
 

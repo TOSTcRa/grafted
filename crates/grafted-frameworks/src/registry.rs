@@ -810,7 +810,21 @@ unsafe extern "C" fn swift_deleted_method() {
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
     unsafe { libc::_exit(1) };
 }
-unsafe extern "C" fn swift_check_metadata(_req: usize, metadata: *mut u8) -> *mut u8 { metadata }
+unsafe extern "C" fn swift_check_metadata(metadata: *mut u8, _request: usize) -> MetadataResponse {
+    // During lifecycle: ALWAYS return our stub metadata (with valid VWT, size=8).
+    // The binary reads VWT.size after this call and does `subq %rax,%rsp`.
+    // If VWT.size is garbage (0x211 or a pointer), it blows the stack.
+    if LIFECYCLE_PATCHES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 };
+    }
+    // Outside lifecycle: return the input metadata with Complete state.
+    let addr = metadata as usize;
+    if addr <= 0x1000 || addr >= 0x800000000000 {
+        MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 }
+    } else {
+        MetadataResponse { metadata, state: 0 }
+    }
+}
 
 /// MetadataResponse: returned in (rax=metadata, rdx=state) on x86_64
 #[repr(C)]
@@ -1022,47 +1036,26 @@ pub static LIFECYCLE_PATCHES_ACTIVE: std::sync::atomic::AtomicBool =
 /// for stub metadata. Otherwise calls the real implementation via trampoline.
 unsafe extern "C" fn smart_checkMetadataState(metadata: *mut u8, request: usize) -> MetadataResponse {
     let addr = metadata as usize;
-    // Guard: only access metadata if it's a valid pointer (above 4KB, below 128TB)
-    if addr > 0x1000 && addr < 0x800000000000 {
-      if LIFECYCLE_PATCHES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        let kind = *(metadata as *const u64);
-        if kind == 1 { return MetadataResponse { metadata, state: 0 }; }
-        if kind == 0x200 {
-            let desc_ptr = *((metadata as *const u64).add(1));
-            if desc_ptr != 0 {
-                let desc = desc_ptr as *const u32;
-                if *desc == 0 && *desc.add(1) == 0 && *desc.add(2) == 0 {
-                    return MetadataResponse { metadata, state: 0 };
-                }
-            }
+
+    // During lifecycle: ALWAYS return Complete. Never call the real function —
+    // it triggers recursive metadata resolution that stack-overflows.
+    if LIFECYCLE_PATCHES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        if addr <= 0x1000 || addr >= 0x800000000000 {
+            return MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 };
         }
-      }
+        return MetadataResponse { metadata, state: 0 };
     }
 
-    // For invalid pointers: return our stub metadata (NOT the garbage input!)
+    // Outside lifecycle: for invalid pointers return stub, otherwise call real
     if addr <= 0x1000 || addr >= 0x800000000000 {
         return MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 };
     }
 
-    // Call the real implementation via trampoline
     let trampoline = REAL_CHECK_METADATA.load(std::sync::atomic::Ordering::Acquire);
     if trampoline != 0 {
         type RealFn = unsafe extern "C" fn(*mut u8, usize) -> MetadataResponse;
         let f: RealFn = std::mem::transmute(trampoline);
-        let resp = f(metadata, request);
-        // After the real function processes metadata, the VWT at [-1] may have been
-        // overwritten by swift_initStructMetadata with a garbage computed value.
-        // Validate and fix it before returning.
-        if !resp.metadata.is_null() && (resp.metadata as usize) > 0x1000 {
-            let vwt = *((resp.metadata as *const u64).sub(1));
-            if vwt < 0x1000 || vwt >= 0x800000000000 {
-                // VWT is garbage — replace with our universal VWT
-                let stub = shim_unresolved_soft_metadata();
-                let good_vwt = *((stub as *const u64).sub(1));
-                *((resp.metadata as *mut u64).sub(1)) = good_vwt;
-            }
-        }
-        return resp;
+        return f(metadata, request);
     }
     MetadataResponse { metadata, state: 0 }
 }
@@ -1364,6 +1357,7 @@ struct PatchSite {
     addr: *mut u8,
     original: [u8; 32],
     size: usize,
+    replacement: *const u8,
 }
 unsafe impl Send for PatchSite {}
 unsafe impl Sync for PatchSite {}
@@ -1385,28 +1379,30 @@ fn save_original_bytes() {
         ("swift_getSingletonMetadata", 12, swift_get_generic_metadata_stub as *const u8),
         ("swift_initStructMetadata", 12, safe_noop_return as *const u8),
         ("swift_initStructMetadataWithLayoutString", 12, safe_noop_return as *const u8),
+        ("swift_allocateGenericValueMetadata", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_allocateGenericClassMetadata", 12, swift_get_generic_metadata_stub as *const u8),
     ];
 
     let mut sites = PATCH_SITES.lock().unwrap();
-    for &(name, size, _replacement) in funcs {
+    for &(name, size, replacement) in funcs {
         let c_name = std::ffi::CString::new(name).unwrap();
         let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
         if addr.is_null() { continue; }
         let mut original = [0u8; 32];
         unsafe { std::ptr::copy_nonoverlapping(addr, original.as_mut_ptr(), size); }
-        sites.push(PatchSite { addr, original, size });
+        sites.push(PatchSite { addr, original, size, replacement: replacement as *const u8 });
         log::info!("Saved {} bytes from {} at {:p}", size, name, addr);
     }
 
     // Also save the Slow variants (+0x30 from the fast function)
-    for &(name, _size, _replacement) in &funcs[1..3] { // getAssociatedType/Conformance
+    for &(name, _size, replacement) in &funcs[1..3] { // getAssociatedType/Conformance
         let c_name = std::ffi::CString::new(name).unwrap();
         let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
         if addr.is_null() { continue; }
         let slow = unsafe { addr.add(0x30) };
         let mut original = [0u8; 32];
         unsafe { std::ptr::copy_nonoverlapping(slow, original.as_mut_ptr(), 12); }
-        sites.push(PatchSite { addr: slow, original, size: 12 });
+        sites.push(PatchSite { addr: slow, original, size: 12, replacement: replacement as *const u8 });
     }
 
     // Also build trampolines for the smart functions that need to call originals
@@ -1470,22 +1466,8 @@ pub fn patch_binary_crash_sites() {
 /// Apply binary patches temporarily (before applicationDidFinishLaunching).
 pub fn apply_lifecycle_patches() {
     let sites = PATCH_SITES.lock().unwrap();
-    let replacements: &[*const u8] = &[
-        smart_checkMetadataState as *const u8,
-        safe_getAssociatedTypeWitness as *const u8,
-        safe_getAssociatedConformanceWitness as *const u8,
-        safe_getAssociatedTypeWitness as *const u8,  // Relative
-        safe_getAssociatedConformanceWitness as *const u8,  // Relative
-        safe_conformsToProtocol as *const u8,         // conformsToProtocol
-        safe_conformsToProtocol as *const u8,         // conformsToProtocol2
-        safe_conformsToProtocol as *const u8,         // conformsToProtocolCommon
-        safe_getAssociatedTypeWitness as *const u8,  // Slow
-        safe_getAssociatedConformanceWitness as *const u8,  // Slow
-    ];
-    for (i, site) in sites.iter().enumerate() {
-        if i < replacements.len() {
-            unsafe { patch_function_at(site.addr, replacements[i]); }
-        }
+    for site in sites.iter() {
+        unsafe { patch_function_at(site.addr, site.replacement); }
     }
     log::info!("Applied {} lifecycle patches", sites.len());
 }
