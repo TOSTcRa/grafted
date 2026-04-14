@@ -882,6 +882,20 @@ fn get_stub_witness_table() -> *mut u8 {
 
 /// No-op function for patching init functions that corrupt our stub metadata.
 unsafe extern "C" fn safe_noop_return() {}
+/// Return a stub heap object (for swift_getKeyPath etc.)
+unsafe extern "C" fn safe_return_stub_object(_a: *mut u8, _b: *mut u8) -> *mut u8 {
+    shim_unresolved_soft_metadata()
+}
+/// Return null pointer
+unsafe extern "C" fn safe_return_null(_a: *mut u8, _b: *mut u8) -> *mut u8 {
+    std::ptr::null_mut()
+}
+/// Return false (0)
+unsafe extern "C" fn safe_return_false(_a: *mut u8, _b: *mut u8) -> i32 { 0 }
+/// Return stub metadata
+unsafe extern "C" fn safe_return_stub_metadata(_a: *mut u8, _b: usize, _c: *mut u8, _d: *mut u8) -> *mut u8 {
+    shim_unresolved_soft_metadata()
+}
 
 /// Safe swift_conformsToProtocol: always returns NULL (no conformance found).
 unsafe extern "C" fn safe_conformsToProtocol(
@@ -1381,6 +1395,29 @@ fn save_original_bytes() {
         ("swift_initStructMetadataWithLayoutString", 12, safe_noop_return as *const u8),
         ("swift_allocateGenericValueMetadata", 12, swift_get_generic_metadata_stub as *const u8),
         ("swift_allocateGenericClassMetadata", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_getKeyPath", 12, safe_return_stub_object as *const u8),
+        ("swift_getOpaqueTypeMetadata", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_getOpaqueTypeMetadata2", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_getFunctionTypeMetadata", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_getTupleTypeMetadata", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_getTupleTypeMetadata2", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_getTupleTypeMetadata3", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_getExistentialTypeMetadata", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_getObjCClassMetadata", 12, swift_get_generic_metadata_stub as *const u8),
+        ("swift_dynamicCast", 12, safe_return_false as *const u8),
+        ("swift_dynamicCastClass", 12, safe_return_null as *const u8),
+        ("swift_dynamicCastMetatype", 12, safe_return_null as *const u8),
+        ("swift_dynamicCastObjCClass", 12, safe_return_null as *const u8),
+        ("swift_dynamicCastUnknownClass", 12, safe_return_null as *const u8),
+        ("swift_getTypeByMangledNameInContext", 12, safe_return_stub_metadata as *const u8),
+        ("swift_getTypeByMangledNameInContext2", 12, safe_return_stub_metadata as *const u8),
+        ("swift_getTypeByMangledNameInContextInMetadataState", 12, safe_return_stub_metadata as *const u8),
+        // Prevent Swift fatalError from aborting during lifecycle
+        ("swift_reportError", 12, safe_noop_return as *const u8),
+        ("_swift_runtime_on_report", 12, safe_noop_return as *const u8),
+        ("_swift_stdlib_reportFatalError", 12, safe_noop_return as *const u8),
+        ("_swift_stdlib_reportFatalErrorInFile", 12, safe_noop_return as *const u8),
+        ("swift_unexpectedError", 12, safe_noop_return as *const u8),
     ];
 
     let mut sites = PATCH_SITES.lock().unwrap();
@@ -1468,6 +1505,12 @@ pub fn apply_lifecycle_patches() {
     let sites = PATCH_SITES.lock().unwrap();
     for site in sites.iter() {
         unsafe { patch_function_at(site.addr, site.replacement); }
+        // Verify the patch was written
+        let b0 = unsafe { std::ptr::read_volatile(site.addr) };
+        let b1 = unsafe { std::ptr::read_volatile(site.addr.add(1)) };
+        if b0 != 0x48 || b1 != 0xB8 {
+            log::warn!("Patch at {:p} NOT applied! bytes: {:02x} {:02x}", site.addr, b0, b1);
+        }
     }
     log::info!("Applied {} lifecycle patches", sites.len());
 }

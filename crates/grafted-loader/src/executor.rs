@@ -292,6 +292,16 @@ unsafe fn process_syscall(
         }
         DarwinSyscall::Unknown { raw } => {
             if raw < 500 {
+                // Intercept tgkill(pid, tid, SIGABRT=6) during lifecycle —
+                // Swift's fatalError calls abort() which does tgkill. Skip it
+                // so the lifecycle function can continue past assertions.
+                if raw == 234 && args[2] == 6 { // SYS_tgkill, sig=SIGABRT
+                    if RECOVERY_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                        log::warn!("Intercepted abort() during lifecycle — skipping tgkill(SIGABRT)");
+                        return 0; // pretend success
+                    }
+                }
+
                 // Allow raw Linux syscalls to pass through unmodified.
                 // This is crucial for our Linux libc shims to work.
                 let ret: i64;
@@ -442,7 +452,7 @@ unsafe extern "C" fn sigsegv_handler(
     let info = unsafe { &*info };
     let uctx = unsafe { &*(context as *const libc::ucontext_t) };
 
-    // If recovery is active, log and longjmp back.
+    // If recovery is active, longjmp back cleanly.
     if RECOVERY_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
         let rip = uctx.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
         let fault = unsafe { info.si_addr() } as u64;
