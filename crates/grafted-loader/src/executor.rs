@@ -404,7 +404,10 @@ fn enable_sud() -> Result<(), LoaderError> {
 }
 
 // Recovery point for graceful SIGSEGV handling during lifecycle calls.
-static mut RECOVERY_BUF: [u8; 256] = [0u8; 256]; // sigjmp_buf
+// sigjmp_buf on Linux x86_64 is ~200 bytes and requires 8-byte alignment.
+#[repr(C, align(16))]
+struct SigJmpBuf([u8; 256]);
+static mut RECOVERY_BUF: SigJmpBuf = SigJmpBuf([0u8; 256]);
 static RECOVERY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 unsafe extern "C" {
@@ -418,7 +421,7 @@ unsafe extern "C" {
 pub extern "C" fn grafted_try_call(func: unsafe extern "C" fn(*mut u8, *mut u8), a: *mut u8, b: *mut u8) -> bool {
     unsafe {
         RECOVERY_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-        let ret = __sigsetjmp(std::ptr::addr_of_mut!(RECOVERY_BUF) as *mut u8, 1);
+        let ret = __sigsetjmp(std::ptr::addr_of_mut!(RECOVERY_BUF.0) as *mut u8, 1);
         if ret == 0 {
             func(a, b);
             RECOVERY_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -452,7 +455,7 @@ unsafe extern "C" fn sigsegv_handler(
         w(&mut buf2, &mut p2, b" rip=0x"); wh(&mut buf2, &mut p2, rip);
         buf2[p2] = b'\n'; p2 += 1;
         unsafe { libc::write(2, buf2.as_ptr() as *const _, p2) };
-        unsafe { siglongjmp(std::ptr::addr_of_mut!(RECOVERY_BUF) as *mut u8, 1) };
+        unsafe { siglongjmp(std::ptr::addr_of_mut!(RECOVERY_BUF.0) as *mut u8, 1) };
     }
     let rip = uctx.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
     let rsp = uctx.uc_mcontext.gregs[libc::REG_RSP as usize] as u64;
