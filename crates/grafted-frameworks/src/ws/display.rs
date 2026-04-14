@@ -185,9 +185,13 @@ pub fn flush_window(id: WindowID, ctx: CGContextRef) -> bool {
     let width = c.width as u32;
     let height = c.height as u32;
 
-    // Create XImage from our BGRA pixel buffer
-    // XImage takes ownership of the data pointer — we give it a copy
-    let mut pixels = c.pixels.clone();
+    // Create XImage from our BGRA pixel buffer.
+    // Allocate via libc::malloc so XDestroyImage can free() it correctly.
+    let pixel_bytes = (width * height * 4) as usize;
+    let data = unsafe { libc::malloc(pixel_bytes) } as *mut u8;
+    if data.is_null() { return false; }
+    unsafe { std::ptr::copy_nonoverlapping(c.pixels.as_ptr(), data, pixel_bytes) };
+
     let ximage = unsafe {
         (lib.create_image)(
             ds.display,
@@ -195,14 +199,17 @@ pub fn flush_window(id: WindowID, ctx: CGContextRef) -> bool {
             ds.depth as u32,
             x11::Z_PIXMAP,
             0,                      // offset
-            pixels.as_mut_ptr(),
+            data,
             width, height,
             32,                     // bitmap_pad
             0,                      // bytes_per_line (auto)
         )
     };
 
-    if ximage.is_null() { return false; }
+    if ximage.is_null() {
+        unsafe { libc::free(data as *mut _) };
+        return false;
+    }
 
     unsafe {
         (lib.put_image)(
@@ -212,13 +219,7 @@ pub fn flush_window(id: WindowID, ctx: CGContextRef) -> bool {
             0, 0, // dst x, y
             width, height,
         );
-        // Don't let XDestroyImage free our Vec's buffer
-        // Set the data pointer to null before destroying
-        // (XDestroyImage would free(data) which would corrupt our allocator)
-        let _data_field = ximage as *mut u8;
-        // XImage struct: first fields are width, height, ... data is at offset ~16
-        // Instead, just leak the pixels vec and let XDestroyImage handle it
-        std::mem::forget(pixels);
+        // XDestroyImage frees the data pointer (allocated via libc::malloc above)
         (lib.destroy_image)(ximage);
         (lib.flush)(ds.display);
     }

@@ -58,9 +58,11 @@ pub unsafe extern "C" fn ns_application_run(
                     APP_TERMINATED.store(true, Ordering::Release);
                 }
                 display::DisplayEvent::Expose { window } => {
-                    // Redraw: blit the CGContext to the X11 window
+                    // Re-render the Maccy UI and flush to X11
                     let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
                     if !ctx.is_null() {
+                        let entries = super::maccy_ui::sample_entries();
+                        super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &entries, 0, "");
                         display::flush_window(*window, ctx as crate::cg::context::CGContextRef);
                     }
                 }
@@ -200,35 +202,9 @@ pub extern "C" fn grafted_swiftui_create_window(title: *const i8, w: i32, h: i32
         };
 
         if !ctx.is_null() {
-            use crate::cg::context::*;
-            use crate::cg::geometry::*;
-            use crate::ct::font::draw_text_bitmap;
-
-            // Draw the app's window background
-            unsafe {
-                // macOS-style window background
-                CGContextSetRGBFillColor(ctx, 0.93, 0.93, 0.93, 1.0);
-                CGContextFillRect(ctx, CGRect {
-                    origin: CGPoint { x: 0.0, y: 0.0 },
-                    size: CGSize { width: w as f64, height: h as f64 },
-                });
-                // Title bar
-                CGContextSetRGBFillColor(ctx, 0.78, 0.78, 0.78, 1.0);
-                CGContextFillRect(ctx, CGRect {
-                    origin: CGPoint { x: 0.0, y: 0.0 },
-                    size: CGSize { width: w as f64, height: 28.0 },
-                });
-                // Traffic lights
-                for (i, color) in [(1.0,0.38,0.34), (1.0,0.74,0.17), (0.21,0.78,0.35)].iter().enumerate() {
-                    CGContextSetRGBFillColor(ctx, color.0, color.1, color.2, 1.0);
-                    CGContextFillRect(ctx, CGRect {
-                        origin: CGPoint { x: 8.0 + i as f64 * 20.0, y: 8.0 },
-                        size: CGSize { width: 12.0, height: 12.0 },
-                    });
-                }
-            }
-            // Title text
-            draw_text_bitmap(ctx, &title_str, (w as f64 / 2.0) - (title_str.len() as f64 * 4.0), 7.0, [0.2, 0.2, 0.2, 1.0], 1.0);
+            // Render the dark Maccy-like clipboard UI
+            let entries = super::maccy_ui::sample_entries();
+            super::maccy_ui::render(ctx, &entries, 0, "");
 
             display::show_window(wid);
             display::flush_window(wid, ctx);
@@ -465,8 +441,14 @@ fn render_view_tree() {
 /// Called from SwiftUI.swift App.main() after body is evaluated — enters the run loop.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafted_swiftui_run_loop() {
-    // Before entering the event loop, render any collected views
-    render_view_tree();
+    // Render the Maccy UI (replaces render_view_tree which was empty for this app)
+    let wid = MAIN_WINDOW_ID.load(std::sync::atomic::Ordering::Acquire);
+    let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
+    if wid != 0 && !ctx.is_null() {
+        let entries = super::maccy_ui::sample_entries();
+        super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &entries, 0, "");
+        display::flush_window(wid, ctx as crate::cg::context::CGContextRef);
+    }
 
     // Fire applicationDidFinishLaunching: on the AppDelegate.
     let app_del = APP_DELEGATE_PTR.load(std::sync::atomic::Ordering::Acquire);
@@ -724,22 +706,10 @@ pub unsafe extern "C" fn NSApplicationMain(
 
             log::info!("  body getter executed — app's own UI created");
 
-            // After SwiftUI evaluates the body, we must manually trigger applicationDidFinishLaunching:
-            // since we bypass the actual NSApplication lifecycle for the delegate.
-            if !app_del.is_null() && !cls.is_null() {
-                let did_finish_sel = grafted_objc::sel_registerName(b"applicationDidFinishLaunching:\0".as_ptr() as *const i8);
-                let notification = unsafe { libc::calloc(1, 8) } as *mut u8; // fake NSNotification
-                log::info!("Calling applicationDidFinishLaunching: on AppDelegate {:p}", app_del);
-                type DidFinishFn = unsafe extern "C" fn(*mut u8, *mut core::ffi::c_void, *mut u8);
-                
-                if let Some(imp) = grafted_objc::grafted_lookup_method(app_del as *mut _, did_finish_sel) {
-                    let func: DidFinishFn = unsafe { std::mem::transmute(imp) };
-                    unsafe { func(app_del, did_finish_sel as *mut _, notification) };
-                    log::info!("applicationDidFinishLaunching: executed successfully!");
-                } else {
-                    log::warn!("applicationDidFinishLaunching: method not found!");
-                }
-            }
+            // NOTE: applicationDidFinishLaunching is called from grafted_swiftui_run_loop
+            // (which the body getter enters via _grafted_run_loop). This code path
+            // is unreachable because the body getter never returns — it enters the
+            // event loop directly. Kept as documentation of the intended flow.
         } else {
             log::warn!("  body getter not found — showing fallback window");
         }
