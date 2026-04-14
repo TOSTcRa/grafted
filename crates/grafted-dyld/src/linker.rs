@@ -320,8 +320,12 @@ impl Linker {
                 }
             }
         }
-        // ObjC class_data fixup handled by swift_metadata_translate.rs.
-        // register_objc_metadata hangs on Maccy's complex method lists.
+        // Register ObjC classes from the main binary (names only, skip method parsing).
+        // This runs BEFORE translate_swift_metadata so class_data_bits at +32 is still valid.
+        // Method dispatch for main binary classes is handled by grafted_lookup_method.
+        if let Err(e) = self.register_objc_class_names(main_binary) {
+            log::debug!("ObjC class names for main binary: {}", e);
+        }
 
         // In Darwin, initializers are called in bottom-up order (dependencies first).
         // Skip slid libraries for now (init funcs also use pre-slide addresses).
@@ -360,18 +364,19 @@ impl Linker {
                                 );
                                 log::info!("    reading data_ptr from {:p}", data_field_ptr);
                                 
-                                let data_ptr = std::ptr::read_unaligned(data_field_ptr as *const *mut grafted_objc::types::class_ro_t);
-                                if data_ptr.is_null() { 
+                                let raw_data_ptr = std::ptr::read_unaligned(data_field_ptr as *const usize);
+                                // Strip ObjC tag bits from class_data_bits (low 3 bits are flags)
+                                let data_ptr = (raw_data_ptr & !7) as *mut grafted_objc::types::class_ro_t;
+                                if data_ptr.is_null() {
                                     log::info!("    data_ptr is NULL, skipping");
-                                    continue; 
+                                    continue;
                                 }
 
-                                log::info!("    data_ptr={:p}", data_ptr);
+                                log::info!("    data_ptr={:p} (raw={:#x})", data_ptr, raw_data_ptr);
 
-                                let name_field_ptr = (data_ptr as *const u8).add(
-                                    std::mem::offset_of!(grafted_objc::types::class_ro_t, name)
-                                );
-                                let class_name_ptr = std::ptr::read_unaligned(name_field_ptr as *const *const i8);
+                                // class_ro_t layout: flags(4) + instanceStart(4) + instanceSize(4) +
+                                // reserved(4) + ivarLayout(8) + name(8) → name is at +24
+                                let class_name_ptr = std::ptr::read_unaligned((data_ptr as *const u8).add(24) as *const *const i8);
                                 
                                 let class_name = if !class_name_ptr.is_null() {
                                     log::info!("    class_name_ptr={:p}", class_name_ptr);
@@ -382,8 +387,9 @@ impl Linker {
 
                                 log::info!("    detected Objective-C class: {}", class_name);
 
-                                let raw_method_list_ptr = (*data_ptr).base_methods;
-                                
+                                // class_ro_t: baseMethods at +32
+                                let raw_method_list_ptr = std::ptr::read_unaligned((data_ptr as *const u8).add(32) as *const *mut grafted_objc::types::method_list_t);
+
                                 // Modern ObjC tags the method_list_ptr in the lower bits
                                 let method_list_ptr = ((raw_method_list_ptr as usize) & !3) as *mut grafted_objc::types::method_list_t;
                                 
@@ -394,8 +400,10 @@ impl Linker {
                                     let is_relative = (flags & 0x80000000) != 0;
                                     let entsize = flags & 0xFFFF;
                                     
-                                    if method_count > 1000 {
-                                        log::warn!("  skipping massive method list ({} methods) in {}", method_count, class_name);
+                                    if method_count > 500 || entsize == 0 || entsize > 64 {
+                                        log::warn!("  skipping class {} (methods={}, entsize={})", class_name, method_count, entsize);
+                                        // Still register the class (without methods) so objc_getClass works
+                                        grafted_objc::objc_registerClassPair(cls_ptr as *mut _ as grafted_objc::types::Class);
                                         continue;
                                     }
 
@@ -437,6 +445,98 @@ impl Linker {
                                 }
 
                                 grafted_objc::objc_registerClassPair(cls_ptr as *mut _ as grafted_objc::types::Class);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Lightweight ObjC class registration: register class names only, skip method parsing.
+    /// This is used for the main binary where full method list parsing can hang.
+    fn register_objc_class_names(&self, binary: &MachOBinary) -> Result<(), LinkError> {
+        let macho = MachO::parse(&binary.data, 0)
+            .map_err(|e| LinkError::Parse(e.to_string()))?;
+
+        for segment in &macho.segments {
+            for section_res in segment {
+                if let Ok((section, _data)) = section_res {
+                    let sect_name = section.name().unwrap_or("");
+                    if sect_name == "__objc_classlist" {
+                        let count = section.size / 8;
+                        let ptrs = (section.addr + binary.slide) as *const *mut grafted_objc::types::class_t;
+                        log::info!("grafted-dyld: registering {} class names from main binary", count);
+
+                        for i in 0..count {
+                            let cls_ptr = unsafe { std::ptr::read_unaligned(ptrs.add(i as usize)) };
+                            if cls_ptr.is_null() { continue; }
+
+                            unsafe {
+                                // Read class_data_bits at +32, strip tag bits
+                                let raw_bits = std::ptr::read_unaligned((cls_ptr as *const u8).add(32) as *const usize);
+                                let data_ptr = (raw_bits & !7) as *const u8;
+                                if data_ptr.is_null() { continue; }
+
+                                // class_ro_t name at +24
+                                let name_ptr = std::ptr::read_unaligned(data_ptr.add(24) as *const *const i8);
+                                if name_ptr.is_null() { continue; }
+
+                                let class_name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy();
+
+                                // Register the class name first
+                                grafted_objc::objc_registerClassPair(cls_ptr as *mut _ as grafted_objc::types::Class);
+
+                                // Now register methods from class_ro_t baseMethods at +32
+                                let method_list_raw = std::ptr::read_unaligned(data_ptr.add(32) as *const usize);
+                                let method_list_ptr = (method_list_raw & !3) as *const u8;
+                                let mut method_count_registered = 0u32;
+
+                                if !method_list_ptr.is_null() && (method_list_ptr as usize) > 0x10000 {
+                                    let flags = std::ptr::read_unaligned(method_list_ptr as *const u32);
+                                    let m_count = std::ptr::read_unaligned(method_list_ptr.add(4) as *const u32);
+                                    let is_relative = (flags & 0x80000000) != 0;
+                                    let entsize = flags & 0xFFFF;
+
+                                    if m_count <= 200 && entsize > 0 && entsize <= 64 {
+                                        let first_method = method_list_ptr.add(8);
+                                        for m in 0..m_count {
+                                            let method_base = first_method.add((m * entsize) as usize);
+
+                                            if is_relative {
+                                                let name_offset = std::ptr::read_unaligned(method_base as *const i32);
+                                                let imp_offset = std::ptr::read_unaligned(method_base.add(8) as *const i32);
+
+                                                let name_ptr = (method_base as *const i8).offset(name_offset as isize);
+                                                let imp_addr = (method_base.add(8) as *const i8).offset(imp_offset as isize);
+
+                                                let sel = grafted_objc::sel_registerName(name_ptr);
+                                                grafted_objc::class_addMethod(
+                                                    cls_ptr as *mut _ as grafted_objc::types::Class,
+                                                    sel,
+                                                    Some(std::mem::transmute(imp_addr)),
+                                                    std::ptr::null(),
+                                                );
+                                                method_count_registered += 1;
+                                            } else {
+                                                let name_ptr = std::ptr::read_unaligned(method_base as *const *const i8);
+                                                let imp_ptr = std::ptr::read_unaligned(method_base.add(16) as *const *const ());
+
+                                                let sel = grafted_objc::sel_registerName(name_ptr);
+                                                grafted_objc::class_addMethod(
+                                                    cls_ptr as *mut _ as grafted_objc::types::Class,
+                                                    sel,
+                                                    Some(std::mem::transmute(imp_ptr)),
+                                                    std::ptr::null(),
+                                                );
+                                                method_count_registered += 1;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                log::info!("  registered ObjC class: {} ({} methods)", class_name, method_count_registered);
                             }
                         }
                     }
@@ -506,6 +606,18 @@ impl Linker {
             let cls = auto_create_objc_class(class_name);
             if !cls.is_null() {
                 return Ok(cls as u64);
+            }
+        }
+
+        // Try dlsym as last resort — Swift runtime libraries are loaded with RTLD_GLOBAL,
+        // so Foundation/Observation/etc. symbols are in the global symbol table.
+        if symbol.starts_with("_$s") || symbol.starts_with("$s") || symbol.starts_with("_swift_") {
+            let clean = symbol.strip_prefix('_').unwrap_or(symbol);
+            let c_name = std::ffi::CString::new(clean).unwrap();
+            let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
+            if !addr.is_null() {
+                log::debug!("dlsym fallback resolved: {symbol} → {:#x}", addr as u64);
+                return Ok(addr as u64);
             }
         }
 
@@ -579,9 +691,11 @@ fn auto_create_objc_class(name: &str) -> grafted_objc::types::Class {
     let c_name = std::ffi::CString::new(name).unwrap_or_default();
     let existing = grafted_objc::objc_getClass(c_name.as_ptr());
     if !existing.is_null() {
+        log::debug!("auto_create_objc_class: reusing registered class {} → {:p}", name, existing);
         map.insert(name.to_string(), existing);
         return existing;
     }
+    log::debug!("auto_create_objc_class: creating stub for {}", name);
 
     // Allocate a new stub class
     let cls = unsafe { libc::calloc(1, 256) } as grafted_objc::types::Class;

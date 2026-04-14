@@ -16,6 +16,7 @@ pub fn register_all() {
         register_nsprocessinfo();
         register_nsfilemanager();
         register_nsuserdefaults();
+        register_nsnotification();
         log::info!("Foundation: registered classes with ObjC runtime");
     });
 }
@@ -136,6 +137,26 @@ fn register_nsfilemanager() {
     }
 
     reg(cls, "defaultManager\0", default_manager as *const ());
+}
+
+fn register_nsnotification() {
+    let cls = alloc_class("NSNotification", 64);
+
+    unsafe extern "C" fn notification_name(self_: *mut u8, _sel: *mut u8) -> *mut u8 {
+        if self_.is_null() { return std::ptr::null_mut(); }
+        unsafe { *(self_.add(16) as *const *mut u8) }
+    }
+    unsafe extern "C" fn notification_object(self_: *mut u8, _sel: *mut u8) -> *mut u8 {
+        if self_.is_null() { return std::ptr::null_mut(); }
+        unsafe { *(self_.add(24) as *const *mut u8) }
+    }
+    unsafe extern "C" fn notification_user_info(_self: *mut u8, _sel: *mut u8) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+
+    reg(cls, "name\0", notification_name as *const ());
+    reg(cls, "object\0", notification_object as *const ());
+    reg(cls, "userInfo\0", notification_user_info as *const ());
 }
 
 fn register_nsuserdefaults() {

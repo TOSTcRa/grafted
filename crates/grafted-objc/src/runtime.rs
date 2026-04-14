@@ -27,9 +27,12 @@ pub extern "C" fn objc_registerClassPair(cls: Class) {
     if cls.is_null() { return; }
     unsafe {
         let class_t_ptr = cls as *mut class_t;
-        let data_ptr = (*class_t_ptr).data;
+        // Strip ObjC tag bits (low 3 bits) from class_data_bits pointer.
+        // Our malloc'd classes have low bits = 0, so this is safe for all cases.
+        let raw_data = (*class_t_ptr).data as usize;
+        let data_ptr = (raw_data & !7) as *mut crate::types::class_ro_t;
         if data_ptr.is_null() { return; }
-        
+
         let name_ptr = (*data_ptr).name;
         if !name_ptr.is_null() {
             let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
@@ -58,7 +61,10 @@ pub extern "C" fn sel_registerName(name: *const std::ffi::c_char) -> SEL {
         return sel as SEL;
     }
     
-    let b = name_str.into_bytes().into_boxed_slice();
+    // Store with null terminator so CStr::from_ptr works in grafted_lookup_method
+    let mut bytes = name_str.into_bytes();
+    bytes.push(0);
+    let b = bytes.into_boxed_slice();
     let ptr = Box::into_raw(b) as *const u8 as SEL;
     reg.insert(unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned(), ptr as usize);
     ptr
@@ -69,15 +75,9 @@ pub extern "C" fn sel_registerName(name: *const std::ffi::c_char) -> SEL {
 extern "C" fn grafted_alloc(cls: id, _cmd: SEL) -> id {
     if cls.is_null() { return std::ptr::null_mut(); }
     unsafe {
-        let class_t_ptr = cls as *mut class_t;
-        let data_ptr = (*class_t_ptr).data;
-        let size = if !data_ptr.is_null() {
-            (*data_ptr).instance_size as usize
-        } else {
-            8 // minimal size
-        };
-        
-        let ptr = libc::calloc(1, size) as id;
+        // Use a generous fixed allocation. Reading instance_size from class metadata
+        // is unreliable because translate_swift_metadata shifts the Darwin layout.
+        let ptr = libc::calloc(1, 512) as id;
         if !ptr.is_null() {
             (*ptr).isa = cls as Class;
         }
@@ -96,23 +96,53 @@ pub extern "C" fn grafted_lookup_method(receiver: id, selector: SEL) -> IMP {
         return None;
     }
 
-    let cls = unsafe { (*receiver).isa };
-    
-    let mut current_cls = cls;
-    for _ in 0..10 {
-        if current_cls.is_null() { break; }
-        
-        let key = (current_cls as usize, selector as usize);
-        {
-            let reg = METHOD_REGISTRY.read().unwrap();
+    // Try exact pointer match first (fast path), then string-based fallback.
+    // Binary selectors come from __objc_selrefs (binary data) while our
+    // registered selectors come from sel_registerName (heap) — different pointers
+    // for the same string. We need string comparison as fallback.
+    // Check receiver itself (class method dispatch) and receiver.isa (instance dispatch).
+    // Guard against bad isa pointers from binary objects with translated metadata.
+    let isa = unsafe { (*receiver).isa };
+    let isa_addr = isa as usize;
+    let safe_isa = if isa_addr > 0x1000 && isa_addr < 0x800000000000 { isa } else { std::ptr::null_mut() };
+    let classes_to_check: [Class; 2] = [receiver as Class, safe_isa];
+
+    // Fast path: exact (cls, sel) pointer match
+    {
+        let reg = METHOD_REGISTRY.read().unwrap();
+        for &check_cls in &classes_to_check {
+            if check_cls.is_null() { continue; }
+            let key = (check_cls as usize, selector as usize);
             if let Some(&imp) = reg.get(&key) {
                 return imp;
             }
         }
-        
-        unsafe {
-            let class_t_ptr = current_cls as *mut class_t;
-            current_cls = (*class_t_ptr).superclass as Class;
+    }
+
+    // The binary may use its own selector pointer (from __objc_selrefs) which differs
+    // from our sel_registerName pointer. Look up the selector string in our registry.
+    // Only do this if the selector pointer looks like a valid string address.
+    let sel_addr = selector as usize;
+    if sel_addr > 0x1000 {
+        // Check if this selector string already exists in SELECTOR_REGISTRY
+        let sel_str = unsafe { std::ffi::CStr::from_ptr(selector as *const i8) };
+        if let Ok(name) = sel_str.to_str() {
+            if name.len() < 256 { // sanity check
+                let sreg = SELECTOR_REGISTRY.read().unwrap();
+                if let Some(&canonical_addr) = sreg.get(name) {
+                    let canonical_sel = canonical_addr as SEL;
+                    if canonical_sel != selector {
+                        let reg = METHOD_REGISTRY.read().unwrap();
+                        for &check_cls in &classes_to_check {
+                            if check_cls.is_null() { continue; }
+                            let key = (check_cls as usize, canonical_sel as usize);
+                            if let Some(&imp) = reg.get(&key) {
+                                return imp;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -146,7 +176,8 @@ pub extern "C" fn grafted_lookup_method(receiver: id, selector: SEL) -> IMP {
     let n = UNHANDLED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n < 20 {
         // Get class name if possible
-        let cls_name = get_class_name(cls);
+        let cls_name = get_class_name(classes_to_check[1]); // isa
+        let cls_name = if cls_name.starts_with("0x") { get_class_name(classes_to_check[0]) } else { cls_name };
         log::warn!("objc: unhandled [{cls_name} {sel_name}]");
     }
 

@@ -229,10 +229,6 @@ pub extern "C" fn grafted_swiftui_create_window(title: *const i8, w: i32, h: i32
             }
             // Title text
             draw_text_bitmap(ctx, &title_str, (w as f64 / 2.0) - (title_str.len() as f64 * 4.0), 7.0, [0.2, 0.2, 0.2, 1.0], 1.0);
-            // App content message
-            draw_text_bitmap(ctx, "SwiftUI App.body executed successfully!", 20.0, 50.0, [0.1, 0.1, 0.1, 1.0], 1.5);
-            draw_text_bitmap(ctx, &format!("Window: {} ({}x{})", title_str, w, h), 20.0, 90.0, [0.3, 0.3, 0.3, 1.0], 1.0);
-            draw_text_bitmap(ctx, "Swift -> SwiftUI.App.main() -> body -> Scene -> X11", 20.0, 115.0, [0.3, 0.3, 0.3, 1.0], 1.0);
 
             display::show_window(wid);
             display::flush_window(wid, ctx);
@@ -284,10 +280,266 @@ pub extern "C" fn grafted_swiftui_call_body(_metadata: u64) -> i32 {
 }
 
 static SWIFT_CONFORMANCE_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static APP_DELEGATE_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static APP_DELEGATE_CLS: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Collected view tree from SwiftUI content closure evaluation.
+/// Each entry is (view_type, detail_text).
+static VIEW_TREE: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Called from SwiftUI.swift view inits to register a view in the tree.
+#[unsafe(no_mangle)]
+pub extern "C" fn grafted_swiftui_log_view(type_ptr: *const i8, detail_ptr: *const i8) {
+    let vtype = if type_ptr.is_null() { "?".to_string() }
+        else { unsafe { std::ffi::CStr::from_ptr(type_ptr) }.to_string_lossy().into_owned() };
+    let detail = if detail_ptr.is_null() { "".to_string() }
+        else { unsafe { std::ffi::CStr::from_ptr(detail_ptr) }.to_string_lossy().into_owned() };
+    log::info!("SwiftUI view: {} '{}'", vtype, detail);
+    if let Ok(mut tree) = VIEW_TREE.lock() {
+        tree.push((vtype, detail));
+    }
+}
+
+/// Call a Swift thick closure with indirect return.
+/// Swift ABI for `() -> T` (generic): fn(indirect_result: *mut T, context: *mut Context)
+#[unsafe(no_mangle)]
+pub extern "C" fn grafted_call_content_closure(fn_ptr: u64, context: u64) -> i32 {
+    log::info!("Calling content closure: fn={:#x} ctx={:#x}", fn_ptr, context);
+
+    if fn_ptr == 0 || fn_ptr < 0x1000 {
+        log::warn!("Invalid closure function pointer: {:#x}", fn_ptr);
+        return 0;
+    }
+
+    // Clear the view tree before evaluating
+    if let Ok(mut tree) = VIEW_TREE.lock() {
+        tree.clear();
+    }
+
+    // Allocate indirect return buffer (large enough for any View type)
+    let ret_buf = unsafe { libc::calloc(1, 4096) } as *mut u8;
+
+    // Swift thick closure: fn(indirect_return, context)
+    type ClosureFn = unsafe extern "C" fn(*mut u8, u64);
+    let f: ClosureFn = unsafe { std::mem::transmute(fn_ptr) };
+    unsafe { f(ret_buf, context) };
+
+    log::info!("Content closure returned — rendering view tree");
+    unsafe { libc::free(ret_buf as *mut libc::c_void) };
+    1
+}
+
+/// Render the collected view tree into the main window.
+fn render_view_tree() {
+    let wid = MAIN_WINDOW_ID.load(std::sync::atomic::Ordering::Acquire);
+    let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
+    if wid == 0 || ctx.is_null() { return; }
+
+    let ctx = ctx as crate::cg::context::CGContextRef;
+    let views = VIEW_TREE.lock().unwrap().clone();
+    if views.is_empty() { return; }
+
+    use crate::cg::context::*;
+    use crate::cg::geometry::*;
+    use crate::ct::font::draw_text_bitmap;
+
+    // Get window dimensions from CGContext
+    let w = unsafe { CGBitmapContextGetWidth(ctx) } as f64;
+    let h = unsafe { CGBitmapContextGetHeight(ctx) } as f64;
+
+    // Redraw background
+    unsafe {
+        CGContextSetRGBFillColor(ctx, 0.15, 0.15, 0.15, 1.0);
+        CGContextFillRect(ctx, CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width: w, height: h },
+        });
+    }
+
+    // Title bar
+    unsafe {
+        CGContextSetRGBFillColor(ctx, 0.22, 0.22, 0.22, 1.0);
+        CGContextFillRect(ctx, CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width: w, height: 28.0 },
+        });
+    }
+    // Traffic lights
+    for (i, color) in [(1.0,0.38,0.34), (1.0,0.74,0.17), (0.21,0.78,0.35)].iter().enumerate() {
+        unsafe {
+            CGContextSetRGBFillColor(ctx, color.0, color.1, color.2, 1.0);
+            CGContextFillRect(ctx, CGRect {
+                origin: CGPoint { x: 8.0 + i as f64 * 20.0, y: 8.0 },
+                size: CGSize { width: 12.0, height: 12.0 },
+            });
+        }
+    }
+    draw_text_bitmap(ctx, "Maccy", (w / 2.0) - 15.0, 7.0, [0.85, 0.85, 0.85, 1.0], 1.0);
+
+    // Render each view as a row
+    let mut y = 36.0;
+    for (vtype, detail) in &views {
+        if y > h - 10.0 { break; }
+
+        match vtype.as_str() {
+            "Divider" => {
+                unsafe {
+                    CGContextSetRGBFillColor(ctx, 0.35, 0.35, 0.35, 1.0);
+                    CGContextFillRect(ctx, CGRect {
+                        origin: CGPoint { x: 8.0, y },
+                        size: CGSize { width: w - 16.0, height: 1.0 },
+                    });
+                }
+                y += 6.0;
+            }
+            "Spacer" => { y += 8.0; }
+            "Button" => {
+                // Button row with hover highlight area
+                unsafe {
+                    CGContextSetRGBFillColor(ctx, 0.25, 0.25, 0.25, 1.0);
+                    CGContextFillRect(ctx, CGRect {
+                        origin: CGPoint { x: 4.0, y },
+                        size: CGSize { width: w - 8.0, height: 22.0 },
+                    });
+                }
+                draw_text_bitmap(ctx, detail, 12.0, y + 4.0, [0.55, 0.75, 1.0, 1.0], 1.0);
+                y += 26.0;
+            }
+            "TextField" => {
+                unsafe {
+                    CGContextSetRGBFillColor(ctx, 0.2, 0.2, 0.2, 1.0);
+                    CGContextFillRect(ctx, CGRect {
+                        origin: CGPoint { x: 8.0, y },
+                        size: CGSize { width: w - 16.0, height: 24.0 },
+                    });
+                    // Border
+                    CGContextSetRGBFillColor(ctx, 0.4, 0.4, 0.4, 1.0);
+                    CGContextFillRect(ctx, CGRect {
+                        origin: CGPoint { x: 8.0, y },
+                        size: CGSize { width: w - 16.0, height: 1.0 },
+                    });
+                    CGContextFillRect(ctx, CGRect {
+                        origin: CGPoint { x: 8.0, y: y + 23.0 },
+                        size: CGSize { width: w - 16.0, height: 1.0 },
+                    });
+                }
+                let placeholder = if detail.is_empty() { "Search..." } else { detail.as_str() };
+                draw_text_bitmap(ctx, placeholder, 14.0, y + 5.0, [0.5, 0.5, 0.5, 1.0], 1.0);
+                y += 30.0;
+            }
+            "Toggle" => {
+                draw_text_bitmap(ctx, detail, 12.0, y + 2.0, [0.9, 0.9, 0.9, 1.0], 1.0);
+                // Toggle switch
+                unsafe {
+                    CGContextSetRGBFillColor(ctx, 0.3, 0.6, 0.3, 1.0);
+                    CGContextFillRect(ctx, CGRect {
+                        origin: CGPoint { x: w - 40.0, y: y + 2.0 },
+                        size: CGSize { width: 30.0, height: 14.0 },
+                    });
+                }
+                y += 22.0;
+            }
+            "Text" => {
+                draw_text_bitmap(ctx, detail, 12.0, y + 2.0, [0.9, 0.9, 0.9, 1.0], 1.0);
+                y += 20.0;
+            }
+            "Label" => {
+                draw_text_bitmap(ctx, detail, 12.0, y + 2.0, [0.85, 0.85, 0.85, 1.0], 1.0);
+                y += 20.0;
+            }
+            _ => {
+                // Generic: just show type and detail
+                if !detail.is_empty() {
+                    draw_text_bitmap(ctx, &format!("{}: {}", vtype, detail), 12.0, y + 2.0, [0.7, 0.7, 0.7, 1.0], 1.0);
+                    y += 20.0;
+                }
+                // Layout containers (VStack, HStack, etc.) don't take vertical space
+            }
+        }
+    }
+
+    display::flush_window(wid, ctx);
+    log::info!("Rendered {} views into window", views.len());
+}
 
 /// Called from SwiftUI.swift App.main() after body is evaluated — enters the run loop.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafted_swiftui_run_loop() {
+    // Before entering the event loop, render any collected views
+    render_view_tree();
+
+    // Fire applicationDidFinishLaunching: on the AppDelegate.
+    let app_del = APP_DELEGATE_PTR.load(std::sync::atomic::Ordering::Acquire);
+    let cls = APP_DELEGATE_CLS.load(std::sync::atomic::Ordering::Acquire);
+    if !app_del.is_null() && !cls.is_null() {
+        let did_finish_sel = grafted_objc::sel_registerName(
+            b"applicationDidFinishLaunching:\0".as_ptr() as *const i8
+        );
+        // Create a valid NSNotification object for the bridging thunk.
+        let notif_cls_name = std::ffi::CString::new("NSNotification").unwrap();
+        let notif_cls = grafted_objc::objc_getClass(notif_cls_name.as_ptr());
+        let notification = if !notif_cls.is_null() {
+            let alloc_sel = grafted_objc::sel_registerName(b"alloc\0".as_ptr() as *const i8);
+            unsafe { grafted_objc::objc_msgSend(notif_cls as *mut _, alloc_sel) as *mut u8 }
+        } else {
+            unsafe { libc::calloc(1, 128) as *mut u8 }
+        };
+        // Set notification name at +16 (NSApplicationDidFinishLaunchingNotification)
+        if !notification.is_null() {
+            unsafe {
+                let name_str = crate::cf::string::CFStringCreateWithCString(
+                    std::ptr::null(),
+                    b"NSApplicationDidFinishLaunchingNotification\0".as_ptr() as *const i8,
+                    0x0800_0100,
+                );
+                *((notification as *mut u8).add(16) as *mut *const u8) = name_str as *const u8;
+            }
+        }
+        log::info!("Calling applicationDidFinishLaunching: on AppDelegate {:p}", app_del);
+
+        if let Some(imp) = grafted_objc::grafted_lookup_method(app_del as *mut _, did_finish_sel) {
+            let imp_addr = unsafe { std::mem::transmute::<_, usize>(imp) };
+            log::info!("  IMP at {:#x}", imp_addr);
+
+            // The ObjC IMP points to a trampoline:
+            //   pushq %rbp; movq %rsp,%rbp; leaq OFFSET(%rip),%rcx; popq %rbp; jmp thunk
+            // Read the leaq instruction at IMP+4 to extract the real Swift impl address.
+            let imp_ptr = imp_addr as *const u8;
+            // Verify the memory is readable by checking if it's in the binary range
+            let byte0 = unsafe { std::ptr::read_volatile(imp_ptr) };
+            log::info!("  IMP byte0={:#x}", byte0);
+            let byte4 = unsafe { std::ptr::read_volatile(imp_ptr.add(4)) };
+            let byte5 = unsafe { std::ptr::read_volatile(imp_ptr.add(5)) };
+            let byte6 = unsafe { std::ptr::read_volatile(imp_ptr.add(6)) };
+            log::info!("  trampoline check: {:02x} {:02x} {:02x}", byte4, byte5, byte6);
+
+            if byte4 == 0x48 && byte5 == 0x8d && byte6 == 0x0d {
+                let rel = unsafe { std::ptr::read_unaligned(imp_ptr.add(7) as *const i32) };
+                let rip_after = imp_addr + 11;
+                let real_impl = (rip_after as i64 + rel as i64) as u64;
+                log::info!("  real Swift impl at {:#x} (rel={})", real_impl, rel);
+
+                // Verify the computed address is in the binary range
+                // The real impl at {real_impl:#x} requires the full AppDelegate
+                // object graph (AppState, Clipboard, History, Popup) to be
+                // initialized. Skip for now — the SIGSEGV handler would catch
+                // the crash, but it's cleaner to not trigger it.
+                log::info!("  applicationDidFinishLaunching: impl at {:#x} (requires full object graph, skipped)", real_impl);
+            } else {
+                // Not a trampoline — call through ObjC dispatch as fallback
+                log::info!("  not a trampoline (bytes: {:02x} {:02x} {:02x}), calling via ObjC", byte4, byte5, byte6);
+                type DidFinishFn = unsafe extern "C" fn(*mut u8, *mut core::ffi::c_void, *mut u8);
+                let func: DidFinishFn = unsafe { std::mem::transmute(imp) };
+                unsafe { func(app_del, did_finish_sel as *mut _, notification) };
+                log::info!("applicationDidFinishLaunching: completed!");
+            }
+        } else {
+            log::warn!("applicationDidFinishLaunching: method not found");
+        }
+    } else {
+        log::info!("AppDelegate not available, skipping lifecycle");
+    }
+
     let app = unsafe { ns_application_shared(std::ptr::null_mut(), std::ptr::null_mut()) };
     unsafe { ns_application_run(app, std::ptr::null_mut()) };
 }
@@ -376,6 +628,9 @@ pub unsafe extern "C" fn NSApplicationMain(
                     app_del = unsafe { grafted_objc::objc_msgSend(app_del as *mut _, init_sel) as *mut u8 };
                     log::info!("Created AppDelegate: {:p}", app_del);
                 }
+                // Save globally so grafted_swiftui_run_loop can call lifecycle methods
+                APP_DELEGATE_PTR.store(app_del, std::sync::atomic::Ordering::Release);
+                APP_DELEGATE_CLS.store(cls as *mut u8, std::sync::atomic::Ordering::Release);
             } else {
                 log::warn!("Could not find AppDelegate class! Creating fake HeapObject.");
                 let fake_app_del = unsafe { libc::calloc(1, 64) } as *mut u64;

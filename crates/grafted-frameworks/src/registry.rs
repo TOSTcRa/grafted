@@ -12,6 +12,11 @@ static REAL_GET_TYPE_FN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
     let mut reg = HashMap::new();
 
+    // Register ObjC classes FIRST so _OBJC_CLASS_$_ fixups find them
+    // during chained fixup resolution (before any symbol table build).
+    crate::foundation::register_classes();
+    crate::appkit::register_classes();
+
     reg.insert(
         "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation".into(),
         core_foundation_symbols(),
@@ -140,6 +145,23 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
         "/usr/lib/swift/libswift_Concurrency.dylib",
     ] {
         reg.insert((*lib).into(), swift_syms.clone());
+    }
+
+    // Darwin frameworks also import Swift symbols (e.g. Foundation.Notification).
+    // Merge swift_syms into framework entries so they resolve correctly.
+    for fw in &[
+        "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation",
+        "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit",
+        "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
+        "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics",
+        "/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices",
+    ] {
+        if let Some(entry) = reg.get_mut::<str>(fw) {
+            // Swift symbols fill gaps — don't overwrite framework-specific stubs
+            for (k, v) in &swift_syms {
+                entry.entry(k.clone()).or_insert(*v);
+            }
+        }
     }
 
     // Other system libraries
@@ -381,6 +403,25 @@ fn core_graphics_symbols() -> HashMap<String, u64> {
     sym!(s, "_CGEventSourceSetLocalEventsFilterDuringSuppressionState", swift_noop);
     sym!(s, "_CGWindowListCopyWindowInfo", swift_noop_ptr);
 
+    // ObjC class pointers for _OBJC_CLASS_$_ imports that come through CoreFoundation.
+    // register_classes() was already called at the top of framework_registry().
+    for class_name in &[
+        "NSUserDefaults", "NSString", "NSMutableString", "NSNumber", "NSNull",
+        "NSBundle", "NSNotificationCenter", "NSDistributedNotificationCenter",
+        "NSProcessInfo", "NSFileManager", "NSObject", "NSArray", "NSMutableArray",
+        "NSDictionary", "NSMutableDictionary", "NSData", "NSMutableData",
+        "NSURL", "NSSet", "NSMutableSet", "NSDate", "NSError",
+        "NSNumberFormatter", "NSByteCountFormatter",
+        "NSMutableAttributedString", "NSAttributedString",
+    ] {
+        let c_name = std::ffi::CString::new(*class_name).unwrap();
+        let cls = grafted_objc::objc_getClass(c_name.as_ptr());
+        if !cls.is_null() {
+            s.insert(format!("_OBJC_CLASS_$_{}", class_name), cls as u64);
+            s.insert(format!("_OBJC_METACLASS_$_{}", class_name), cls as u64);
+        }
+    }
+
     s
 }
 
@@ -454,6 +495,21 @@ fn foundation_symbols() -> HashMap<String, u64> {
         "_NSKeyValueChangeOldKey",
     ] {
         s.insert(name.into(), &NS_CONSTANT_STRINGS as *const _ as u64);
+    }
+    // Expose registered Foundation class pointers for _OBJC_CLASS_$_ imports.
+    // register_classes() was already called at the top of framework_registry().
+    for class_name in &[
+        "NSUserDefaults", "NSString", "NSMutableString", "NSNumber", "NSNull",
+        "NSBundle", "NSNotificationCenter", "NSDistributedNotificationCenter",
+        "NSProcessInfo", "NSFileManager", "NSNumberFormatter",
+        "NSByteCountFormatter", "NSMutableAttributedString", "NSAttributedString",
+    ] {
+        let c_name = std::ffi::CString::new(*class_name).unwrap();
+        let cls = grafted_objc::objc_getClass(c_name.as_ptr());
+        if !cls.is_null() {
+            s.insert(format!("_OBJC_CLASS_$_{}", class_name), cls as u64);
+            s.insert(format!("_OBJC_METACLASS_$_{}", class_name), cls as u64);
+        }
     }
     s
 }
