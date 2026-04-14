@@ -1064,3 +1064,224 @@ public class NSHostingController<Content> {
 public class NSHostingView<Content> {
     public init(rootView: Content) {}
 }
+
+// ── Internal modifier types needed by binary code ──────────────────────
+// These generate real metadata (VMa) with proper VWTs and conformances
+// so that generic SwiftUI view construction in the binary doesn't crash.
+
+public struct _OverlayModifier<Overlay>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _BackgroundModifier<Background>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _BackgroundStyleModifier: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _ForegroundStyleModifier: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _PaddingLayout: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _FrameLayout: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _FlexFrameLayout: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _FixedSizeLayout: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _ClipEffect<ClipShape>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _OpacityEffect: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _OffsetEffect: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _TraitWritingModifier<Trait>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _TagTraitWritingModifier<Trait>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _EnvironmentKeyWritingModifier<Value>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _EnvironmentKeyTransformModifier<Value>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _PreferenceWritingModifier<Key>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _PreferenceActionModifier<Key>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _AppearanceActionModifier: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _TaskModifier: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _AnimationModifier<Value>: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _HoverRegionModifier: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _SafeAreaRegionsIgnoringLayout: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct _AlignmentWritingModifier: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct AccessibilityAttachmentModifier: ViewModifier {
+    public func body(content: Content) -> some View { EmptyView() }
+}
+
+public struct IDView<Content, ID>: View where Content: View, ID: Hashable {}
+
+public struct _ShapeView<S, Style>: View where S: Shape {}
+
+public struct _LayoutRoot<L, Content>: View {}
+
+public struct ScrollViewProxy {
+    public func scrollTo<ID: Hashable>(_ id: ID, anchor: UnitPoint? = nil) {}
+}
+
+// ── Layout protocol types ──────────────────────────────────────────────
+
+public struct LayoutSubview {
+    public subscript<K>(key: K.Type) -> K.Value where K: LayoutValueKey {
+        fatalError()
+    }
+    public func sizeThatFits(_ proposal: ProposedViewSize) -> CGSize { .zero }
+    public func place(at position: CGPoint, anchor: UnitPoint = UnitPoint(x: 0, y: 0), proposal: ProposedViewSize) {}
+}
+
+public struct LayoutSubviews: RandomAccessCollection {
+    public var startIndex: Int { 0 }
+    public var endIndex: Int { 0 }
+    public subscript(index: Int) -> LayoutSubview { fatalError() }
+}
+
+public struct ProposedViewSize: Equatable {
+    public var width: CGFloat?
+    public var height: CGFloat?
+    public init(width: CGFloat? = nil, height: CGFloat? = nil) { self.width = width; self.height = height }
+    public static let zero = ProposedViewSize(width: 0, height: 0)
+    public static let unspecified = ProposedViewSize()
+    public static let infinity = ProposedViewSize(width: .infinity, height: .infinity)
+}
+
+public protocol LayoutValueKey {
+    associatedtype Value
+    static var defaultValue: Value { get }
+}
+
+public struct LayoutProperties {
+    public var stackOrientation: Axis? = nil
+    public init() {}
+}
+
+public protocol Layout {
+    associatedtype Cache = Void
+    typealias Subviews = LayoutSubviews
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache)
+    func makeCache(subviews: Subviews) -> Cache
+    static var layoutProperties: LayoutProperties { get }
+}
+
+extension Layout {
+    public static var layoutProperties: LayoutProperties { LayoutProperties() }
+}
+
+extension Layout where Cache == Void {
+    public func makeCache(subviews: Subviews) {}
+}
+
+public struct _HStackLayout: Layout {
+    public func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize { .zero }
+    public func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) {}
+}
+
+public struct _VStackLayout: Layout {
+    public func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize { .zero }
+    public func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) {}
+}
+
+public struct _ZStackLayout: Layout {
+    public func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize { .zero }
+    public func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) {}
+}
+
+// ── Tag / Trait system ─────────────────────────────────────────────────
+
+public struct TagValueTraitKey<V>: _ViewTraitKey {
+    public static var defaultValue: V? { nil }
+}
+
+public protocol _ViewTraitKey {
+    associatedtype Value
+    static var defaultValue: Value { get }
+}
+
+// ── Text substyles ─────────────────────────────────────────────────────
+
+extension Text {
+    public struct DateStyle {
+        public static let time = DateStyle()
+        public static let date = DateStyle()
+        public static let relative = DateStyle()
+        public static let offset = DateStyle()
+        public static let timer = DateStyle()
+    }
+
+    public struct LineStyle: Equatable {
+        public init(pattern: Pattern = .solid, color: Color? = nil) {}
+        public enum Pattern { case solid, dot, dash, dashDot, dashDotDot }
+        public static let single = LineStyle()
+    }
+}
+
+// ── LocalizedStringKey.StringInterpolation ─────────────────────────────
+
+extension LocalizedStringKey {
+    public struct StringInterpolation: StringInterpolationProtocol {
+        public init(literalCapacity: Int, interpolationCount: Int) {}
+        public mutating func appendLiteral(_ literal: String) {}
+        public mutating func appendInterpolation(_ string: String) {}
+        public mutating func appendInterpolation<T>(_ value: T) {}
+    }
+
+    public init(stringInterpolation: StringInterpolation) {
+        self.stringValue = ""
+    }
+}
