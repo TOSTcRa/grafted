@@ -10,7 +10,6 @@ pub mod view;
 pub mod event;
 pub mod menu;
 pub mod pasteboard;
-pub mod maccy_ui;
 pub mod register;
 
 /// Register all AppKit classes with the ObjC runtime.

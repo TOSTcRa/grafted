@@ -58,11 +58,8 @@ pub unsafe extern "C" fn ns_application_run(
                     APP_TERMINATED.store(true, Ordering::Release);
                 }
                 display::DisplayEvent::Expose { window } => {
-                    // Re-render the Maccy UI and flush to X11
                     let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
                     if !ctx.is_null() {
-                        let entries = super::maccy_ui::sample_entries();
-                        super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &entries, 0, "");
                         display::flush_window(*window, ctx as crate::cg::context::CGContextRef);
                     }
                 }
@@ -202,10 +199,6 @@ pub extern "C" fn grafted_swiftui_create_window(title: *const i8, w: i32, h: i32
         };
 
         if !ctx.is_null() {
-            // Render the dark Maccy-like clipboard UI
-            let entries = super::maccy_ui::sample_entries();
-            super::maccy_ui::render(ctx, &entries, 0, "");
-
             display::show_window(wid);
             display::flush_window(wid, ctx);
         }
@@ -445,8 +438,6 @@ pub extern "C" fn grafted_swiftui_run_loop() {
     let wid = MAIN_WINDOW_ID.load(std::sync::atomic::Ordering::Acquire);
     let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
     if wid != 0 && !ctx.is_null() {
-        let entries = super::maccy_ui::sample_entries();
-        super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &entries, 0, "");
         display::flush_window(wid, ctx as crate::cg::context::CGContextRef);
     }
 
