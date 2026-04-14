@@ -858,6 +858,14 @@ fn get_stub_witness_table() -> *mut u8 {
     wt
 }
 
+/// Safe swift_conformsToProtocol: always returns NULL (no conformance found).
+unsafe extern "C" fn safe_conformsToProtocol(
+    _type: *const u8,
+    _protocol: *const u8,
+) -> *const u8 {
+    std::ptr::null()
+}
+
 /// Our replacement for swift_getAssociatedConformanceWitness.
 unsafe extern "C" fn safe_getAssociatedConformanceWitness(
     _witness_table: *const u8,
@@ -1340,6 +1348,9 @@ fn save_original_bytes() {
         ("swift_getAssociatedConformanceWitness", 12, safe_getAssociatedConformanceWitness as *const u8),
         ("swift_getAssociatedTypeWitnessRelative", 12, safe_getAssociatedTypeWitness as *const u8),
         ("swift_getAssociatedConformanceWitnessRelative", 12, safe_getAssociatedConformanceWitness as *const u8),
+        ("swift_conformsToProtocol", 12, safe_conformsToProtocol as *const u8),
+        ("swift_conformsToProtocol2", 12, safe_conformsToProtocol as *const u8),
+        ("swift_conformsToProtocolCommon", 12, safe_conformsToProtocol as *const u8),
     ];
 
     let mut sites = PATCH_SITES.lock().unwrap();
@@ -1394,6 +1405,9 @@ pub fn apply_lifecycle_patches() {
         safe_getAssociatedConformanceWitness as *const u8,
         safe_getAssociatedTypeWitness as *const u8,  // Relative
         safe_getAssociatedConformanceWitness as *const u8,  // Relative
+        safe_conformsToProtocol as *const u8,         // conformsToProtocol
+        safe_conformsToProtocol as *const u8,         // conformsToProtocol2
+        safe_conformsToProtocol as *const u8,         // conformsToProtocolCommon
         safe_getAssociatedTypeWitness as *const u8,  // Slow
         safe_getAssociatedConformanceWitness as *const u8,  // Slow
     ];

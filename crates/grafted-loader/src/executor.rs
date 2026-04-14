@@ -442,8 +442,30 @@ unsafe extern "C" fn sigsegv_handler(
     let info = unsafe { &*info };
     let uctx = unsafe { &*(context as *const libc::ucontext_t) };
 
-    // If recovery is active, longjmp back to the setjmp point.
+    // If recovery is active, log and longjmp back.
     if RECOVERY_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        let rip = uctx.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
+        let fault = unsafe { info.si_addr() } as u64;
+        // Resolve crash location via dladdr
+        let mut dli: libc::Dl_info = unsafe { std::mem::zeroed() };
+        let has_dl = unsafe { libc::dladdr(rip as *const _, &mut dli) } != 0;
+        let mut b = [0u8; 256]; let mut p = 0;
+        fn w(b: &mut [u8], p: &mut usize, s: &[u8]) { b[*p..*p+s.len()].copy_from_slice(s); *p += s.len(); }
+        fn hex(v: u64, o: &mut [u8]) { let d = b"0123456789abcdef"; let mut v=v; for i in (0..16).rev() { o[i]=d[(v&0xf)as usize]; v>>=4; } }
+        fn wh(b: &mut [u8], p: &mut usize, v: u64) { hex(v, &mut b[*p..*p+16]); *p += 16; }
+        w(&mut b, &mut p, b"  [recovery] at=0x"); wh(&mut b, &mut p, fault);
+        w(&mut b, &mut p, b" rip=0x"); wh(&mut b, &mut p, rip);
+        if has_dl && !dli.dli_fbase.is_null() {
+            w(&mut b, &mut p, b" off=0x"); wh(&mut b, &mut p, rip - dli.dli_fbase as u64);
+            if !dli.dli_fname.is_null() {
+                w(&mut b, &mut p, b" ");
+                let nm = unsafe { std::ffi::CStr::from_ptr(dli.dli_fname) }.to_bytes();
+                let n = nm.len().min(80);
+                w(&mut b, &mut p, &nm[nm.len()-n..]);
+            }
+        }
+        b[p] = b'\n'; p += 1;
+        unsafe { libc::write(2, b.as_ptr() as *const _, p) };
         unsafe { siglongjmp(std::ptr::addr_of_mut!(RECOVERY_BUF.0) as *mut u8, 1) };
     }
     let rip = uctx.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
