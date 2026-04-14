@@ -109,6 +109,10 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
                 "_swift_getTypeByMangledNameInContext2", "swift_getTypeByMangledNameInContext2",
                 "_swift_allocateWitnessTablePack", "swift_allocateWitnessTablePack",
                 "_swift_deallocateWitnessTablePack", "swift_deallocateWitnessTablePack",
+                // swift_getKeyPath instantiates KeyPath objects from pattern buffers.
+                // Internal libswiftCore.so calls jump to mid-function offsets,
+                // bypassing our entry-point JMP patch. Keep as stub permanently.
+                "_swift_getKeyPath", "swift_getKeyPath",
             ] {
                 if let Some(addr) = stubs_only.get(sym_name) {
                     merged.insert(sym_name.into(), *addr);
@@ -705,7 +709,7 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     sym!(s, "_swift_getTypeByMangledNameInContextInMetadataState2", swift_get_type_by_mangled_name);
     sym!(s, "_swift_getAssociatedConformanceWitness", swift_noop_ptr);
     // Key paths
-    sym!(s, "_swift_getKeyPath", swift_noop_ptr);
+    sym!(s, "_swift_getKeyPath", safe_return_stub_object);
     sym!(s, "_swift_getAtKeyPath", swift_noop_ptr);
     // Array operations
     sym!(s, "_swift_arrayDestroy", swift_noop);
