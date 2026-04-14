@@ -295,13 +295,6 @@ unsafe fn process_syscall(
                 // Intercept tgkill(pid, tid, SIGABRT=6) during lifecycle —
                 // Swift's fatalError calls abort() which does tgkill. Skip it
                 // so the lifecycle function can continue past assertions.
-                if raw == 234 && args[2] == 6 { // SYS_tgkill, sig=SIGABRT
-                    if RECOVERY_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-                        log::warn!("Intercepted abort() during lifecycle — skipping tgkill(SIGABRT)");
-                        return 0; // pretend success
-                    }
-                }
-
                 // Allow raw Linux syscalls to pass through unmodified.
                 // This is crucial for our Linux libc shims to work.
                 let ret: i64;
@@ -578,6 +571,33 @@ fn install_sigsegv() {
         libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGABRT, &sa, std::ptr::null_mut());
     }
+}
+
+/// Override libc abort() — during lifecycle recovery, longjmp instead of aborting.
+/// This prevents UB from Swift's `fatalError` (marked `-> Never`) calling abort
+/// and the code continuing in an undefined state.
+#[unsafe(no_mangle)]
+pub extern "C" fn abort() -> ! {
+    if RECOVERY_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        // Print caller return address for diagnostics
+        let ra = unsafe {
+            let r: u64;
+            std::arch::asm!("mov 8(%rbp), {0}", out(reg) r, options(nostack, att_syntax));
+            r
+        };
+        let mut dli: libc::Dl_info = unsafe { std::mem::zeroed() };
+        let has_dl = unsafe { libc::dladdr(ra as *const _, &mut dli) } != 0;
+        if has_dl && !dli.dli_fname.is_null() {
+            let lib = unsafe { std::ffi::CStr::from_ptr(dli.dli_fname) }.to_string_lossy();
+            let off = ra - dli.dli_fbase as u64;
+            log::warn!("abort() intercepted — caller: {:#x} (off={:#x} {})", ra, off, lib);
+        } else {
+            log::warn!("abort() intercepted — caller: {:#x}", ra);
+        }
+        unsafe { siglongjmp(std::ptr::addr_of_mut!(RECOVERY_BUF.0) as *mut u8, 1) };
+    }
+    // Real abort for non-lifecycle crashes
+    unsafe { libc::_exit(134) }; // 128 + SIGABRT(6)
 }
 
 /// Re-install our SIGSEGV handler (Swift runtime may override it).

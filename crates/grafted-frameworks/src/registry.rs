@@ -109,10 +109,11 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
                 "_swift_getTypeByMangledNameInContext2", "swift_getTypeByMangledNameInContext2",
                 "_swift_allocateWitnessTablePack", "swift_allocateWitnessTablePack",
                 "_swift_deallocateWitnessTablePack", "swift_deallocateWitnessTablePack",
-                // swift_getKeyPath instantiates KeyPath objects from pattern buffers.
-                // Internal libswiftCore.so calls jump to mid-function offsets,
-                // bypassing our entry-point JMP patch. Keep as stub permanently.
+                // These functions have internal call paths within libswiftCore.so
+                // that bypass our entry-point JMP patches. Keep as stubs permanently.
                 "_swift_getKeyPath", "swift_getKeyPath",
+                "_swift_getGenericMetadata", "swift_getGenericMetadata",
+                "_swift_getSingletonMetadata", "swift_getSingletonMetadata",
             ] {
                 if let Some(addr) = stubs_only.get(sym_name) {
                     merged.insert(sym_name.into(), *addr);
@@ -1416,7 +1417,6 @@ fn save_original_bytes() {
         ("swift_getTypeByMangledNameInContext", 12, safe_return_stub_metadata as *const u8),
         ("swift_getTypeByMangledNameInContext2", 12, safe_return_stub_metadata as *const u8),
         ("swift_getTypeByMangledNameInContextInMetadataState", 12, safe_return_stub_metadata as *const u8),
-        // Prevent Swift fatalError from aborting during lifecycle
         ("swift_reportError", 12, safe_noop_return as *const u8),
         ("_swift_runtime_on_report", 12, safe_noop_return as *const u8),
         ("_swift_stdlib_reportFatalError", 12, safe_noop_return as *const u8),
