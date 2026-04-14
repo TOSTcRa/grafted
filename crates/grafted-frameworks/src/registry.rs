@@ -778,8 +778,18 @@ fn libcxx_symbols() -> HashMap<String, u64> {
 
 unsafe extern "C" fn swift_retain(obj: *mut u8) -> *mut u8 { obj }
 unsafe extern "C" fn swift_release(_obj: *mut u8) {}
-unsafe extern "C" fn swift_alloc_object(_type: *mut u8, size: usize, _align: usize) -> *mut u8 {
-    unsafe { libc::calloc(1, size) as *mut u8 }
+unsafe extern "C" fn swift_alloc_object(metadata: *mut u8, size: usize, _align: usize) -> *mut u8 {
+    let obj = unsafe { libc::calloc(1, size.max(16)) } as *mut u8;
+    if !obj.is_null() {
+        unsafe {
+            // HeapObject layout: +0 = metadata, +8 = InlineRefCounts
+            *(obj as *mut *mut u8) = metadata;
+            // Set refcount to "1 strong reference" (immortal-ish: high bits set
+            // so retain/release don't underflow to dealloc)
+            *((obj as *mut u64).add(1)) = 0xFFFFFFFF00000000; // immortal refcount (high bits set)
+        }
+    }
+    obj
 }
 unsafe extern "C" fn swift_dealloc_object(obj: *mut u8, _size: usize, _align: usize) {
     unsafe { libc::free(obj as *mut _) };
@@ -1038,10 +1048,13 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
 
     unsafe {
         let dummy_descriptor = libc::calloc(1, 256) as *mut u64;
-        *metadata.sub(1) = vwt as u64;              // VWT at [-1]
+        // Set immortal refcount on the raw allocation (in case it's treated as HeapObject)
+        *raw.add(0) = metadata as u64;                // isa → self (metadata)
+        *raw.add(1) = 0xFFFFFFFF00000000;             // immortal refcount at +8
+        *metadata.sub(1) = vwt as u64;               // VWT at [-1]
         *metadata = 0x200;                            // kind: struct metadata
         *metadata.add(1) = dummy_descriptor as u64;   // descriptor pointer (non-null)
-        // Fill generic arguments with self-reference so they are valid metadata pointers!
+        // Fill generic arguments with self-reference so they are valid metadata pointers
         for i in 2..16 {
             *metadata.add(i) = metadata as u64;
         }
@@ -1058,6 +1071,41 @@ unsafe extern "C" fn swift_slow_alloc(size: usize, align: usize) -> *mut u8 {
 }
 unsafe extern "C" fn swift_slow_dealloc(ptr: *mut u8, _size: usize, _align: usize) {
     if !ptr.is_null() { unsafe { libc::free(ptr as *mut _) }; }
+}
+
+/// Override swift_allocateWitnessTablePack via ELF symbol interposition.
+/// This is exported as #[no_mangle] so the main binary's symbol takes
+/// precedence over libswiftCore.so's internal calls via PLT.
+/// Returns a pointer to an array of valid stub witness table pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn swift_allocateWitnessTablePack(
+    _descriptor: *const u8,
+    _pattern_args: *const *const u8,
+) -> *mut *const u8 {
+    // Return an array of stub pointers. The caller reads N entries from
+    // this array (N = number of witness tables in the pack). Each entry
+    // should be a valid witness table pointer. Use our universal stub.
+    static STUB_PACK: std::sync::atomic::AtomicPtr<*const u8> =
+        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let mut pack = STUB_PACK.load(std::sync::atomic::Ordering::Acquire);
+    if pack.is_null() {
+        // Allocate an array of 32 stub witness table pointers
+        let arr = unsafe { libc::calloc(32, 8) } as *mut *const u8;
+        // Fill with pointer to our soft stub metadata (which has valid VWT)
+        // Use a calloc'd page with valid VWT as stub witness table
+        let stub = unsafe { libc::calloc(1, 256) } as *const u8;
+        for i in 0..32 {
+            unsafe { *arr.add(i) = stub; }
+        }
+        STUB_PACK.store(arr, std::sync::atomic::Ordering::Release);
+        pack = arr;
+    }
+    pack
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn swift_deallocateWitnessTablePack(_pack: *mut *const u8) {
+    // No-op: our stub pack is statically allocated
 }
 unsafe extern "C" fn swift_stdlib_random(buf: *mut u8, count: usize) {
     // Fill with random bytes via getrandom

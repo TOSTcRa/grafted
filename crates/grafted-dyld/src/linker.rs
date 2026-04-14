@@ -56,6 +56,8 @@ unsafe extern "C" fn shim_unresolved_soft() -> *mut u8 {
         // metadata starts at page + 96 (VWT=88 bytes + 8 byte prefix)
         let meta_ptr = unsafe { page.add(96) };
         unsafe {
+            // Set immortal refcount early in the page (in case page is treated as HeapObject)
+            *((page as *mut u64).add(1)) = 0xFFFFFFFF00000000; // immortal refcount
             // metadata[-1] = VWT pointer
             *((meta_ptr as *mut u64).sub(1)) = vwt as u64;
             // metadata[0] = kind (1 = struct)
