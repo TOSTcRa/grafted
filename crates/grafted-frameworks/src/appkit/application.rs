@@ -520,11 +520,12 @@ pub extern "C" fn grafted_swiftui_run_loop() {
                 log::info!("  real Swift impl at {:#x} (rel={})", real_impl, rel);
 
                 // Verify the computed address is in the binary range
-                // The real impl at {real_impl:#x} requires the full AppDelegate
-                // object graph (AppState, Clipboard, History, Popup) to be
-                // initialized. Skip for now — the SIGSEGV handler would catch
-                // the crash, but it's cleaner to not trigger it.
-                log::info!("  applicationDidFinishLaunching: impl at {:#x} (requires full object graph, skipped)", real_impl);
+                // The real impl needs the full Swift generic type system:
+                // swift_allocateWitnessTablePack crashes because our stub
+                // metadata lacks protocol conformance records for generic
+                // SwiftUI view construction. Skipping lifecycle until
+                // witness table packs are implemented.
+                log::info!("  applicationDidFinishLaunching: real impl at {:#x} (needs witness table pack support)", real_impl);
             } else {
                 // Not a trampoline — call through ObjC dispatch as fallback
                 log::info!("  not a trampoline (bytes: {:02x} {:02x} {:02x}), calling via ObjC", byte4, byte5, byte6);

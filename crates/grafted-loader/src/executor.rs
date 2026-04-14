@@ -440,6 +440,26 @@ unsafe extern "C" fn sigsegv_handler(
             w(&mut buf, &mut p, b" "); wh(&mut buf, &mut p, val);
         }
     }
+    // Try dladdr to identify the crashing library/function
+    let mut dl_info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(rip as *const _, &mut dl_info) } != 0 {
+        w(&mut buf, &mut p, b"\n  base=0x"); wh(&mut buf, &mut p, dl_info.dli_fbase as u64);
+        w(&mut buf, &mut p, b" off=0x"); wh(&mut buf, &mut p, rip - dl_info.dli_fbase as u64);
+        w(&mut buf, &mut p, b"\n  lib=");
+        if !dl_info.dli_fname.is_null() {
+            let lib = unsafe { std::ffi::CStr::from_ptr(dl_info.dli_fname) };
+            let bytes = lib.to_bytes();
+            let len = bytes.len().min(120);
+            w(&mut buf, &mut p, &bytes[..len]);
+        }
+        w(&mut buf, &mut p, b" sym=");
+        if !dl_info.dli_sname.is_null() {
+            let sym = unsafe { std::ffi::CStr::from_ptr(dl_info.dli_sname) };
+            let bytes = sym.to_bytes();
+            let len = bytes.len().min(120);
+            w(&mut buf, &mut p, &bytes[..len]);
+        }
+    }
     buf[p] = b'\n'; p += 1;
     unsafe { libc::write(2, buf.as_ptr() as *const _, p) };
     unsafe { libc::_exit(139) };

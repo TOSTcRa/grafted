@@ -12,18 +12,58 @@ unsafe extern "C" fn shim_unresolved_trap() -> ! {
     unsafe { libc::_exit(127) };
 }
 
-/// Soft stub: returns a valid heap pointer that can be used as Swift metadata.
-/// The pointer is offset +64 into a zeroed page so that negative offsets
-/// (like [-8] for the VWT pointer) still access valid zeroed memory.
-/// This prevents crashes when callers treat the return as type metadata.
+/// No-op value witness functions for the universal stub VWT.
+unsafe extern "C" fn vwt_noop(_: *mut u8, _: *mut u8, _: *const u8) -> *mut u8 {
+    std::ptr::null_mut()
+}
+unsafe extern "C" fn vwt_destroy(_: *mut u8, _: *const u8) {}
+unsafe extern "C" fn vwt_initcopy(dest: *mut u8, src: *mut u8, _meta: *const u8) -> *mut u8 {
+    unsafe { std::ptr::copy_nonoverlapping(src, dest, 8) };
+    dest
+}
+unsafe extern "C" fn vwt_enum_tag(_: *const u8, _: u32, _: *const u8) -> u32 { 0 }
+unsafe extern "C" fn vwt_store_enum_tag(_: *mut u8, _: u32, _: u32, _: *const u8) {}
+
+/// Soft stub: returns a valid Swift metadata pointer with a proper VWT.
+/// The VWT has valid function pointers and size/stride/flags so that
+/// code reading metadata[-1]→VWT[0x40] (size) doesn't crash.
 unsafe extern "C" fn shim_unresolved_soft() -> *mut u8 {
-    static STUB_PAGE: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-    let mut ptr = STUB_PAGE.load(std::sync::atomic::Ordering::Acquire);
+    static STUB_META: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let mut ptr = STUB_META.load(std::sync::atomic::Ordering::Acquire);
     if ptr.is_null() {
+        // Allocate: [VWT (88 bytes)] [metadata_prefix (8 bytes)] [metadata (64+ bytes)]
         let page = unsafe { libc::calloc(1, 8192) } as *mut u8;
-        // Return a pointer 64 bytes in, so [-8], [-16], etc. are valid zeros
-        ptr = unsafe { page.add(64) };
-        STUB_PAGE.store(ptr, std::sync::atomic::Ordering::Release);
+
+        // Build the VWT at the start of the page
+        let vwt = page as *mut u64;
+        unsafe {
+            *vwt.add(0) = vwt_initcopy as u64;  // initializeBufferWithCopyOfBuffer
+            *vwt.add(1) = vwt_destroy as u64;    // destroy
+            *vwt.add(2) = vwt_initcopy as u64;   // initializeWithCopy
+            *vwt.add(3) = vwt_initcopy as u64;   // assignWithCopy
+            *vwt.add(4) = vwt_initcopy as u64;   // initializeWithTake
+            *vwt.add(5) = vwt_initcopy as u64;   // assignWithTake
+            *vwt.add(6) = vwt_enum_tag as u64;   // getEnumTagSinglePayload
+            *vwt.add(7) = vwt_store_enum_tag as u64; // storeEnumTagSinglePayload
+            *vwt.add(8) = 8;                     // size
+            *vwt.add(9) = 8;                     // stride
+            // flags: alignment mask = 7 (8-byte aligned), BitwiseTakable | Inline
+            *(vwt.add(10) as *mut u32) = 0x20007; // flags
+            *((vwt.add(10) as *mut u32).add(1)) = 0; // extraInhabitantCount
+        }
+
+        // metadata_prefix: VWT pointer at offset -8 from the metadata pointer
+        // metadata starts at page + 96 (VWT=88 bytes + 8 byte prefix)
+        let meta_ptr = unsafe { page.add(96) };
+        unsafe {
+            // metadata[-1] = VWT pointer
+            *((meta_ptr as *mut u64).sub(1)) = vwt as u64;
+            // metadata[0] = kind (1 = struct)
+            *(meta_ptr as *mut u64) = 1;
+        }
+
+        ptr = meta_ptr;
+        STUB_META.store(ptr, std::sync::atomic::Ordering::Release);
     }
     ptr
 }
