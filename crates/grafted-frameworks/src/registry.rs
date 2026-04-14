@@ -1028,9 +1028,9 @@ unsafe extern "C" fn smart_checkMetadataState(metadata: *mut u8, request: usize)
       }
     }
 
-    // For invalid pointers or non-lifecycle: try real impl, or return Complete
+    // For invalid pointers: return our stub metadata (NOT the garbage input!)
     if addr <= 0x1000 || addr >= 0x800000000000 {
-        return MetadataResponse { metadata, state: 0 };
+        return MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 };
     }
 
     // Call the real implementation via trampoline
