@@ -1359,6 +1359,7 @@ fn save_original_bytes() {
         ("swift_conformsToProtocol", 12, safe_conformsToProtocol as *const u8),
         ("swift_conformsToProtocol2", 12, safe_conformsToProtocol as *const u8),
         ("swift_conformsToProtocolCommon", 12, safe_conformsToProtocol as *const u8),
+        ("swift_getWitnessTable", 12, swift_get_witness_table_stub as *const u8),
     ];
 
     let mut sites = PATCH_SITES.lock().unwrap();
