@@ -11,7 +11,6 @@ pub mod event;
 pub mod menu;
 pub mod pasteboard;
 pub mod maccy_ui;
-pub mod clipboard_history;
 pub mod register;
 
 /// Register all AppKit classes with the ObjC runtime.

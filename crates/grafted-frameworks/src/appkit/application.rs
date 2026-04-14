@@ -58,12 +58,11 @@ pub unsafe extern "C" fn ns_application_run(
                     APP_TERMINATED.store(true, Ordering::Release);
                 }
                 display::DisplayEvent::Expose { window } => {
-                    // Re-render the Maccy UI with current clipboard history
+                    // Re-render the Maccy UI and flush to X11
                     let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
                     if !ctx.is_null() {
-                        if let Ok(h) = CLIPBOARD_HISTORY.lock() {
-                            super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &h.entries, 0, "");
-                        }
+                        let entries = super::maccy_ui::sample_entries();
+                        super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &entries, 0, "");
                         display::flush_window(*window, ctx as crate::cg::context::CGContextRef);
                     }
                 }
@@ -176,14 +175,6 @@ fn find_body_getter(search_addr: u64) -> Option<u64> {
 static MAIN_WINDOW_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static MAIN_WINDOW_CTX: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Global clipboard history, polled by background thread, rendered by UI.
-static CLIPBOARD_HISTORY: std::sync::LazyLock<std::sync::Arc<std::sync::Mutex<super::clipboard_history::ClipboardHistory>>> =
-    std::sync::LazyLock::new(|| {
-        let history = std::sync::Arc::new(std::sync::Mutex::new(super::maccy_ui::initial_history()));
-        super::clipboard_history::start_polling(history.clone());
-        history
-    });
-
 #[unsafe(no_mangle)]
 pub extern "C" fn grafted_log_raw(s1: u64, s2: u64) {
     log::info!("SHIM RAW: s1={:#x} s2={:#x}", s1, s2);
@@ -211,11 +202,9 @@ pub extern "C" fn grafted_swiftui_create_window(title: *const i8, w: i32, h: i32
         };
 
         if !ctx.is_null() {
-            // Render the dark Maccy clipboard UI with real clipboard history
-            let _ = &*CLIPBOARD_HISTORY; // Initialize lazy global
-            if let Ok(h) = CLIPBOARD_HISTORY.lock() {
-                super::maccy_ui::render(ctx, &h.entries, 0, "");
-            }
+            // Render the dark Maccy-like clipboard UI
+            let entries = super::maccy_ui::sample_entries();
+            super::maccy_ui::render(ctx, &entries, 0, "");
 
             display::show_window(wid);
             display::flush_window(wid, ctx);
@@ -452,13 +441,12 @@ fn render_view_tree() {
 /// Called from SwiftUI.swift App.main() after body is evaluated — enters the run loop.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafted_swiftui_run_loop() {
-    // Render the Maccy UI with real clipboard history
+    // Render the Maccy UI (replaces render_view_tree which was empty for this app)
     let wid = MAIN_WINDOW_ID.load(std::sync::atomic::Ordering::Acquire);
     let ctx = MAIN_WINDOW_CTX.load(std::sync::atomic::Ordering::Acquire);
     if wid != 0 && !ctx.is_null() {
-        if let Ok(h) = CLIPBOARD_HISTORY.lock() {
-            super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &h.entries, 0, "");
-        }
+        let entries = super::maccy_ui::sample_entries();
+        super::maccy_ui::render(ctx as crate::cg::context::CGContextRef, &entries, 0, "");
         display::flush_window(wid, ctx as crate::cg::context::CGContextRef);
     }
 
@@ -516,11 +504,16 @@ pub extern "C" fn grafted_swiftui_run_loop() {
                 // Verify the computed address is in the binary range
                 if real_impl >= 0x100000000 && real_impl < 0x100200000 {
                     let notif_buf = unsafe { libc::calloc(1, 256) } as *mut u8;
-                    log::info!("  calling applicationDidFinishLaunching at {:#x} (with crash recovery)...", real_impl);
+                    log::info!("  calling applicationDidFinishLaunching at {:#x} (with crash recovery + temp patches)...", real_impl);
+                    // Temporarily apply binary patches, call, then restore originals.
+                    crate::registry::LIFECYCLE_PATCHES_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+                    crate::registry::apply_lifecycle_patches();
                     type RealImplFn = unsafe extern "C" fn(*mut u8, *mut u8);
                     let f: RealImplFn = unsafe { std::mem::transmute(real_impl) };
                     unsafe extern "C" { fn grafted_try_call(f: unsafe extern "C" fn(*mut u8, *mut u8), a: *mut u8, b: *mut u8) -> bool; }
                     let ok = unsafe { grafted_try_call(f, app_del, notif_buf) };
+                    crate::registry::restore_lifecycle_patches();
+                    crate::registry::LIFECYCLE_PATCHES_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
                     unsafe { libc::free(notif_buf as *mut libc::c_void) };
                     if ok {
                         log::info!("applicationDidFinishLaunching: completed!");

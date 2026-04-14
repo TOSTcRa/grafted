@@ -627,8 +627,8 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
     sym!(s, "_swift_getExistentialTypeMetadata", swift_noop_ptr);
     sym!(s, "_swift_getGenericMetadata", swift_get_generic_metadata_stub);
     sym!(s, "_swift_getObjCClassMetadata", swift_noop_ptr);
-    sym!(s, "_swift_getWitnessTable", swift_get_witness_table_stub);
-    sym!(s, "_swift_getAssociatedTypeWitness", swift_get_witness_table_stub);
+    sym!(s, "_swift_getWitnessTable", swift_noop_ptr);
+    sym!(s, "_swift_getAssociatedTypeWitness", swift_noop_ptr);
     sym!(s, "_swift_checkMetadataState", swift_check_metadata);
     sym!(s, "_swift_getFunctionTypeMetadata", swift_noop_ptr);
     sym!(s, "_swift_getTupleTypeMetadata", swift_noop_ptr);
@@ -811,6 +811,232 @@ unsafe extern "C" fn swift_deleted_method() {
     unsafe { libc::_exit(1) };
 }
 unsafe extern "C" fn swift_check_metadata(_req: usize, metadata: *mut u8) -> *mut u8 { metadata }
+
+/// MetadataResponse: returned in (rax=metadata, rdx=state) on x86_64
+#[repr(C)]
+pub struct MetadataResponse {
+    pub metadata: *mut u8,
+    pub state: usize,
+}
+
+/// Our replacement for swift_getAssociatedTypeWitness.
+/// During lifecycle: returns stub metadata. Otherwise: calls real via trampoline.
+static REAL_GET_ASSOC_TYPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+unsafe extern "C" fn safe_getAssociatedTypeWitness(
+    request: usize,
+    witness_table: *const u8,
+    conforming_type: *const u8,
+    req_base: *const u8,
+    assoc_type: *const u8,
+) -> MetadataResponse {
+    if LIFECYCLE_PATCHES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        let stub = shim_unresolved_soft_metadata();
+        return MetadataResponse { metadata: stub, state: 0 };
+    }
+    let trampoline = REAL_GET_ASSOC_TYPE.load(std::sync::atomic::Ordering::Acquire);
+    if trampoline != 0 {
+        type F = unsafe extern "C" fn(usize, *const u8, *const u8, *const u8, *const u8) -> MetadataResponse;
+        let f: F = std::mem::transmute(trampoline);
+        return f(request, witness_table, conforming_type, req_base, assoc_type);
+    }
+    MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 }
+}
+
+/// Get a valid stub witness table filled with universal metadata pointers.
+fn get_stub_witness_table() -> *mut u8 {
+    static STUB_WT: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let wt = STUB_WT.load(std::sync::atomic::Ordering::Acquire);
+    if !wt.is_null() { return wt; }
+
+    let meta = shim_unresolved_soft_metadata();
+    let p = unsafe { libc::calloc(1, 512) } as *mut u64;
+    // Fill ALL entries with valid metadata pointers (not self-referencing)
+    unsafe { for i in 0..64 { *p.add(i) = meta as u64; } }
+    let wt = p as *mut u8;
+    STUB_WT.store(wt, std::sync::atomic::Ordering::Release);
+    wt
+}
+
+/// Our replacement for swift_getAssociatedConformanceWitness.
+unsafe extern "C" fn safe_getAssociatedConformanceWitness(
+    _witness_table: *const u8,
+    _conforming_type: *const u8,
+    _assoc_type: *const u8,
+    _req_base: *const u8,
+    _assoc_conformance: *const u8,
+) -> *const u8 {
+    swift_get_witness_table_stub(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) as *const u8
+}
+
+/// Patch ALL loaded instances of a function + its local Slow variant.
+/// Uses dl_iterate_phdr to find every loaded libswiftCore.so and patches each one.
+unsafe fn patch_all_instances(exported_name: &str, slow_offset: usize, replacement: *const u8) {
+    use std::ffi::CString;
+
+    // First, find the offset of the exported function within libswiftCore.so
+    // by comparing dlsym result with the library's load address.
+    let c_name = CString::new(exported_name).unwrap();
+
+    // Collect all libswiftCore.so base addresses via /proc/self/maps
+    let mut bases: Vec<usize> = Vec::new();
+    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+        for line in maps.lines() {
+            if line.contains("libswiftCore.so") && line.contains("r-xp") {
+                // Parse the start address from "55a1234000-55a1240000 r-xp ..."
+                if let Some(addr_str) = line.split('-').next() {
+                    if let Ok(addr) = usize::from_str_radix(addr_str.trim(), 16) {
+                        bases.push(addr);
+                    }
+                }
+            }
+        }
+    }
+
+    if bases.is_empty() { return; }
+
+    // Find the exported function's offset from the first base
+    let sym_addr = libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) as usize;
+    if sym_addr == 0 { return; }
+
+    // Determine which base this symbol belongs to
+    let mut sym_offset = 0usize;
+    for &base in &bases {
+        if sym_addr >= base && sym_addr < base + 0x1000000 {
+            sym_offset = sym_addr - base;
+            break;
+        }
+    }
+    if sym_offset == 0 { return; }
+
+    // Now patch the Slow variant in ALL loaded copies
+    for &base in &bases {
+        let slow_addr = (base + sym_offset + slow_offset) as *mut u8;
+        // Verify the target looks like a function (starts with push %rbp or similar)
+        let first_byte = std::ptr::read_volatile(slow_addr);
+        if first_byte == 0x55 || first_byte == 0x48 || first_byte == 0x41 {
+            log::info!("Patching {}Slow at {:#x} (base {:#x})", exported_name, slow_addr as usize, base);
+            patch_function_at(slow_addr, replacement);
+        }
+    }
+}
+
+/// Patch a function at a raw address with a JMP to our replacement.
+unsafe fn patch_function_at(target: *mut u8, replacement: *const u8) {
+    if target.is_null() { return; }
+
+    let page = (target as usize & !0xFFF) as *mut libc::c_void;
+    if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) != 0 {
+        return;
+    }
+
+    let p = target;
+    *p = 0x48;
+    *p.add(1) = 0xB8;
+    std::ptr::write_unaligned(p.add(2) as *mut u64, replacement as u64);
+    *p.add(10) = 0xFF;
+    *p.add(11) = 0xE0;
+
+    libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
+}
+
+/// Patch a function in a loaded library by overwriting its first bytes with
+/// a JMP to our replacement. This works for internal calls that don't go through PLT.
+unsafe fn patch_function(name: &str, replacement: *const u8) {
+    let c_name = std::ffi::CString::new(name).unwrap();
+    let target = libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr());
+    if target.is_null() { return; }
+
+    // Make the page writable
+    let page = (target as usize & !0xFFF) as *mut libc::c_void;
+    if libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) != 0 {
+        return;
+    }
+
+    // Write: mov rax, <address>; jmp rax  (12 bytes)
+    let p = target as *mut u8;
+    *p = 0x48;                               // REX.W
+    *p.add(1) = 0xB8;                        // mov rax, imm64
+    std::ptr::write_unaligned(p.add(2) as *mut u64, replacement as u64);
+    *p.add(10) = 0xFF;                       // jmp rax
+    *p.add(11) = 0xE0;
+
+    // Restore page protection
+    libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
+    log::info!("Patched {} → {:#x}", name, replacement as u64);
+}
+
+/// Get/create the universal stub metadata pointer (with VWT, descriptor, etc.)
+fn shim_unresolved_soft_metadata() -> *mut u8 {
+    static STUB: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let ptr = STUB.load(std::sync::atomic::Ordering::Acquire);
+    if !ptr.is_null() { return ptr; }
+
+    // Create metadata with proper VWT
+    let raw = unsafe { libc::calloc(1, 512) } as *mut u64;
+    let metadata = unsafe { raw.add(8) };
+    let vwt = unsafe { libc::calloc(1, 256) } as *mut u64;
+    unsafe extern "C" fn dummy_fn(arg: *mut u8) -> *mut u8 { arg }
+    let d = dummy_fn as *const () as u64;
+    unsafe {
+        for i in 0..8 { *vwt.add(i) = d; }
+        *vwt.add(8) = 8; *vwt.add(9) = 8; *vwt.add(10) = 7;
+        let desc = libc::calloc(1, 256) as *mut u64;
+        *metadata.sub(1) = vwt as u64;
+        *metadata = 0x200;
+        *metadata.add(1) = desc as u64;
+        for i in 2..16 { *metadata.add(i) = metadata as u64; }
+    }
+    let p = metadata as *mut u8;
+    STUB.store(p, std::sync::atomic::Ordering::Release);
+    p
+}
+
+static REAL_CHECK_METADATA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Flag: when true, patches are active (during applicationDidFinishLaunching).
+/// When false, patches call through to the real implementation.
+pub static LIFECYCLE_PATCHES_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Smart swift_checkMetadataState: during lifecycle calls, returns Complete
+/// for stub metadata. Otherwise calls the real implementation via trampoline.
+unsafe extern "C" fn smart_checkMetadataState(metadata: *mut u8, request: usize) -> MetadataResponse {
+    let addr = metadata as usize;
+    // Guard: only access metadata if it's a valid pointer (above 4KB, below 128TB)
+    if addr > 0x1000 && addr < 0x800000000000 {
+      if LIFECYCLE_PATCHES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        let kind = *(metadata as *const u64);
+        if kind == 1 { return MetadataResponse { metadata, state: 0 }; }
+        if kind == 0x200 {
+            let desc_ptr = *((metadata as *const u64).add(1));
+            if desc_ptr != 0 {
+                let desc = desc_ptr as *const u32;
+                if *desc == 0 && *desc.add(1) == 0 && *desc.add(2) == 0 {
+                    return MetadataResponse { metadata, state: 0 };
+                }
+            }
+        }
+      }
+    }
+
+    // For invalid pointers or non-lifecycle: try real impl, or return Complete
+    if addr <= 0x1000 || addr >= 0x800000000000 {
+        return MetadataResponse { metadata, state: 0 };
+    }
+
+    // Call the real implementation via trampoline
+    let trampoline = REAL_CHECK_METADATA.load(std::sync::atomic::Ordering::Acquire);
+    if trampoline != 0 {
+        type RealFn = unsafe extern "C" fn(*mut u8, usize) -> MetadataResponse;
+        let f: RealFn = std::mem::transmute(trampoline);
+        return f(metadata, request);
+    }
+    MetadataResponse { metadata, state: 0 }
+}
+
+// swift_checkMetadataState is now handled via temporary binary patching
+// in apply_lifecycle_patches/restore_lifecycle_patches.
 unsafe extern "C" fn swift_alloc_box(_type: *mut u8) -> *mut u8 {
     unsafe { libc::calloc(1, 64) as *mut u8 }
 }
@@ -1074,6 +1300,7 @@ unsafe extern "C" fn swift_slow_dealloc(ptr: *mut u8, _size: usize, _align: usiz
 /// that swift_retain_n/release_n check before calling the default impl.
 pub fn install_swift_retain_hooks() {
     unsafe {
+        // Hook retain/release via Swift's writable function pointer variables
         for (var_name, hook_fn) in [
             ("_swift_retain\0", safe_swift_retain as *const () as u64),
             ("_swift_retain_n\0", safe_swift_retain_n as *const () as u64),
@@ -1086,7 +1313,110 @@ pub fn install_swift_retain_hooks() {
                 log::info!("Swift hook: {} → {:#x}", &var_name[..var_name.len()-1], hook_fn);
             }
         }
+
+        // NOTE: Binary patches for swift_checkMetadataState, swift_getAssociatedTypeWitness
+        // etc. are applied TEMPORARILY by apply_lifecycle_patches() / restore_lifecycle_patches()
+        // only during applicationDidFinishLaunching. Permanent patches break the body getter.
+        // Save original bytes for the functions we'll patch temporarily.
+        save_original_bytes();
     }
+}
+
+/// Saved original function bytes for temporary patching.
+struct PatchSite {
+    addr: *mut u8,
+    original: [u8; 32],
+    size: usize,
+}
+unsafe impl Send for PatchSite {}
+unsafe impl Sync for PatchSite {}
+
+static PATCH_SITES: std::sync::Mutex<Vec<PatchSite>> = std::sync::Mutex::new(Vec::new());
+
+fn save_original_bytes() {
+    let funcs: &[(&str, usize, *const u8)] = &[
+        ("swift_checkMetadataState", 12, smart_checkMetadataState as *const u8),
+        ("swift_getAssociatedTypeWitness", 12, safe_getAssociatedTypeWitness as *const u8),
+        ("swift_getAssociatedConformanceWitness", 12, safe_getAssociatedConformanceWitness as *const u8),
+        ("swift_getAssociatedTypeWitnessRelative", 12, safe_getAssociatedTypeWitness as *const u8),
+        ("swift_getAssociatedConformanceWitnessRelative", 12, safe_getAssociatedConformanceWitness as *const u8),
+    ];
+
+    let mut sites = PATCH_SITES.lock().unwrap();
+    for &(name, size, _replacement) in funcs {
+        let c_name = std::ffi::CString::new(name).unwrap();
+        let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
+        if addr.is_null() { continue; }
+        let mut original = [0u8; 32];
+        unsafe { std::ptr::copy_nonoverlapping(addr, original.as_mut_ptr(), size); }
+        sites.push(PatchSite { addr, original, size });
+        log::info!("Saved {} bytes from {} at {:p}", size, name, addr);
+    }
+
+    // Also save the Slow variants (+0x30 from the fast function)
+    for &(name, _size, _replacement) in &funcs[1..3] { // getAssociatedType/Conformance
+        let c_name = std::ffi::CString::new(name).unwrap();
+        let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
+        if addr.is_null() { continue; }
+        let slow = unsafe { addr.add(0x30) };
+        let mut original = [0u8; 32];
+        unsafe { std::ptr::copy_nonoverlapping(slow, original.as_mut_ptr(), 12); }
+        sites.push(PatchSite { addr: slow, original, size: 12 });
+    }
+
+    // Also build trampolines for the smart functions that need to call originals
+    unsafe {
+        // checkMetadataState trampoline (22-byte boundary)
+        let c_name = std::ffi::CString::new("swift_checkMetadataState").unwrap();
+        let orig = libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr());
+        if !orig.is_null() {
+            let t = libc::mmap(std::ptr::null_mut(), 4096,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) as *mut u8;
+            if !t.is_null() {
+                std::ptr::copy_nonoverlapping(orig as *const u8, t, 22);
+                let ret = (orig as usize + 22) as u64;
+                *t.add(22) = 0x48; *t.add(23) = 0xB8;
+                std::ptr::write_unaligned(t.add(24) as *mut u64, ret);
+                *t.add(32) = 0xFF; *t.add(33) = 0xE0;
+                REAL_CHECK_METADATA.store(t as u64, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Apply binary patches temporarily (before applicationDidFinishLaunching).
+pub fn apply_lifecycle_patches() {
+    let sites = PATCH_SITES.lock().unwrap();
+    let replacements: &[*const u8] = &[
+        smart_checkMetadataState as *const u8,
+        safe_getAssociatedTypeWitness as *const u8,
+        safe_getAssociatedConformanceWitness as *const u8,
+        safe_getAssociatedTypeWitness as *const u8,  // Relative
+        safe_getAssociatedConformanceWitness as *const u8,  // Relative
+        safe_getAssociatedTypeWitness as *const u8,  // Slow
+        safe_getAssociatedConformanceWitness as *const u8,  // Slow
+    ];
+    for (i, site) in sites.iter().enumerate() {
+        if i < replacements.len() {
+            unsafe { patch_function_at(site.addr, replacements[i]); }
+        }
+    }
+    log::info!("Applied {} lifecycle patches", sites.len());
+}
+
+/// Restore original function bytes (after applicationDidFinishLaunching).
+pub fn restore_lifecycle_patches() {
+    let sites = PATCH_SITES.lock().unwrap();
+    for site in sites.iter() {
+        let page = (site.addr as usize & !0xFFF) as *mut libc::c_void;
+        unsafe {
+            libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC);
+            std::ptr::copy_nonoverlapping(site.original.as_ptr(), site.addr, site.size);
+            libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
+        }
+    }
+    log::info!("Restored {} original functions", sites.len());
 }
 
 // Real default implementations (resolved at first call via dlsym)
@@ -1106,19 +1436,9 @@ fn resolve_real(name: &str, cache: &std::sync::atomic::AtomicU64) -> u64 {
     a
 }
 
-/// Stub for swift_getWitnessTable/swift_getAssociatedTypeWitness: returns a valid
-/// witness table pointer (self-referencing entries) instead of NULL.
+/// Stub for swift_getWitnessTable: returns a witness table with valid metadata pointers.
 unsafe extern "C" fn swift_get_witness_table_stub(_a: *mut u8, _b: *mut u8, _c: *mut u8) -> *mut u8 {
-    static STUB_WT: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-    let mut wt = STUB_WT.load(std::sync::atomic::Ordering::Acquire);
-    if wt.is_null() {
-        let p = unsafe { libc::calloc(1, 512) } as *mut u64;
-        // Fill with self-referencing pointers so any dereference is valid
-        unsafe { for i in 0..64 { *p.add(i) = p as u64; } }
-        wt = p as *mut u8;
-        STUB_WT.store(wt, std::sync::atomic::Ordering::Release);
-    }
-    wt
+    get_stub_witness_table()
 }
 
 // All retain/release are no-ops. This prevents crashes on stub objects
@@ -1235,13 +1555,7 @@ pub unsafe extern "C" fn swift_allocateWitnessTablePack(
         // Each must point to a valid-looking witness table (non-null entries)
         // so swift_getAssociatedTypeWitness doesn't null-deref.
         let arr = unsafe { libc::calloc(32, 8) } as *mut *const u8;
-        let stub_wt = unsafe { libc::calloc(1, 512) } as *mut u64;
-        unsafe {
-            // Fill witness table entries with self-referencing pointers
-            for j in 0..64 {
-                *stub_wt.add(j) = stub_wt as u64;
-            }
-        }
+        let stub_wt = get_stub_witness_table();
         for i in 0..32 {
             unsafe { *arr.add(i) = stub_wt as *const u8; }
         }
