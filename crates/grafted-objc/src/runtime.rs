@@ -176,7 +176,7 @@ pub extern "C" fn grafted_lookup_method(receiver: id, selector: SEL) -> IMP {
     // Log unknown selectors for debugging (first N)
     static UNHANDLED_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = UNHANDLED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n < 20 {
+    if n < 50 {
         // Get class name if possible
         let cls_name = get_class_name(classes_to_check[1]); // isa
         let cls_name = if cls_name.starts_with("0x") { get_class_name(classes_to_check[0]) } else { cls_name };

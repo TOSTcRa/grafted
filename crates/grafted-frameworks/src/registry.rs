@@ -799,7 +799,6 @@ unsafe extern "C" fn swift_dealloc_object(obj: *mut u8, _size: usize, _align: us
     unsafe { libc::free(obj as *mut _) };
 }
 unsafe extern "C" fn swift_once(predicate: *mut isize, fn_ptr: unsafe extern "C" fn(*mut u8), ctx: *mut u8) {
-    // Simple once: if *predicate == 0, call fn and set to -1
     if !predicate.is_null() && unsafe { *predicate } == 0 {
         unsafe { *predicate = -1 };
         unsafe { fn_ptr(ctx) };
@@ -920,6 +919,23 @@ unsafe extern "C" fn safe_return_false(_a: *mut u8, _b: *mut u8) -> i32 { 0 }
 /// Return stub metadata
 unsafe extern "C" fn safe_return_stub_metadata(_a: *mut u8, _b: usize, _c: *mut u8, _d: *mut u8) -> *mut u8 {
     shim_unresolved_soft_metadata()
+}
+
+/// swift_once for lifecycle: try the callback, skip if it would crash.
+/// Uses a secondary setjmp/longjmp to catch crashes within the callback.
+unsafe extern "C" fn swift_once_lifecycle(predicate: *mut isize, fn_ptr: unsafe extern "C" fn(*mut u8), ctx: *mut u8) {
+    if !predicate.is_null() && unsafe { *predicate } == 0 {
+        unsafe { *predicate = -1 };
+        // Try calling the callback — if it crashes, skip it
+        unsafe extern "C" { fn grafted_try_call(f: unsafe extern "C" fn(*mut u8, *mut u8), a: *mut u8, b: *mut u8) -> bool; }
+        // Wrap the single-arg fn_ptr as a two-arg call (second arg unused)
+        type TwoArgFn = unsafe extern "C" fn(*mut u8, *mut u8);
+        let f: TwoArgFn = std::mem::transmute(fn_ptr as *const ());
+        let ok = unsafe { grafted_try_call(f, ctx, std::ptr::null_mut()) };
+        if !ok {
+            log::debug!("swift_once callback crashed — skipped");
+        }
+    }
 }
 
 /// Safe swift_conformsToProtocol: returns stub witness table instead of NULL.
@@ -1456,6 +1472,9 @@ fn save_original_bytes() {
         ("_swift_stdlib_reportFatalError", 12, safe_noop_return as *const u8),
         ("_swift_stdlib_reportFatalErrorInFile", 12, safe_noop_return as *const u8),
         ("swift_unexpectedError", 12, safe_noop_return as *const u8),
+        // Patch real swift_once during lifecycle — skip callbacks that crash
+        // but still mark the predicate as done
+        ("swift_once", 12, swift_once_lifecycle as *const u8),
     ];
 
     let mut sites = PATCH_SITES.lock().unwrap();
