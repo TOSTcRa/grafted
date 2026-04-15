@@ -861,10 +861,12 @@ unsafe extern "C" fn safe_getAssociatedTypeWitness(
     MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 }
 }
 
-/// No-op witness function: returns stub metadata (valid VWT at [-1]).
-/// Witness table entries are protocol requirements that often return types/metadata.
+/// No-op witness function: returns stub object with String-safe fields.
+/// Witness table entries are protocol requirements. Callers may treat the
+/// result as a String, so we return an object with empty String patterns
+/// rather than raw metadata (which gets misinterpreted as native String).
 unsafe extern "C" fn witness_noop(_obj: *mut u8, _wt: *mut u8) -> *mut u8 {
-    shim_unresolved_soft_metadata()
+    safe_return_stub_object(std::ptr::null_mut(), std::ptr::null_mut())
 }
 
 /// Get a valid stub witness table filled with no-op function pointers.
@@ -886,27 +888,31 @@ fn get_stub_witness_table() -> *mut u8 {
 
 /// No-op function for patching init functions that corrupt our stub metadata.
 unsafe extern "C" fn safe_noop_return() {}
-/// Return a stub heap object that looks like a real Swift object.
-/// Fields are empty String pairs so String operations see "" not null.
+/// Return a stub that works BOTH as metadata (VWT at [-1]) AND as a
+/// heap object (String-safe fields at positive offsets).
 unsafe extern "C" fn safe_return_stub_object(_a: *mut u8, _b: *mut u8) -> *mut u8 {
     static STUB_OBJ: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
     let obj = STUB_OBJ.load(std::sync::atomic::Ordering::Acquire);
     if !obj.is_null() { return obj; }
 
-    let p = unsafe { libc::calloc(1, 512) } as *mut u64;
+    // Allocate with space before for VWT pointer (like metadata layout)
+    let raw = unsafe { libc::calloc(1, 1024) } as *mut u64;
+    let stub_meta = shim_unresolved_soft_metadata();
+    let good_vwt = unsafe { *((stub_meta as *const u64).sub(1)) };
+
+    // obj starts 8 bytes in, so obj[-1] is raw[0] (VWT pointer)
+    let obj_ptr = unsafe { raw.add(1) };
     unsafe {
-        // isa: point to our universal stub metadata (acts as class metadata)
-        *p = shim_unresolved_soft_metadata() as u64;
-        // refcount: immortal
-        *p.add(1) = 0xFFFFFFFFFFFFFFFF;
-        // Fill all fields with empty Swift String pattern:
-        // (word0=0, word1=0xE000000000000000) = small string, length 0
-        for i in (2..60).step_by(2) {
-            *p.add(i) = 0;
-            *p.add(i + 1) = 0xE000000000000000;
+        *raw = good_vwt;                           // obj[-1] = valid VWT
+        *obj_ptr = 0x200;                          // obj[0] = kind (metadata compat)
+        *obj_ptr.add(1) = stub_meta as u64;        // obj[1] = descriptor
+        // Fill remaining with empty String patterns + self-references
+        for i in (2..120).step_by(2) {
+            *obj_ptr.add(i) = 0;                   // String word0 = 0
+            *obj_ptr.add(i + 1) = 0xE000000000000000; // String word1 = empty small
         }
     }
-    let obj = p as *mut u8;
+    let obj = obj_ptr as *mut u8;
     STUB_OBJ.store(obj, std::sync::atomic::Ordering::Release);
     obj
 }
@@ -916,7 +922,6 @@ unsafe extern "C" fn safe_return_null(_a: *mut u8, _b: *mut u8) -> *mut u8 {
 }
 /// Return false (0)
 unsafe extern "C" fn safe_return_false(_a: *mut u8, _b: *mut u8) -> i32 { 0 }
-/// Return stub metadata
 unsafe extern "C" fn safe_return_stub_metadata(_a: *mut u8, _b: usize, _c: *mut u8, _d: *mut u8) -> *mut u8 {
     shim_unresolved_soft_metadata()
 }
@@ -1472,9 +1477,11 @@ fn save_original_bytes() {
         ("_swift_stdlib_reportFatalError", 12, safe_noop_return as *const u8),
         ("_swift_stdlib_reportFatalErrorInFile", 12, safe_noop_return as *const u8),
         ("swift_unexpectedError", 12, safe_noop_return as *const u8),
-        // Patch real swift_once during lifecycle — skip callbacks that crash
-        // but still mark the predicate as done
-        ("swift_once", 12, swift_once_lifecycle as *const u8),
+        // swift_once: use the normal stub (calls callback directly).
+        // swift_once_lifecycle with nested grafted_try_call corrupts
+        // the outer RECOVERY_ACTIVE flag. Let callbacks run — crashes
+        // are handled by our other patches (String._nativeCopy etc.)
+        ("swift_once", 12, swift_once as *const u8),
     ];
 
     let mut sites = PATCH_SITES.lock().unwrap();
@@ -1513,6 +1520,40 @@ fn save_original_bytes() {
             unsafe { std::ptr::copy_nonoverlapping(await_state, orig3.as_mut_ptr(), 12); }
             sites.push(PatchSite { addr: await_state, original: orig3, size: 12, replacement: safe_return_stub_object as *const u8 });
             log::info!("Saved local patches: doInit, threading::fatal, awaitState");
+        }
+    }
+    // Patch String._nativeCopy which crashes on null String buffer.
+    // Local symbol at _copyUTF16CodeUnits + 0x50.
+    {
+        let c_name = std::ffi::CString::new("$sSS19_copyUTF16CodeUnits4into5rangeySrys6UInt16VG_SnySiGtF").unwrap();
+        let base = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
+        if !base.is_null() {
+            let native_copy = unsafe { base.add(0x50) };
+            let mut orig = [0u8; 32];
+            unsafe { std::ptr::copy_nonoverlapping(native_copy, orig.as_mut_ptr(), 12); }
+            sites.push(PatchSite { addr: native_copy, original: orig, size: 12, replacement: safe_noop_return as *const u8 });
+            log::info!("Saved 12 bytes from String._nativeCopy at {:p}", native_copy);
+        }
+    }
+    // Also patch _nativeCopy in ALL loaded copies by scanning /proc/self/maps
+    {
+        let mut bases: Vec<usize> = Vec::new();
+        if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+            for line in maps.lines() {
+                if line.contains("libswiftCore.so") && line.contains("r-xp") {
+                    if let Some(addr_str) = line.split('-').next() {
+                        if let Ok(addr) = usize::from_str_radix(addr_str.trim(), 16) {
+                            bases.push(addr);
+                        }
+                    }
+                }
+            }
+        }
+        let target_off = 0x29e8d0usize; // _nativeCopy file offset
+        for &base in &bases {
+            let addr = (base + target_off) as *mut u8;
+            unsafe { patch_function_at(addr, safe_noop_return as *const u8) };
+            log::info!("Patched _nativeCopy at {:#x} (base {:#x})", addr as u64, base);
         }
     }
 
@@ -1645,7 +1686,26 @@ pub fn patch_binary_crash_sites() {
             }
         }
     }
-    log::info!("Applied unified VWT scan + {} individual binary patches", 8);
+    // Patch _nativeCopy in ALL loaded libswiftCore.so copies at PATCH TIME
+    // (second copy loads during body getter, not present at startup)
+    {
+        let mut patched = 0;
+        if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+            for line in maps.lines() {
+                if line.contains("libswiftCore.so") && line.contains("r-xp") {
+                    if let Some(addr_str) = line.split('-').next() {
+                        if let Ok(base) = usize::from_str_radix(addr_str.trim(), 16) {
+                            let addr = (base + 0x29e8d0) as *mut u8;
+                            unsafe { patch_function_at(addr, safe_noop_return as *const u8) };
+                            patched += 1;
+                        }
+                    }
+                }
+            }
+        }
+        log::info!("Patched _nativeCopy in {} libswiftCore.so copies", patched);
+    }
+    log::info!("Applied unified VWT scan + binary patches");
 }
 
 /// Apply binary patches temporarily (before applicationDidFinishLaunching).
