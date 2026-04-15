@@ -1543,6 +1543,19 @@ pub fn patch_binary_crash_sites() {
     // Site 1: binary+0x10827: mov -0x8(%rsi),%rcx; mov 0x50(%rcx),%ecx
     // Replace with: xor %ecx,%ecx; nop*5  (ecx=0 → takes simple path)
     // NOP out indirect VWT function calls that crash on null/garbage VWT
+    // NOP the call to the problematic type init function from its caller
+    // at 0x10000fbcd (5-byte call instruction)
+    for &nop5_addr in &[0x10000fbcdu64] {
+        let target = nop5_addr as *mut u8;
+        let page = (target as usize & !0xFFF) as *mut libc::c_void;
+        unsafe {
+            if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
+                for k in 0..5 { *target.add(k) = 0x90; }
+                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
+            }
+        }
+    }
+
     for &nop_addr in &[0x1000e43f2u64, 0x1000e446du64] {
         let target = nop_addr as *mut u8;
         let page = (target as usize & !0xFFF) as *mut libc::c_void;
