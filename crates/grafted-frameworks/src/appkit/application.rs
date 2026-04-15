@@ -621,10 +621,16 @@ pub unsafe extern "C" fn NSApplicationMain(
                         let field = unsafe { *((app_del as *const u64).add(offset / 8)) };
                         if field == 0 {
                             // Allocate a stub object with valid isa + immortal refcount
-                            let stub = unsafe { libc::calloc(1, 256) } as *mut u64;
+                            let stub = unsafe { libc::calloc(1, 512) } as *mut u64;
                             unsafe {
                                 *stub = cls as u64;                    // isa → AppDelegate class
                                 *stub.add(1) = 0xFFFFFFFFFFFFFFFF;     // immortal refcount
+                                // Fill fields as empty Swift Strings: (0, 0xE000000000000000)
+                                // This prevents null-deref in String operations on stub fields
+                                for j in (2..60).step_by(2) {
+                                    *stub.add(j) = 0;
+                                    *stub.add(j + 1) = 0xE000000000000000;
+                                }
                             }
                             unsafe { *((app_del as *mut u64).add(offset / 8)) = stub as u64; }
                         }
