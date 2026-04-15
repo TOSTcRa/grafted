@@ -456,14 +456,12 @@ unsafe extern "C" fn sigsegv_handler(
         fn w(b: &mut [u8], p: &mut usize, s: &[u8]) { b[*p..*p+s.len()].copy_from_slice(s); *p += s.len(); }
         fn hex(v: u64, o: &mut [u8]) { let d = b"0123456789abcdef"; let mut v=v; for i in (0..16).rev() { o[i]=d[(v&0xf)as usize]; v>>=4; } }
         fn wh(b: &mut [u8], p: &mut usize, v: u64) { hex(v, &mut b[*p..*p+16]); *p += 16; }
-        let r13 = uctx.uc_mcontext.gregs[libc::REG_R13 as usize] as u64;
-        let rsi = uctx.uc_mcontext.gregs[libc::REG_RSI as usize] as u64;
-        let rax = uctx.uc_mcontext.gregs[libc::REG_RAX as usize] as u64;
+        let rsp = uctx.uc_mcontext.gregs[libc::REG_RSP as usize] as u64;
+        let rbp = uctx.uc_mcontext.gregs[libc::REG_RBP as usize] as u64;
         w(&mut b, &mut p, b"  [recovery] at=0x"); wh(&mut b, &mut p, fault);
         w(&mut b, &mut p, b" rip=0x"); wh(&mut b, &mut p, rip);
-        w(&mut b, &mut p, b" r13=0x"); wh(&mut b, &mut p, r13);
-        w(&mut b, &mut p, b" rsi=0x"); wh(&mut b, &mut p, rsi);
-        w(&mut b, &mut p, b" rax=0x"); wh(&mut b, &mut p, rax);
+        w(&mut b, &mut p, b" rsp=0x"); wh(&mut b, &mut p, rsp);
+        w(&mut b, &mut p, b" rbp=0x"); wh(&mut b, &mut p, rbp);
         if has_dl && !dli.dli_fbase.is_null() {
             w(&mut b, &mut p, b" off=0x"); wh(&mut b, &mut p, rip - dli.dli_fbase as u64);
             if !dli.dli_fname.is_null() {

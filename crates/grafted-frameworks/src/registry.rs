@@ -891,9 +891,9 @@ unsafe extern "C" fn safe_noop_return() {}
 unsafe extern "C" fn safe_return_stub_object(_a: *mut u8, _b: *mut u8) -> *mut u8 {
     shim_unresolved_soft_metadata()
 }
-/// Return null pointer
+/// Return stub metadata (not null — null metadata causes VWT[-1] crashes)
 unsafe extern "C" fn safe_return_null(_a: *mut u8, _b: *mut u8) -> *mut u8 {
-    std::ptr::null_mut()
+    shim_unresolved_soft_metadata()
 }
 /// Return false (0)
 unsafe extern "C" fn safe_return_false(_a: *mut u8, _b: *mut u8) -> i32 { 0 }
@@ -1436,17 +1436,30 @@ fn save_original_bytes() {
     }
 
     // Patch local (non-exported) C++ functions by offset from known exported symbols.
-    // GenericCacheEntry::doInitialization is at swift_getGenericMetadata + 0xEE10.
-    // It aborts during generic metadata cache init with our stub descriptors.
     {
         let c_name = std::ffi::CString::new("swift_getGenericMetadata").unwrap();
         let base = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
         if !base.is_null() {
+            // GenericCacheEntry::doInitialization at swift_getGenericMetadata + 0xEE10
             let do_init = unsafe { base.add(0xEE10) };
             let mut original = [0u8; 32];
             unsafe { std::ptr::copy_nonoverlapping(do_init, original.as_mut_ptr(), 12); }
             sites.push(PatchSite { addr: do_init, original, size: 12, replacement: safe_return_stub_object as *const u8 });
             log::info!("Saved 12 bytes from GenericCacheEntry::doInitialization at {:p}", do_init);
+
+            // swift::threading::fatal at swift_getGenericMetadata + 0x3DD40
+            let threading_fatal = unsafe { base.add(0x3DD40) };
+            let mut orig2 = [0u8; 32];
+            unsafe { std::ptr::copy_nonoverlapping(threading_fatal, orig2.as_mut_ptr(), 12); }
+            sites.push(PatchSite { addr: threading_fatal, original: orig2, size: 12, replacement: safe_noop_return as *const u8 });
+
+            // GenericCacheEntry::awaitSatisfyingState at +0xE9B0
+            // Waits for metadata to reach complete state — hangs/aborts on stubs
+            let await_state = unsafe { base.add(0xE9B0) };
+            let mut orig3 = [0u8; 32];
+            unsafe { std::ptr::copy_nonoverlapping(await_state, orig3.as_mut_ptr(), 12); }
+            sites.push(PatchSite { addr: await_state, original: orig3, size: 12, replacement: safe_return_stub_object as *const u8 });
+            log::info!("Saved local patches: doInit, threading::fatal, awaitState");
         }
     }
 
@@ -1495,6 +1508,20 @@ pub fn patch_binary_crash_sites() {
 
     // Site 1: binary+0x10827: mov -0x8(%rsi),%rcx; mov 0x50(%rcx),%ecx
     // Replace with: xor %ecx,%ecx; nop*5  (ecx=0 → takes simple path)
+    // Site 3: binary+0xe43f2: callq *0x10(%rax) — 3 bytes, null VWT fn ptr
+    // Replace with: nop nop nop
+    {
+        let target = 0x1000e43f2 as *mut u8;
+        let page = (target as usize & !0xFFF) as *mut libc::c_void;
+        unsafe {
+            if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
+                *target = 0x90; *target.add(1) = 0x90; *target.add(2) = 0x90;
+                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
+                log::info!("Patched binary crash site at {:#x} (3-byte NOP)", 0x1000e43f2u64);
+            }
+        }
+    }
+
     for &addr in &[0x100010827u64, 0x1000e42a6u64] {
         let target = addr as *mut u8;
         let page = (target as usize & !0xFFF) as *mut libc::c_void;
@@ -1507,10 +1534,16 @@ pub fn patch_binary_crash_sites() {
                     *target = 0x31; *target.add(1) = 0xC9; // xor ecx,ecx
                     for i in 2..7 { *target.add(i) = 0x90; } // nop
                 } else {
-                    // mov rax, <good_vwt>; nop; nop
-                    *target = 0x48; *target.add(1) = 0xB8; // mov rax, imm64
-                    std::ptr::write_unaligned(target.add(2) as *mut u64, good_vwt);
-                    *target.add(10) = 0x90; *target.add(11) = 0x90; // nop nop
+                    // Site 2 at 0x1000e42a6: three instructions (12 bytes):
+                    //   mov -0x8(%r13),%rax  (VWT from metadata)
+                    //   mov %rax,-0x50(%rbp) (save VWT)
+                    //   mov 0x40(%rax),%rax  (VWT.size)
+                    // After this, rax is used as stack allocation size.
+                    // Replace all 12 bytes with: mov rax, 8; nops
+                    // This sets rax = 8 (small size) directly.
+                    *target = 0x48; *target.add(1) = 0xC7; *target.add(2) = 0xC0; // mov rax, imm32
+                    *target.add(3) = 8; *target.add(4) = 0; *target.add(5) = 0; *target.add(6) = 0;
+                    for k in 7..12 { *target.add(k) = 0x90; } // nop fill
                 }
                 libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
                 log::info!("Patched binary crash site at {:#x}", addr);
