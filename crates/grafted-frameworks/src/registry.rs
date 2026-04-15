@@ -1435,6 +1435,21 @@ fn save_original_bytes() {
         log::info!("Saved {} bytes from {} at {:p}", size, name, addr);
     }
 
+    // Patch local (non-exported) C++ functions by offset from known exported symbols.
+    // GenericCacheEntry::doInitialization is at swift_getGenericMetadata + 0xEE10.
+    // It aborts during generic metadata cache init with our stub descriptors.
+    {
+        let c_name = std::ffi::CString::new("swift_getGenericMetadata").unwrap();
+        let base = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
+        if !base.is_null() {
+            let do_init = unsafe { base.add(0xEE10) };
+            let mut original = [0u8; 32];
+            unsafe { std::ptr::copy_nonoverlapping(do_init, original.as_mut_ptr(), 12); }
+            sites.push(PatchSite { addr: do_init, original, size: 12, replacement: safe_return_stub_object as *const u8 });
+            log::info!("Saved 12 bytes from GenericCacheEntry::doInitialization at {:p}", do_init);
+        }
+    }
+
     // Also save the Slow variants (+0x30 from the fast function)
     for &(name, _size, replacement) in &funcs[1..3] { // getAssociatedType/Conformance
         let c_name = std::ffi::CString::new(name).unwrap();
