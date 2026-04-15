@@ -902,12 +902,14 @@ unsafe extern "C" fn safe_return_stub_metadata(_a: *mut u8, _b: usize, _c: *mut 
     shim_unresolved_soft_metadata()
 }
 
-/// Safe swift_conformsToProtocol: always returns NULL (no conformance found).
+/// Safe swift_conformsToProtocol: returns stub witness table instead of NULL.
+/// Returning NULL causes downstream code to crash when using the result
+/// as a witness table (e.g., Dictionary.allocate needs Hashable conformance).
 unsafe extern "C" fn safe_conformsToProtocol(
     _type: *const u8,
     _protocol: *const u8,
 ) -> *const u8 {
-    std::ptr::null()
+    get_stub_witness_table() as *const u8
 }
 
 /// Our replacement for swift_getAssociatedConformanceWitness.
@@ -1037,7 +1039,7 @@ fn shim_unresolved_soft_metadata() -> *mut u8 {
         *metadata.sub(1) = vwt as u64;
         *metadata = 0x200;
         *metadata.add(1) = desc as u64;
-        for i in 2..16 { *metadata.add(i) = metadata as u64; }
+        for i in 2..48 { *metadata.add(i) = metadata as u64; }
     }
     let p = metadata as *mut u8;
     STUB.store(p, std::sync::atomic::Ordering::Release);
@@ -1321,7 +1323,7 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
         *metadata = 0x200;                            // kind: struct metadata
         *metadata.add(1) = dummy_descriptor as u64;   // descriptor pointer (non-null)
         // Fill generic arguments with self-reference so they are valid metadata pointers
-        for i in 2..16 {
+        for i in 2..48 {
             *metadata.add(i) = metadata as u64;
         }
     }
