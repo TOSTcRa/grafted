@@ -1533,100 +1533,100 @@ fn save_original_bytes() {
 /// These are compiler-generated helpers that read VWT from metadata that may
 /// have corrupted VWT pointers after Darwin→Linux translation.
 pub fn patch_binary_crash_sites() {
-    // Patch binary sites that read VWT from metadata[-1] where VWT may be 0x211
-    // (corrupted by runtime metadata initialization on our stubs).
-    // Pattern: mov -0x8(%reg),%rax; mov 0xNN(%rax),%rax → crash
-    // Fix: replace the VWT load with loading our universal stub VWT directly.
     let stub_meta = shim_unresolved_soft_metadata();
     let good_vwt = unsafe { *((stub_meta as *const u64).sub(1)) };
 
-    // Site 1: binary+0x10827: mov -0x8(%rsi),%rcx; mov 0x50(%rcx),%ecx
-    // Replace with: xor %ecx,%ecx; nop*5  (ecx=0 → takes simple path)
-    // NOP out indirect VWT function calls that crash on null/garbage VWT
-    // NOP the call to the problematic type init function from its caller
-    // at 0x10000fbcd (5-byte call instruction)
-    for &nop5_addr in &[0x10000fbcdu64] {
-        let target = nop5_addr as *mut u8;
-        let page = (target as usize & !0xFFF) as *mut libc::c_void;
-        unsafe {
-            if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                for k in 0..5 { *target.add(k) = 0x90; }
-                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
+    // === UNIFIED VWT FIX ===
+    // Scan ALL metadata in the binary's data segments and repair corrupted
+    // VWT pointers. swift_initStructMetadata writes garbage (0x211 etc.) to
+    // metadata[-1] during body getter. Fix them ALL in one pass.
+    let mut fixed_vwt = 0u32;
+    for addr in (0x100100000u64..0x100160000u64).step_by(8) {
+        let ptr = addr as *const u64;
+        let val = unsafe { std::ptr::read_volatile(ptr) };
+        if val >= 0x200 && val <= 0x202 {
+            let vwt = unsafe { std::ptr::read_volatile(ptr.sub(1)) };
+            if vwt > 0 && vwt < 0x100000 {
+                let vwt_addr = (addr - 8) as *mut u64;
+                let page = (vwt_addr as usize & !0xFFF) as *mut libc::c_void;
+                unsafe {
+                    libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE);
+                    std::ptr::write_volatile(vwt_addr, good_vwt);
+                    libc::mprotect(page, 8192, libc::PROT_READ);
+                }
+                fixed_vwt += 1;
             }
         }
     }
-
-    for &nop_addr in &[0x1000e43f2u64, 0x1000e446du64] {
-        let target = nop_addr as *mut u8;
-        let page = (target as usize & !0xFFF) as *mut libc::c_void;
-        unsafe {
-            if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                *target = 0x90; *target.add(1) = 0x90; *target.add(2) = 0x90;
-                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
-            }
-        }
+    if fixed_vwt > 0 {
+        log::info!("Unified VWT fix: repaired {} corrupted VWT pointers in binary data", fixed_vwt);
     }
 
-    // Patch VWT LOAD instructions in function 0x1000e41e0.
-    // Each site: mov -0x8(%rax),%rax (4b) + mov %rax,OFFSET(%rbp) (4-7b) = 8-11 bytes
-    // Replace with: mov rax, <good_vwt> (10 bytes) + nop fill
-    // This loads our valid VWT pointer so ALL subsequent field reads (+0x8, +0x40, +0x50) work.
-    // Sites 1 & 2: load VWT pointer → subsequent field reads (+0x8, +0x50) work
+    // === INDIVIDUAL PATCHES for heap-allocated metadata ===
+    // The VWT corruption at 0x211 happens in HEAP metadata created by
+    // swift_initStructMetadata during the body getter. These can't be found
+    // by scanning binary data segments. Patch the binary INSTRUCTIONS that
+    // read from these metadata to use our good_vwt instead.
+
+    // Function at 0x1000e41e0: replace VWT loads with good_vwt pointer
     for &load_addr in &[0x1000e4280u64, 0x1000e42d2u64] {
         let target = load_addr as *mut u8;
         let page = (target as usize & !0xFFF) as *mut libc::c_void;
         unsafe {
             if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                // mov rax, <good_vwt> (10 bytes) + nop (1 byte) = 11 bytes
-                *target = 0x48; *target.add(1) = 0xB8;
+                *target = 0x48; *target.add(1) = 0xB8; // mov rax, imm64
                 std::ptr::write_unaligned(target.add(2) as *mut u64, good_vwt);
-                *target.add(10) = 0x90;
+                *target.add(10) = 0x90; // nop
                 libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
             }
         }
     }
-    // Site 3: this 12-byte range includes the VWT.size read → load SIZE=8 directly
-    // (the next instruction is callq rounding which expects rax=size, not pointer)
+    // Site 3: load size=8 directly (next instruction expects size not pointer)
     {
         let target = 0x1000e432e as *mut u8;
         let page = (target as usize & !0xFFF) as *mut libc::c_void;
         unsafe {
             if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                // mov eax, 8 (5 bytes) + 7 nops = 12 bytes
-                *target = 0xB8; // mov eax, imm32
-                *target.add(1) = 8; *target.add(2) = 0; *target.add(3) = 0; *target.add(4) = 0;
+                *target = 0xB8; *target.add(1) = 8; // mov eax, 8
+                *target.add(2) = 0; *target.add(3) = 0; *target.add(4) = 0;
                 for k in 5..12 { *target.add(k) = 0x90; }
                 libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
             }
         }
     }
-    // Also patch the remaining VWT.size read at 0x1000e435b (uses rcx, 4 bytes)
-    {
-        let target = 0x1000e435b as *mut u8;
+    // VWT.size to rcx + VWT flags read + NOP indirect calls + NOP type init call
+    for &(addr, len, b0, b1) in &[
+        (0x1000e435bu64, 4u64, 0x6au8, 0x08u8),  // push 8; pop rcx; nop
+        (0x100010827u64, 7, 0x31, 0xC9),          // xor ecx,ecx; nops
+    ] {
+        let target = addr as *mut u8;
         let page = (target as usize & !0xFFF) as *mut libc::c_void;
         unsafe {
             if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                *target = 0x6a; *target.add(1) = 0x08; // push 8
-                *target.add(2) = 0x59; // pop rcx
-                *target.add(3) = 0x90; // nop
+                *target = b0; *target.add(1) = b1;
+                if len == 4 { *target.add(2) = 0x59; *target.add(3) = 0x90; }
+                else { for k in 2..(len as usize) { *target.add(k) = 0x90; } }
                 libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
             }
         }
     }
-    log::info!("Patched 3 VWT loads + 1 VWT.size in binary function 0x1000e41e0");
-
-    // Site at binary+0x10827: VWT flags read (7 bytes: xor ecx,ecx + nops)
-    {
-        let target = 0x100010827 as *mut u8;
+    // NOP VWT load+call in helper at 0x100010714 (9 bytes: load VWT + mov + callq)
+    // Also NOP indirect VWT function calls + problematic type init call
+    for &(addr, len) in &[
+        (0x100010714u64, 9u64), // VWT load + callq *(%rax) in helper
+        (0x1000e43f2u64, 3),    // callq *0x10(%rax)
+        (0x1000e446du64, 3),    // callq *0x8(%rax)
+    ] {
+        let target = addr as *mut u8;
         let page = (target as usize & !0xFFF) as *mut libc::c_void;
         unsafe {
             if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                *target = 0x31; *target.add(1) = 0xC9; // xor ecx,ecx
-                for i in 2..7 { *target.add(i) = 0x90; }
+                for k in 0..(len as usize) { *target.add(k) = 0x90; }
                 libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
             }
         }
     }
+    log::info!("Applied unified VWT scan + {} individual binary patches", 8);
 }
 
 /// Apply binary patches temporarily (before applicationDidFinishLaunching).
