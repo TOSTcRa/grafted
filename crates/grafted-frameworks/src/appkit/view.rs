@@ -1,7 +1,4 @@
-//! NSView — the base class for all visual elements.
-//!
-//! NSView provides a drawing surface (backed by a CGContext) and a
-//! coordinate system. Subclasses override drawRect: to render content.
+//! NSView - the base class for all visual elements.
 
 use crate::cg::geometry::*;
 
@@ -126,11 +123,11 @@ pub unsafe extern "C" fn ns_view_set_hidden(
     unsafe { (*view_data(self_)).hidden = flag };
 }
 
-/// ObjC method: -[NSView drawRect:] — base implementation clears with background color
+/// ObjC method: -[NSView drawRect:] - base implementation clears with background color
 pub unsafe extern "C" fn ns_view_draw_rect(
     _self: *mut u8,
     _sel: *mut u8,
     _rect: CGRect,
 ) {
-    // Base implementation does nothing — subclasses override this
+    // Base implementation does nothing - subclasses override this
 }

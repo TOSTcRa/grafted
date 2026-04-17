@@ -1,7 +1,4 @@
-//! NSWindow — wraps WindowServer bridge windows with ObjC interface.
-//!
-//! NSWindow manages a CGContext for drawing and an X11 window via the
-//! WindowServer bridge. Content is drawn by the window's contentView.
+//! NSWindow - wraps WindowServer bridge windows with ObjC interface.
 
 use crate::cg::geometry::*;
 use crate::cg::context;
@@ -165,7 +162,7 @@ pub unsafe extern "C" fn ns_window_content_view(
     data.content_view
 }
 
-/// ObjC method: -[NSWindow graphicsContext] — returns the CGContext
+/// ObjC method: -[NSWindow graphicsContext] - returns the CGContext
 pub unsafe extern "C" fn ns_window_graphics_context(
     self_: *mut u8,
     _sel: *mut u8,

@@ -1,12 +1,19 @@
-//! NSApplication — the application singleton and main event loop.
-//!
-//! NSApplication owns the main run loop and dispatches events to windows.
-//! On Darwin: [NSApplication sharedApplication] creates the singleton,
-//! [NSApp run] enters the main event loop.
+//! NSApplication - the application singleton and main event loop.
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use crate::ws::display;
 use crate::cf::runloop;
+
+// Test-only stubs for symbols normally resolved from grafted-loader. When
+#[cfg(test)]
+#[unsafe(no_mangle)]
+extern "C" fn grafted_try_call(_f: unsafe extern "C" fn(*mut u8, *mut u8), _a: *mut u8, _b: *mut u8) -> bool { true }
+#[cfg(test)]
+#[unsafe(no_mangle)]
+extern "C" fn grafted_set_lifecycle_skip_mode(_active: bool) {}
+#[cfg(test)]
+#[unsafe(no_mangle)]
+extern "C" fn grafted_nop_saved_crash_sites() -> u32 { 0 }
 
 /// Global application state (singleton).
 static APP_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -24,7 +31,7 @@ pub unsafe extern "C" fn ns_application_shared(
     let ptr = SHARED_APP.load(Ordering::Acquire);
     if !ptr.is_null() { return ptr; }
 
-    // Create singleton — allocate a minimal ObjC object
+    // Create singleton - allocate a minimal ObjC object
     let obj = unsafe { libc::calloc(1, 256) } as *mut u8;
     SHARED_APP.store(obj, Ordering::Release);
 
@@ -43,9 +50,7 @@ pub unsafe extern "C" fn ns_application_run(
 ) {
     APP_RUNNING.store(true, Ordering::Release);
 
-    // No fallback window — the body getter creates the app's own window
-    // via grafted_swiftui_create_window. For non-SwiftUI apps, NSWindow.init
-    // calls go through our X11 bridge directly.
+    // No fallback window - the body getter creates the app's own window
 
     log::info!("NSApplication: entering main run loop");
 
@@ -65,7 +70,7 @@ pub unsafe extern "C" fn ns_application_run(
                 }
                 display::DisplayEvent::KeyDown { keycode, .. } => {
                     log::debug!("NSApplication: keyDown {}", keycode);
-                    if *keycode == 9 { // Escape → quit
+                    if *keycode == 9 { // Escape -> quit
                         APP_TERMINATED.store(true, Ordering::Release);
                     }
                 }
@@ -88,28 +93,24 @@ pub unsafe extern "C" fn ns_application_run(
 }
 
 /// Find the body getter function by scanning the conformance descriptor's
-/// witness table pattern for relative pointers that resolve to __TEXT addresses.
-/// `search_addr` can be either a conformance descriptor or a metadata address.
 fn find_body_getter(search_addr: u64) -> Option<u64> {
     if search_addr < 0x1000 { return None; }
 
     // Determine if this is a conformance descriptor (in __DATA_CONST range)
     // or metadata (on heap or in __DATA)
     let conf_addr = if search_addr >= 0x100100000 && search_addr < 0x100140000 {
-        // Likely in __DATA_CONST — treat as conformance descriptor
+        // Likely in __DATA_CONST - treat as conformance descriptor
         search_addr
     } else {
-        // Metadata address — scan __swift5_proto to find matching conformance.
-        // Each entry in __swift5_proto is a 4-byte relative pointer to a conformance.
-        // We scan for one whose type descriptor matches our metadata's descriptor.
+        // Metadata address - scan __swift5_proto to find matching conformance.
 
-        // Read the type descriptor from metadata (for struct: at +8 after Darwin→Linux translation)
+        // Read the type descriptor from metadata (for struct: at +8 after Darwin->Linux translation)
         // For struct metadata (kind=0x200): descriptor at +8
         let kind = unsafe { *(search_addr as *const u64) };
         let type_desc = if kind == 0x200 {
             unsafe { *((search_addr + 8) as *const u64) }
         } else {
-            // For class metadata with Darwin→Linux translation: description at +40
+            // For class metadata with Darwin->Linux translation: description at +40
             unsafe { *((search_addr + 40) as *const u64) }
         };
 
@@ -160,7 +161,7 @@ fn find_body_getter(search_addr: u64) -> Option<u64> {
             let first_byte = unsafe { *(addr as *const u8) };
             if first_byte == 0x55 || first_byte == 0x53 || first_byte == 0x48
                 || first_byte == 0x41 || first_byte == 0x50 {
-                log::info!("  wt[{i}] → {addr:#x} — body getter function!");
+                log::info!("  wt[{i}] -> {addr:#x} - body getter function!");
                 return Some(addr);
             }
         }
@@ -178,7 +179,7 @@ pub extern "C" fn grafted_log_raw(s1: u64, s2: u64) {
 }
 
 /// Called from our compiled SwiftUI.swift when WindowGroup/MenuBarExtra creates a window.
-/// This is the REAL bridge: Swift code → grafted C function → X11 window.
+/// This is the REAL bridge: Swift code -> grafted C function -> X11 window.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafted_swiftui_create_window(title: *const i8, w: i32, h: i32) -> i32 {
     let title_str = if title.is_null() {
@@ -293,7 +294,7 @@ pub extern "C" fn grafted_call_content_closure(fn_ptr: u64, context: u64) -> i32
     let f: ClosureFn = unsafe { std::mem::transmute(fn_ptr) };
     unsafe { f(ret_buf, context) };
 
-    log::info!("Content closure returned — rendering view tree");
+    log::info!("Content closure returned - rendering view tree");
     unsafe { libc::free(ret_buf as *mut libc::c_void) };
     1
 }
@@ -431,7 +432,7 @@ fn render_view_tree() {
     log::info!("Rendered {} views into window", views.len());
 }
 
-/// Called from SwiftUI.swift App.main() after body is evaluated — enters the run loop.
+/// Called from SwiftUI.swift App.main() after body is evaluated - enters the run loop.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafted_swiftui_run_loop() {
     // Render the Maccy UI (replaces render_view_tree which was empty for this app)
@@ -475,9 +476,18 @@ pub extern "C" fn grafted_swiftui_run_loop() {
             log::info!("  IMP at {:#x}", imp_addr);
 
             // The ObjC IMP points to a trampoline:
-            //   pushq %rbp; movq %rsp,%rbp; leaq OFFSET(%rip),%rcx; popq %rbp; jmp thunk
-            // Read the leaq instruction at IMP+4 to extract the real Swift impl address.
             let imp_ptr = imp_addr as *const u8;
+
+            // Verify IMP is in a reasonable range before reading memory
+            if imp_addr < 0x100000000 || imp_addr > 0x200000000 {
+                log::warn!("  IMP address {:#x} outside expected range, using ObjC dispatch", imp_addr);
+                type DidFinishFn = unsafe extern "C" fn(*mut u8, *mut core::ffi::c_void, *mut u8);
+                let func: DidFinishFn = unsafe { std::mem::transmute(imp) };
+                unsafe { func(app_del, did_finish_sel as *mut _, notification) };
+                log::info!("applicationDidFinishLaunching: completed via ObjC!");
+                return;
+            }
+
             // Verify the memory is readable by checking if it's in the binary range
             let byte0 = unsafe { std::ptr::read_volatile(imp_ptr) };
             log::info!("  IMP byte0={:#x}", byte0);
@@ -490,31 +500,59 @@ pub extern "C" fn grafted_swiftui_run_loop() {
                 let rel = unsafe { std::ptr::read_unaligned(imp_ptr.add(7) as *const i32) };
                 let rip_after = imp_addr + 11;
                 let real_impl = (rip_after as i64 + rel as i64) as u64;
-                log::info!("  real Swift impl at {:#x} (rel={})", real_impl, rel);
+                log::info!("  real Swift impl at {:#x} (rel={}) from rip_after={:#x}", real_impl, rel, rip_after);
 
-                // Verify the computed address is in the binary range
-                if real_impl >= 0x100000000 && real_impl < 0x100200000 {
+                // Verify the computed address is non-null and in the binary range
+                if real_impl != 0 && real_impl >= 0x100000000 && real_impl < 0x100200000 {
                     let notif_buf = unsafe { libc::calloc(1, 256) } as *mut u8;
-                    log::info!("  calling applicationDidFinishLaunching at {:#x} (with crash recovery + temp patches)...", real_impl);
-                    // Patch binary crash sites + apply temporary runtime patches
-                    crate::registry::patch_binary_crash_sites();
+                    log::info!("  calling applicationDidFinishLaunching at {:#x} (with crash recovery + temp patches + frame-walk skip)...", real_impl);
+                    // Apply temporary runtime patches
                     crate::registry::LIFECYCLE_PATCHES_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
                     crate::registry::apply_lifecycle_patches();
+                    // Retry lifecycle call multiple times. Each crash is recovered via
+                    unsafe extern "C" {
+                        fn grafted_try_call(f: unsafe extern "C" fn(*mut u8, *mut u8), a: *mut u8, b: *mut u8) -> bool;
+                        fn grafted_set_lifecycle_skip_mode(active: bool);
+                        fn grafted_nop_saved_crash_sites() -> u32;
+                    }
+                    // Step 0.B: single attempt by default + skip-mode off by default.
+                    let legacy = std::env::var("GRAFTED_LEGACY_PATCHES")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
+                    unsafe { grafted_set_lifecycle_skip_mode(legacy) };
                     type RealImplFn = unsafe extern "C" fn(*mut u8, *mut u8);
                     let f: RealImplFn = unsafe { std::mem::transmute(real_impl) };
-                    unsafe extern "C" { fn grafted_try_call(f: unsafe extern "C" fn(*mut u8, *mut u8), a: *mut u8, b: *mut u8) -> bool; }
-                    let ok = unsafe { grafted_try_call(f, app_del, notif_buf) };
+                    let max_retries: u32 = 1;
+                    let mut ok = false;
+                    for attempt in 0..max_retries {
+                        let result = unsafe { grafted_try_call(f, app_del, notif_buf) };
+                        if result {
+                            ok = true;
+                            break;
+                        }
+                        // NOP-patch crash sites saved by the signal handler.
+                        // mprotect is safe here (outside signal handler, no SUD conflict).
+                        let nop_count = unsafe { grafted_nop_saved_crash_sites() };
+                        if attempt < max_retries - 1 {
+                            log::info!("  lifecycle attempt {} crashed - NOP'd {} sites, retrying...", attempt + 1, nop_count);
+                        }
+                    }
+                    unsafe { grafted_set_lifecycle_skip_mode(false) };
                     crate::registry::restore_lifecycle_patches();
                     crate::registry::LIFECYCLE_PATCHES_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
                     unsafe { libc::free(notif_buf as *mut libc::c_void) };
                     if ok {
                         log::info!("applicationDidFinishLaunching: completed!");
                     } else {
-                        log::warn!("applicationDidFinishLaunching: crashed (recovered via longjmp)");
+                        log::warn!("applicationDidFinishLaunching: crashed {} times (giving up)", max_retries);
                     }
+                } else {
+                    log::warn!("  computed Swift impl address is invalid: {:#x} (rel={} from rip_after={:#x})", real_impl, rel, rip_after);
+                    log::warn!("  falling back to ObjC dispatch");
+                    // Fall through to ObjC dispatch
                 }
             } else {
-                // Not a trampoline — call through ObjC dispatch as fallback
+                // Not a trampoline - call through ObjC dispatch as fallback
                 log::info!("  not a trampoline (bytes: {:02x} {:02x} {:02x}), calling via ObjC", byte4, byte5, byte6);
                 type DidFinishFn = unsafe extern "C" fn(*mut u8, *mut core::ffi::c_void, *mut u8);
                 let func: DidFinishFn = unsafe { std::mem::transmute(imp) };
@@ -555,7 +593,7 @@ pub unsafe extern "C" fn ns_application_activate(
     _sel: *mut u8,
     _flag: bool,
 ) {
-    // No-op on Linux — we don't have app activation semantics
+    // No-op on Linux - we don't have app activation semantics
 }
 
 /// ObjC method: -[NSApplication setActivationPolicy:]
@@ -568,8 +606,6 @@ pub unsafe extern "C" fn ns_application_set_activation_policy(
 }
 
 /// C entry point: NSApplicationMain (called from main() in Cocoa apps)
-/// Also used as SwiftUI App.main() — receives Swift type metadata + witness table
-/// instead of argc/argv. We detect which calling convention based on arg values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn NSApplicationMain(
     arg0: u64,  // argc (C) or type_metadata (Swift)
@@ -581,20 +617,16 @@ pub unsafe extern "C" fn NSApplicationMain(
     let is_swift = arg0 > 0x1000;
 
     if is_swift {
-        log::info!("NSApplicationMain: Swift App.main() — metadata={:#x}", arg0);
+        log::info!("NSApplicationMain: Swift App.main() - metadata={:#x}", arg0);
 
         // The metadata addr was saved by grafted_swiftui_save_conformance.
-        // Search __swift5_proto for a conformance descriptor whose type
-        // matches this metadata, then find and call the body getter.
         let conf_addr = SWIFT_CONFORMANCE_ADDR.load(std::sync::atomic::Ordering::Acquire);
 
         // If no conformance stored, search for it using the metadata address.
-        // The conformance's type field is a relative pointer to the type descriptor,
-        // which is at metadata[1] (struct) or metadata+64/+40 (class).
         let search_addr = if conf_addr > 0 { conf_addr } else { arg0 };
 
         if let Some(body_fn) = find_body_getter(search_addr) {
-            log::info!("  body getter at {:#x} — calling binary's own code!", body_fn);
+            log::info!("  body getter at {:#x} - calling binary's own code!", body_fn);
 
             let instance = unsafe { libc::calloc(1, 512) } as *mut u8;
 
@@ -615,27 +647,14 @@ pub unsafe extern "C" fn NSApplicationMain(
                 if !app_del.is_null() {
                     app_del = unsafe { grafted_objc::objc_msgSend(app_del as *mut _, init_sel) as *mut u8 };
                     log::info!("Created AppDelegate: {:p}", app_del);
-                    // Fill stored property slots (+16..+256) with valid stub objects
-                    // so applicationDidFinishLaunching doesn't null-deref on self.property
-                    for offset in (16..256).step_by(8) {
-                        let field = unsafe { *((app_del as *const u64).add(offset / 8)) };
-                        if field == 0 {
-                            // Allocate a stub object with valid isa + immortal refcount
-                            let stub = unsafe { libc::calloc(1, 512) } as *mut u64;
-                            unsafe {
-                                *stub = cls as u64;                    // isa → AppDelegate class
-                                *stub.add(1) = 0xFFFFFFFFFFFFFFFF;     // immortal refcount
-                                // Fill fields as empty Swift Strings: (0, 0xE000000000000000)
-                                // This prevents null-deref in String operations on stub fields
-                                for j in (2..60).step_by(2) {
-                                    *stub.add(j) = 0;
-                                    *stub.add(j + 1) = 0xE000000000000000;
-                                }
-                            }
-                            unsafe { *((app_del as *mut u64).add(offset / 8)) = stub as u64; }
+                    // Fill stored property body with empty Swift String patterns DIRECTLY.
+                    for idx in (2..64).step_by(2) {
+                        unsafe {
+                            *((app_del as *mut u64).add(idx)) = 0;
+                            *((app_del as *mut u64).add(idx + 1)) = 0xE000000000000000;
                         }
                     }
-                    log::info!("  filled {} stored property slots with stubs", (256 - 16) / 8);
+                    log::info!("  filled stored properties with String-safe empty patterns");
                 }
                 // Save globally so grafted_swiftui_run_loop can call lifecycle methods
                 APP_DELEGATE_PTR.store(app_del, std::sync::atomic::Ordering::Release);
@@ -652,9 +671,6 @@ pub unsafe extern "C" fn NSApplicationMain(
             unsafe { *(instance as *mut *mut u8) = app_del };
 
             // Initialize _hiddenMenu (field[1]) State<Bool> to true.
-            // Read metadata to find field offsets. For struct metadata:
-            //   +0: kind (u64), +8: descriptor (u64)
-            //   +16: field offset vector (u32 per field)
             let meta = arg0 as *const u8;
             let kind = unsafe { *(meta as *const u64) };
             let desc = unsafe { *((meta as *const u64).add(1)) };
@@ -700,21 +716,16 @@ pub unsafe extern "C" fn NSApplicationMain(
             }
 
             // Call the body getter. Swift method witnesses use this convention:
-            //   fn(self: *mut App, metadata: *const Metadata, witness_table: *const WitnessTable)
-            // We pass our zeroed instance, the metadata, and a fake witness table.
             let fake_wt = unsafe { libc::calloc(1, 256) } as *mut u8;
             type BodyGetter = unsafe extern "C" fn(*mut u8, u64, *mut u8);
             let getter: BodyGetter = unsafe { std::mem::transmute(body_fn) };
             unsafe { getter(instance, arg0, fake_wt) };
 
-            log::info!("  body getter executed — app's own UI created");
+            log::info!("  body getter executed - app's own UI created");
 
             // NOTE: applicationDidFinishLaunching is called from grafted_swiftui_run_loop
-            // (which the body getter enters via _grafted_run_loop). This code path
-            // is unreachable because the body getter never returns — it enters the
-            // event loop directly. Kept as documentation of the intended flow.
         } else {
-            log::warn!("  body getter not found — showing fallback window");
+            log::warn!("  body getter not found - showing fallback window");
         }
     }
 

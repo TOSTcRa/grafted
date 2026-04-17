@@ -1,4 +1,4 @@
-//! NSEvent — input events routed from WindowServer to the application.
+//! NSEvent - input events routed from WindowServer to the application.
 
 use crate::cg::geometry::*;
 

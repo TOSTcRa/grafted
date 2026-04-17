@@ -1,7 +1,4 @@
-//! NSMenu + NSMenuItem — application menus.
-//!
-//! Every macOS app has a menu bar. NSMenu holds NSMenuItems, each with
-//! a title, key equivalent, and action selector.
+//! NSMenu + NSMenuItem - application menus.
 
 use crate::cf::string::CFStringInner;
 
