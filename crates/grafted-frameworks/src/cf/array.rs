@@ -1,4 +1,4 @@
-//! CFArray — ordered collection of CFTypeRef values.
+//! CFArray - ordered collection of CFTypeRef values.
 
 use super::types::*;
 

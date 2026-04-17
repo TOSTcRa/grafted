@@ -1,7 +1,4 @@
-//! CFString — Core Foundation's universal string type.
-//!
-//! Toll-free bridged with NSString. Supports both UTF-8 and UTF-16 access.
-//! Darwin apps use CFString for everything: file paths, dict keys, UI labels.
+//! CFString - Core Foundation's universal string type.
 
 use super::types::*;
 

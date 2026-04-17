@@ -1,8 +1,4 @@
-//! Display server — manages windows and bridges CGContext to X11.
-//!
-//! This is our WindowServer equivalent. It maintains a table of windows,
-//! each backed by a CGContext for rendering. The display loop blits pixel
-//! buffers to X11 and routes X11 events back to the application.
+//! Display server - manages windows and bridges CGContext to X11.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

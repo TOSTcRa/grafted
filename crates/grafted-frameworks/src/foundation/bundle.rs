@@ -1,7 +1,4 @@
-//! NSBundle — access to the .app bundle's resources.
-//!
-//! Apps use NSBundle to find Info.plist, nib files, images, and localizations.
-//! We read from the actual filesystem .app bundle structure.
+//! NSBundle - access to the .app bundle's resources.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +22,7 @@ pub unsafe extern "C" fn ns_bundle_main(_cls: *mut u8, _sel: *mut u8) -> *mut u8
         if !MAIN_BUNDLE.is_null() { return MAIN_BUNDLE; }
         let obj = libc::calloc(1, 1024) as *mut u8;
         // Try to find .app bundle from executable path
-        // Convention: /path/to/Foo.app/Contents/MacOS/Foo → bundle = /path/to/Foo.app
+        // Convention: /path/to/Foo.app/Contents/MacOS/Foo -> bundle = /path/to/Foo.app
         let exe = std::env::args().next().unwrap_or_default();
         let bundle_path = find_app_bundle(&exe).unwrap_or_else(|| PathBuf::from("."));
         let path_bytes = bundle_path.to_string_lossy();
@@ -67,7 +64,7 @@ pub unsafe extern "C" fn ns_bundle_resource_path(self_: *mut u8, _sel: *mut u8) 
     }
 }
 
-/// ObjC: -[NSBundle infoDictionary] — returns empty dictionary for now
+/// ObjC: -[NSBundle infoDictionary] - returns empty dictionary for now
 pub unsafe extern "C" fn ns_bundle_info_dict(_self: *mut u8, _sel: *mut u8) -> *mut u8 {
     unsafe {
         crate::cf::dictionary::CFDictionaryCreateMutable(

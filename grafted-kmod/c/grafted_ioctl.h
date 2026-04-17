@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * grafted_ioctl.h — ioctl definitions for /dev/grafted
+ * grafted_ioctl.h - ioctl definitions for /dev/grafted
  *
  * These must match the definitions in crates/grafted-kernel/src/ioctl.rs
  */
@@ -11,7 +11,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-/* ioctl magic number — 'G' for Grafted */
+/* ioctl magic number - 'G' for Grafted */
 #define GRAFTED_IOC_MAGIC 'G'
 
 /* Ping the module, returns version in arg */
@@ -23,7 +23,7 @@
 /* Unregister current process */
 #define GRAFTED_IOC_UNREGISTER  _IO(GRAFTED_IOC_MAGIC, 2)
 
-/* Translate a Mach trap — pass trap number and args, get result */
+/* Translate a Mach trap - pass trap number and args, get result */
 struct grafted_mach_trap {
     __u32 trap_number;
     __u64 args[6];

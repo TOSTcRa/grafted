@@ -1,8 +1,4 @@
 //! CTFont + bitmap text rendering.
-//!
-//! Built-in 8x16 monospace font for basic text display. Each ASCII character
-//! (32-126) is stored as 16 bytes, 1 bit per pixel, 8 pixels wide.
-//! This lets us render text without external font libraries.
 
 use crate::cf::types::*;
 use crate::cg::geometry::*;
@@ -81,7 +77,7 @@ pub unsafe extern "C" fn CTFontGetLeading(_font: CTFontRef) -> CGFloat {
 }
 
 /// Draw a string into a CGContext using the built-in bitmap font.
-/// This is our primary text rendering path — called from NSView drawing code.
+/// This is our primary text rendering path - called from NSView drawing code.
 pub fn draw_text_bitmap(ctx: CGContextRef, text: &str, x: f64, y: f64, color: [f64; 4], scale: f64) {
     if ctx.is_null() || text.is_empty() { return; }
     let c = unsafe { &mut *ctx };
@@ -153,7 +149,7 @@ pub unsafe extern "C" fn CTLineCreateWithAttributedString(
 pub unsafe extern "C" fn CTLineDraw(line: CTLineRef, ctx: CGContextRef) {
     if line.is_null() || ctx.is_null() { return; }
     let inner = unsafe { &*line };
-    // Draw at origin (0,0) — caller should have set CTM
+    // Draw at origin (0,0) - caller should have set CTM
     draw_text_bitmap(ctx, &inner.text, 0.0, 0.0, [0.0, 0.0, 0.0, 1.0], 1.0);
 }
 

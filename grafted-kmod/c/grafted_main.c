@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * grafted_main.c — Grafted kernel module entry point
+ * grafted_main.c - Grafted kernel module entry point
  *
  * Registers the module and initializes the /dev/grafted char device
  * for userspace communication.
@@ -39,5 +39,5 @@ module_exit(grafted_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Grafted Contributors");
-MODULE_DESCRIPTION("Darwin compatibility layer — Mach trap and syscall translation");
+MODULE_DESCRIPTION("Darwin compatibility layer - Mach trap and syscall translation");
 MODULE_VERSION("0.1.0");

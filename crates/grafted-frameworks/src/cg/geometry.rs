@@ -1,5 +1,4 @@
-//! CG geometry types — CGPoint, CGSize, CGRect, CGAffineTransform.
-//! These are plain C structs used throughout all Darwin frameworks.
+//! CG geometry types - CGPoint, CGSize, CGRect, CGAffineTransform.
 
 pub type CGFloat = f64;
 

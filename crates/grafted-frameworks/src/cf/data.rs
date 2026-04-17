@@ -1,4 +1,4 @@
-//! CFData — immutable/mutable byte buffer.
+//! CFData - immutable/mutable byte buffer.
 
 use super::types::*;
 

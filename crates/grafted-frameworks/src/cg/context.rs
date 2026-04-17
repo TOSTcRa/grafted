@@ -1,8 +1,4 @@
-//! CGContext — 2D drawing context with software pixel buffer backend.
-//!
-//! This is the core rendering surface. Darwin apps draw into CGContexts
-//! which are then composited by WindowServer. We back them with BGRA pixel
-//! buffers that can be blitted to X11 XImage or Wayland wl_shm_buffer.
+//! CGContext - 2D drawing context with software pixel buffer backend.
 
 use super::geometry::*;
 use super::color::CGColorSpaceRef;

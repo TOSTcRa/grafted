@@ -1,7 +1,4 @@
-//! NSString — toll-free bridged to CFString.
-//!
-//! On Darwin, NSString and CFString are the same object. We implement NSString
-//! methods as ObjC methods on the NSString class that operate on CFStringInner.
+//! NSString - toll-free bridged to CFString.
 
 use crate::cf::string::CFStringInner;
 use crate::cf::types::*;
@@ -40,7 +37,7 @@ pub unsafe extern "C" fn ns_string_with_utf8(
     }
 }
 
-/// ObjC: +[NSString stringWithFormat:] (simplified — just returns the format string)
+/// ObjC: +[NSString stringWithFormat:] (simplified - just returns the format string)
 pub unsafe extern "C" fn ns_string_with_format(
     _cls: *mut u8, _sel: *mut u8, format: *mut u8,
 ) -> *mut u8 {
@@ -49,7 +46,7 @@ pub unsafe extern "C" fn ns_string_with_format(
     format
 }
 
-/// ObjC: -[NSString description] — returns self
+/// ObjC: -[NSString description] - returns self
 pub unsafe extern "C" fn ns_string_description(self_: *mut u8, _sel: *mut u8) -> *mut u8 {
     self_
 }

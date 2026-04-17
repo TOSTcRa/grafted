@@ -78,7 +78,7 @@ public struct MenuBarExtra<Label, Content>: Scene {
         _grafted_create_window("App", 400, 500)
     }
 
-    // DARWIN ABI OVERRIDE — the actual symbol the binary calls
+    // DARWIN ABI OVERRIDE - the actual symbol the binary calls
     // ABI layout (from disassembly of Maccy body getter):
     //   rdi,rsi = LocalizedStringKey (Darwin small string)
     //   rdx,rcx,r8,r9 = Binding<Bool> parts
@@ -103,7 +103,7 @@ public struct MenuBarExtra<Label, Content>: Scene {
             let _ = _grafted_call_closure(closureFn, closureCtx)
         }
 
-        // Enter event loop — the real Maccy UI comes from AppDelegate,
+        // Enter event loop - the real Maccy UI comes from AppDelegate,
         // not from this content closure (which returns EmptyView).
         _grafted_run_loop()
         fatalError("unreachable")

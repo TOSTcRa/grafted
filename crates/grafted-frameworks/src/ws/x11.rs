@@ -1,7 +1,4 @@
-//! Raw X11 bindings via dlopen — no compile-time libX11 dependency.
-//!
-//! Functions are loaded at runtime from libX11.so.6. If X11 is not available
-//! (headless server, Wayland-only), all operations gracefully return None.
+//! Raw X11 bindings via dlopen - no compile-time libX11 dependency.
 
 use std::ffi::CString;
 use std::sync::OnceLock;
@@ -96,7 +93,7 @@ impl X11Lib {
         let lib_name = CString::new("libX11.so.6").ok()?;
         let handle = unsafe { libc::dlopen(lib_name.as_ptr(), libc::RTLD_LAZY) };
         if handle.is_null() {
-            log::info!("X11: libX11.so.6 not found — running headless");
+            log::info!("X11: libX11.so.6 not found - running headless");
             return None;
         }
 

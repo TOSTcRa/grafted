@@ -1,19 +1,18 @@
-//! CFDictionary — key-value store used throughout Darwin for configuration,
-//! property lists, user defaults, and framework communication.
+//! CFDictionary - key-value store used throughout Darwin for configuration,
 
 use std::collections::HashMap;
 use super::types::*;
 
 pub type CFDictionaryRef = *const CFDictionaryInner;
 
-// Callback types (simplified — we use pointer equality for keys)
+// Callback types (simplified - we use pointer equality for keys)
 pub type CFDictionaryKeyCallBacks = *const core::ffi::c_void;
 pub type CFDictionaryValueCallBacks = *const core::ffi::c_void;
 
 #[repr(C)]
 pub struct CFDictionaryInner {
     pub base: CFRuntimeBase,
-    pub entries: HashMap<usize, CFTypeRef>, // key pointer → value pointer
+    pub entries: HashMap<usize, CFTypeRef>, // key pointer -> value pointer
 }
 
 #[unsafe(no_mangle)]
@@ -116,7 +115,7 @@ pub unsafe extern "C" fn CFDictionaryRemoveValue(
     }
 }
 
-// Standard callback constants (stubs — we use pointer identity)
+// Standard callback constants (stubs - we use pointer identity)
 #[unsafe(no_mangle)]
 pub static kCFTypeDictionaryKeyCallBacks: [usize; 6] = [0; 6];
 #[unsafe(no_mangle)]

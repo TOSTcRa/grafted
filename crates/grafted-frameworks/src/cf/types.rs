@@ -1,7 +1,4 @@
-//! CF type system — reference counting, type IDs, CFTypeRef.
-//!
-//! Every CF object starts with a CFRuntimeBase header containing the type ID
-//! and reference count. CFTypeRef is an opaque pointer to this header.
+//! CF type system - reference counting, type IDs, CFTypeRef.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -68,9 +65,6 @@ impl CFRuntimeBase {
 }
 
 /// Get the type ID from any CFTypeRef.
-///
-/// # Safety
-/// `cf` must be a valid CF object pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID {
     if cf.is_null() { return 0; }
@@ -112,7 +106,7 @@ pub unsafe extern "C" fn CFRelease(cf: CFTypeRef) {
                 let _ = unsafe { Box::from_raw(cf as *mut super::data::CFDataInner) };
             }
             _ => {
-                // Unknown type — just drop the base allocation
+                // Unknown type - just drop the base allocation
                 let _ = unsafe { Box::from_raw(cf as *mut CFRuntimeBase) };
             }
         }
@@ -153,7 +147,7 @@ pub unsafe extern "C" fn CFHash(cf: CFTypeRef) -> CFHashCode {
 #[unsafe(no_mangle)] pub extern "C" fn CFBooleanGetTypeID() -> CFTypeID { CF_BOOLEAN_TYPE_ID }
 #[unsafe(no_mangle)] pub extern "C" fn CFNumberGetTypeID() -> CFTypeID { CF_NUMBER_TYPE_ID }
 
-// Allocator stubs — always use the default allocator
+// Allocator stubs - always use the default allocator
 pub type CFAllocatorRef = *const core::ffi::c_void;
 pub const K_CF_ALLOCATOR_DEFAULT: CFAllocatorRef = core::ptr::null();
 

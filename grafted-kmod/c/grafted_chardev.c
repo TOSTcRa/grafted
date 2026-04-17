@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * grafted_chardev.c — /dev/grafted misc character device
+ * grafted_chardev.c - /dev/grafted misc character device
  *
  * Provides ioctl interface for userspace to request Mach trap handling
  * and syscall translation from the kernel module.
@@ -101,7 +101,7 @@ static struct miscdevice grafted_misc = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name  = "grafted",
 	.fops  = &grafted_fops,
-	.mode  = 0660,  /* owner + group can access — add users to 'grafted' group */
+	.mode  = 0660,  /* owner + group can access - add users to 'grafted' group */
 };
 
 int grafted_chardev_init(void)
