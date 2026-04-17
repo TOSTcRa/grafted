@@ -1,9 +1,4 @@
 //! Register a Mach-O binary's __swift5_* sections with the Linux Swift runtime.
-//!
-//! The Swift runtime uses `swift_addNewDSOImage` to learn about type metadata,
-//! protocol conformances, and type descriptors in loaded binaries. Since our
-//! Mach-O binary is mmap'd (not loaded via dlopen), the runtime can't find it
-//! automatically. We extract the section addresses and register them manually.
 
 use std::ffi::CString;
 
@@ -49,7 +44,7 @@ pub fn register_swift_sections(binary_data: &[u8], slide: u64) {
     let func_name = CString::new("swift_addNewDSOImage").unwrap();
     let func_ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, func_name.as_ptr()) };
     if func_ptr.is_null() {
-        log::debug!("swift_addNewDSOImage not found — Swift runtime not loaded");
+        log::debug!("swift_addNewDSOImage not found - Swift runtime not loaded");
         return;
     }
     let swift_add: unsafe extern "C" fn(*const MetadataSections) =

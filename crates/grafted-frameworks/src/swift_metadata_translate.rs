@@ -1,20 +1,4 @@
 //! Swift Metadata Translation Layer
-//!
-//! Translates Mach-O Swift class metadata layout into a form the Linux
-//! Swift runtime can consume. Runs AFTER chained fixups (which resolve
-//! absolute pointers) but BEFORE swift_addNewDSOImage (which hands
-//! metadata to the runtime).
-//!
-//! What we fix:
-//! 1. ObjC class prefix: ensure class_data (+32) is non-NULL
-//! 2. Swift description pointer: ensure it resolves to the type descriptor
-//! 3. Metaclass layout: ensure metaclass has valid data too
-//! 4. Generic argument pointers: ensure they're not NULL/soft-stub
-//!
-//! What we DON'T touch:
-//! - Relative pointers in __swift5_* sections (they're position-independent)
-//! - Chained fixup results (already correct)
-//! - Value witness tables (allocated by the runtime)
 
 /// Translate all Swift class metadata in a mapped Mach-O binary.
 /// Must be called AFTER apply_fixups and BEFORE register_swift_sections.
@@ -92,37 +76,12 @@ fn fix_class_descriptor(descriptor_addr: u64) -> Option<u32> {
     let positive_size = unsafe { *((descriptor_addr + 28) as *const u32) } as usize;
 
     // The metadata access function, when called, returns a pointer to the
-    // metadata. But we can also find statically-emitted metadata by scanning
-    // __DATA for class metadata records that reference this descriptor.
-    //
-    // For non-generic classes, the metadata is the canonical instance.
-    // For generic classes, there may be pre-specialized instances.
 
     let _ = (negative_size, positive_size, is_generic);
-    Some(0) // descriptor itself doesn't need fixing — the metadata records do
+    Some(0) // descriptor itself doesn't need fixing - the metadata records do
 }
 
 /// Translate Darwin class metadata layout to Linux layout.
-///
-/// The key difference: Darwin has ObjC cache_t (16 bytes) at +16, which
-/// shifts ALL subsequent fields by 24 bytes compared to Linux:
-///
-///   Field                  Darwin offset   Linux offset
-///   isa                    +0              +0
-///   superclass             +8              +8
-///   cache_t (ObjC)         +16 (16 bytes)  (not present)
-///   class_data_bits        +32             (not present)
-///   Swift Flags            +40             +16
-///   InstanceAddressPoint   +44             +20
-///   InstanceSize           +48             +24
-///   InstanceAlignMask      +52             +28
-///   Reserved               +54             +30
-///   ClassSize              +56             +32
-///   ClassAddressPoint      +60             +36
-///   Description            +64             +40
-///
-/// The translation copies Swift-specific fields from Darwin offsets to
-/// Linux offsets IN-PLACE so the Linux runtime reads correct values.
 fn fix_objc_class_prefix(cls_addr: u64) -> bool {
     if cls_addr < 0x1000 { return false; }
 
@@ -143,27 +102,14 @@ fn fix_objc_class_prefix(cls_addr: u64) -> bool {
     unsafe { libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE) };
 
     // Copy Swift fields from Darwin offsets to Linux offsets (shift by -24)
-    // Darwin +40 → Linux +16 (Flags, 4 bytes)
-    // Darwin +44 → Linux +20 (InstanceAddressPoint, 4 bytes)
-    // Darwin +48 → Linux +24 (InstanceSize, 4 bytes)
-    // Darwin +52 → Linux +28 (InstanceAlignMask, 2 bytes)
-    // Darwin +54 → Linux +30 (Reserved, 2 bytes)
-    // Darwin +56 → Linux +32 (ClassSize, 4 bytes)
-    // Darwin +60 → Linux +36 (ClassAddressPoint, 4 bytes)
-    // Darwin +64 → Linux +40 (Description, 8 bytes)
-    // Darwin +72 → Linux +48 (IVarDestroyer?, 8 bytes)
-    //
-    // We copy the 40-byte block from +40 to +16 (shifting left by 24)
     unsafe {
         let src = (cls_addr + 40) as *const u8;
         let dst = (cls_addr + 16) as *mut u8;
         // Copy 40 bytes: flags(4) + addressPoint(4) + instanceSize(4) +
-        // alignMask(2) + reserved(2) + classSize(4) + classAddressPoint(4) +
-        // description(8) + ivarDestroyer(8)
         std::ptr::copy(src, dst, 40);
     }
 
-    log::debug!("  translated class metadata at {:#x} (Darwin→Linux layout shift -24)", cls_addr);
+    log::debug!("  translated class metadata at {:#x} (Darwin->Linux layout shift -24)", cls_addr);
 
     // Also translate the metaclass
     let isa = unsafe { std::ptr::read_unaligned(cls_addr as *const u64) };

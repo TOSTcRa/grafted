@@ -1,9 +1,4 @@
-//! Swift runtime loader — loads the real Linux Swift runtime (libswiftCore.so)
-//! and maps its symbols for Darwin binary use.
-//!
-//! Instead of stubbing 100+ Swift runtime functions, we load the actual Swift
-//! runtime compiled for Linux. The ABI is stable since Swift 5.0, so the
-//! Linux runtime works for macOS-compiled binaries.
+//! Swift runtime loader - loads the real Linux Swift runtime (libswiftCore.so)
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -83,13 +78,13 @@ pub fn load_swift_runtime() -> usize {
                 let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
                 if handle.is_null() {
                     let err = unsafe { std::ffi::CStr::from_ptr(libc::dlerror()) };
-                    log::debug!("Swift runtime: {} — {}", lib_name, err.to_string_lossy());
+                    log::debug!("Swift runtime: {} - {}", lib_name, err.to_string_lossy());
                     continue;
                 }
                 handles.push(handle);
                 log::info!("Swift runtime: loaded {}", lib_name);
 
-                // No binary patches — the metadata translation layer
+                // No binary patches - the metadata translation layer
                 // (swift_metadata_translate.rs) fixes the data at load time.
             } // end for lib_name in SWIFT_LIBS
 
@@ -104,16 +99,13 @@ pub fn load_swift_runtime() -> usize {
                 let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
                 if handle.is_null() {
                     let err = unsafe { std::ffi::CStr::from_ptr(libc::dlerror()) };
-                    log::warn!("SwiftUI shim: {} — {}", shim_path, err.to_string_lossy());
+                    log::warn!("SwiftUI shim: {} - {}", shim_path, err.to_string_lossy());
                     continue;
                 }
                 handles.push(handle);
                 log::info!("SwiftUI shim: loaded {}", shim_path);
 
                 // Extract ALL exported SwiftUI symbols from the shim by
-                // running nm on the .so and dlsym'ing each one.
-                // This catches constrained extension inits and other symbols
-                // that a hardcoded list would miss.
                 let mut shim_count = 0;
                 if let Ok(output) = std::process::Command::new("nm")
                     .args(&["-D", "--defined-only", shim_path])
@@ -139,10 +131,7 @@ pub fn load_swift_runtime() -> usize {
                                     symbols.insert(clean.to_string(), addr as u64);
                                     shim_count += 1;
 
-                                    // Darwin↔Linux module path aliases:
-                                    // CGFloat lives in CoreGraphics on Darwin, Foundation on Linux.
-                                    // NSObject comes from ObjectiveC on Darwin, different on Linux.
-                                    // Create aliases so Darwin-mangled imports find Linux-compiled code.
+                                    // Darwin<->Linux module path aliases:
                                     let aliases: &[(&str, &str)] = &[
                                         ("10Foundation7CGFloatV", "12CoreGraphics7CGFloatV"),
                                         ("10Foundation7CGFloatV", "14CoreFoundation7CGFloatV"),
@@ -194,7 +183,7 @@ pub fn load_swift_runtime() -> usize {
             return Some(SwiftRuntime { handles, symbols });
         }
 
-        log::warn!("Swift runtime: not found — using stubs (SwiftUI apps won't render)");
+        log::warn!("Swift runtime: not found - using stubs (SwiftUI apps won't render)");
         None
     });
 
@@ -202,16 +191,8 @@ pub fn load_swift_runtime() -> usize {
 }
 
 /// Bridge for SwiftUI's LocalizedStringKey.init(stringLiteral:)
-/// 
-/// Darwin binary calls this with Darwin String (in RDI, RSI).
-/// We translate to Linux String and call the real shim function.
 #[unsafe(no_mangle)]
 /// Bridge for SwiftUI's LocalizedStringKey.init(stringLiteral:)
-/// 
-/// Darwin binary calls this with Darwin String.
-/// Convention check:
-/// 1. If (RSI >> 60) == 0xE, then (RDI, RSI) is the String (Small struct).
-/// 2. If (RDX >> 60) == 0xE, then (RSI, RDX) is the String, RDI is result_ptr (Large struct).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bridge_SwiftUI_LocalizedStringKey_init(
     rdi: u64, rsi: u64, rdx: u64,
