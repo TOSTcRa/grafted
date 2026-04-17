@@ -1,8 +1,4 @@
-//! AppKit emulation — NSApplication, NSWindow, NSView, NSEvent.
-//!
-//! All classes are registered with the ObjC runtime so that Darwin binaries
-//! can use objc_msgSend to interact with them. Methods are implemented as
-//! extern "C" functions registered via class_addMethod.
+//! AppKit emulation - NSApplication, NSWindow, NSView, NSEvent.
 
 pub mod application;
 pub mod window;

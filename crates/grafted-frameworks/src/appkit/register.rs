@@ -1,7 +1,4 @@
 //! Register AppKit classes with the ObjC runtime.
-//!
-//! Each class gets its methods registered so objc_msgSend dispatches correctly.
-//! Darwin binaries call [NSApplication sharedApplication], [NSWindow alloc], etc.
 
 use grafted_objc::{objc_registerClassPair, sel_registerName, class_addMethod, types::Class};
 use std::sync::Once;
@@ -91,7 +88,7 @@ fn register_nsview() {
 fn register_nsscreen() {
     let cls = alloc_class("NSScreen", 64);
 
-    // +[NSScreen mainScreen] — returns a singleton with screen dimensions
+    // +[NSScreen mainScreen] - returns a singleton with screen dimensions
     unsafe extern "C" fn ns_screen_main(_cls: *mut u8, _sel: *mut u8) -> *mut u8 {
         static mut SCREEN: *mut u8 = std::ptr::null_mut();
         unsafe {
@@ -154,6 +151,8 @@ fn register_nspasteboard() {
     reg(cls, "changeCount\0", pasteboard::ns_pasteboard_change_count as *const ());
     reg(cls, "types\0", pasteboard::ns_pasteboard_types as *const ());
     reg(cls, "pasteboardItems\0", pasteboard::ns_pasteboard_items as *const ());
+    reg(cls, "declareTypes:owner:\0", pasteboard::ns_pasteboard_declare_types as *const ());
+    reg(cls, "dataForType:\0", pasteboard::ns_pasteboard_data_for_type as *const ());
 
     alloc_class("NSPasteboardItem", 128);
 }
@@ -239,3 +238,4 @@ fn register_nslayout() {
     alloc_class("NSComboBox", 128);
     alloc_class("NSSegmentedControl", 128);
 }
+
