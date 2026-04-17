@@ -10,9 +10,10 @@ grafted-kmod/modules.order
 grafted-kmod/.module-common.o
 grafted-kmod/.tmp_versions/
 
-# AI tool state
+# Local tool state
 .omc/
 .claude/
+.cache/
 working-docs/
 
 # Editor
@@ -31,3 +32,9 @@ tests/fixtures/*.macho
 tests/fixtures/lua/
 tests/fixtures/jq-macos-amd64
 swift-runtime/
+
+# Swift compile artifacts
+shims/*.swiftdoc
+shims/*.swiftmodule
+shims/*.swiftsourceinfo
+shims/*.so

@@ -1,6 +1,6 @@
 [package]
 name = "grafted-objc"
-description = "Objective-C runtime bridge — integration with GNUstep libobjc2 for ABI-compatible ObjC on Linux"
+description = "Objective-C runtime bridge - integration with GNUstep libobjc2 for ABI-compatible ObjC on Linux"
 version.workspace = true
 edition.workspace = true
 

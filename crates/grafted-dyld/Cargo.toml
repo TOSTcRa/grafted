@@ -1,6 +1,6 @@
 [package]
 name = "grafted-dyld"
-description = "dyld emulation — shared cache parsing, image loading, dylib resolution"
+description = "dyld emulation - shared cache parsing, image loading, dylib resolution"
 version.workspace = true
 edition.workspace = true
 

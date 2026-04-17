@@ -1,6 +1,6 @@
 [package]
 name = "grafted-cli"
-description = "CLI entry point — run Darwin binaries on Linux via grafted"
+description = "CLI entry point - run Darwin binaries on Linux via grafted"
 version.workspace = true
 edition.workspace = true
 

@@ -1,6 +1,6 @@
 [package]
 name = "grafted-kernel"
-description = "Userspace client for grafted-kmod — ioctl interface to the kernel Mach trap and syscall translator"
+description = "Userspace client for grafted-kmod - ioctl interface to the kernel Mach trap and syscall translator"
 version.workspace = true
 edition.workspace = true
 

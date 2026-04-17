@@ -1,6 +1,6 @@
 [package]
 name = "grafted-frameworks"
-description = "Darwin framework shims — CoreFoundation, Foundation, CoreGraphics, AppKit, UIKit, Metal"
+description = "Darwin framework shims - CoreFoundation, Foundation, CoreGraphics, AppKit, UIKit, Metal"
 version.workspace = true
 edition.workspace = true
 
