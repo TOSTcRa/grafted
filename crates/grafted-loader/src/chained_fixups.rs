@@ -68,7 +68,7 @@ where
         };
 
         let addr = resolve_symbol(dylib_name, name);
-        log::trace!("chained import[{i}]: {dylib_name}::{name} → {addr:#x}");
+        log::trace!("chained import[{i}]: {dylib_name}::{name} -> {addr:#x}");
         resolved_imports.push(addr);
     }
 
@@ -146,7 +146,7 @@ where
                 };
 
                 if (chain_ptr as u64) >= 0x10013e000 && (chain_ptr as u64) <= 0x100148000 {
-                    log::info!("patching {:p}: format={} bind={} raw={:#x} → {:#x}", chain_ptr, ptr_format, is_bind, encoded, addr);
+                    log::info!("patching {:p}: format={} bind={} raw={:#x} -> {:#x}", chain_ptr, ptr_format, is_bind, encoded, addr);
                 }
                 
                 let page_base = (chain_ptr as usize & !0xFFF) as *mut libc::c_void;

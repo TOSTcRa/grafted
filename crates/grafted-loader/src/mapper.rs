@@ -90,7 +90,7 @@ fn map_segment(seg: &Segment, file_data: &[u8], slide: u64) -> Result<(), Loader
 pub fn map_binary(binary: &MachOBinary) -> Result<(u64, u64), LoaderError> {
     let text_seg = binary.segments.iter().find(|s| s.name == "__TEXT");
 
-    // Dylibs have __TEXT at vmaddr=0 — need a slide to a free address range.
+    // Dylibs have __TEXT at vmaddr=0 - need a slide to a free address range.
     // Executables have __TEXT at a fixed address (e.g., 0x100000000).
     let slide = if text_seg.map(|s| s.vmaddr).unwrap_or(0) == 0 {
         // Allocate a region for the dylib, then unmap it (just to get an address)
@@ -107,12 +107,12 @@ pub fn map_binary(binary: &MachOBinary) -> Result<(u64, u64), LoaderError> {
             mmap_anonymous(None, size, ProtFlags::PROT_NONE, MapFlags::MAP_PRIVATE)
         }.map_err(|e| LoaderError::Mmap(format!("dylib slide alloc: {e}")))?;
         let base = region.as_ptr() as u64;
-        // Unmap — the individual segments will be mapped with MAP_FIXED at base + vmaddr
+        // Unmap - the individual segments will be mapped with MAP_FIXED at base + vmaddr
         unsafe { nix::sys::mman::munmap(region, total_size as usize).ok() };
         log::debug!("dylib slide: {base:#x} (total_size={total_size:#x})");
         base
     } else {
-        0 // executable — no slide needed
+        0 // executable - no slide needed
     };
 
     for seg in &binary.segments {
@@ -123,8 +123,6 @@ pub fn map_binary(binary: &MachOBinary) -> Result<(u64, u64), LoaderError> {
     }
 
     // Update segment vmaddrs to reflect the slide (so symbol lookup uses slid addresses)
-    // Note: we can't mutate binary.segments directly, but the mapped memory is correct.
-    // The linker uses vmaddr from the binary struct, so we store the slide.
 
     let entry = if binary.entry_is_offset {
         let ts = text_seg.ok_or(LoaderError::NoTextSegment)?;
