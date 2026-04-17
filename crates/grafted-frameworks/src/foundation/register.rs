@@ -15,7 +15,6 @@ pub fn register_all() {
         register_nsnotification_center();
         register_nsprocessinfo();
         register_nsfilemanager();
-        register_nsuserdefaults();
         register_nsnotification();
         log::info!("Foundation: registered classes with ObjC runtime");
     });
@@ -100,11 +99,15 @@ fn register_nsnotification_center() {
     reg(cls, "defaultCenter\0", notification::ns_notification_center_default as *const ());
     reg(cls, "addObserver:selector:name:object:\0", notification::ns_notification_center_add_observer as *const ());
     reg(cls, "removeObserver:\0", notification::ns_notification_center_remove_observer as *const ());
+    reg(cls, "removeObserver:name:object:\0", notification::ns_notification_center_remove_observer_name_object as *const ());
     reg(cls, "postNotificationName:object:\0", notification::ns_notification_center_post as *const ());
+    reg(cls, "postNotificationName:object:userInfo:\0", notification::ns_notification_center_post_user_info as *const ());
 
     let dcls = alloc_class("NSDistributedNotificationCenter", 256);
     reg(dcls, "defaultCenter\0", notification::ns_distributed_notification_center_default as *const ());
     reg(dcls, "addObserver:selector:name:object:\0", notification::ns_notification_center_add_observer as *const ());
+    reg(dcls, "removeObserver:\0", notification::ns_notification_center_remove_observer as *const ());
+    reg(dcls, "postNotificationName:object:\0", notification::ns_notification_center_post as *const ());
 }
 
 fn register_nsprocessinfo() {
@@ -159,23 +162,3 @@ fn register_nsnotification() {
     reg(cls, "userInfo\0", notification_user_info as *const ());
 }
 
-fn register_nsuserdefaults() {
-    let cls = alloc_class("NSUserDefaults", 256);
-
-    unsafe extern "C" fn standard(_cls: *mut u8, _sel: *mut u8) -> *mut u8 {
-        static mut UD: *mut u8 = std::ptr::null_mut();
-        unsafe { if UD.is_null() { UD = libc::calloc(1, 256) as *mut u8; } UD }
-    }
-    unsafe extern "C" fn object_for_key(_self: *mut u8, _sel: *mut u8, _key: *mut u8) -> *mut u8 {
-        std::ptr::null_mut() // not found
-    }
-    unsafe extern "C" fn set_object(_self: *mut u8, _sel: *mut u8, _val: *mut u8, _key: *mut u8) {}
-    unsafe extern "C" fn bool_for_key(_self: *mut u8, _sel: *mut u8, _key: *mut u8) -> bool { false }
-    unsafe extern "C" fn register_defaults(_self: *mut u8, _sel: *mut u8, _dict: *mut u8) {}
-
-    reg(cls, "standardUserDefaults\0", standard as *const ());
-    reg(cls, "objectForKey:\0", object_for_key as *const ());
-    reg(cls, "setObject:forKey:\0", set_object as *const ());
-    reg(cls, "boolForKey:\0", bool_for_key as *const ());
-    reg(cls, "registerDefaults:\0", register_defaults as *const ());
-}
