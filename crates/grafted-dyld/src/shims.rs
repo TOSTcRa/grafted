@@ -1,7 +1,4 @@
-//! libSystem.B.dylib shim — in-process function table.
-//!
-//! Shim functions toggle the SUD selector byte (ALLOW before syscall, BLOCK after)
-//! so that our Linux syscalls pass through while Darwin code remains intercepted.
+//! libSystem.B.dylib shim - in-process function table.
 
 use std::arch::asm;
 use std::collections::HashMap;
@@ -28,7 +25,7 @@ pub fn set_process_info(binary_path: &str, argv: &[String]) {
         c_argv.push(std::ptr::null()); // NULL terminator
 
         let argv_ptr = c_argv.as_ptr();
-        std::mem::forget(c_argv); // leak — must persist for process lifetime
+        std::mem::forget(c_argv); // leak - must persist for process lifetime
 
         NXARGC = argv.len() as i32;
         NXARGV = argv_ptr;
@@ -50,8 +47,6 @@ fn selector_block() {
 }
 
 // These hold pointers to the real Linux FILE structs.
-// Darwin code does: FILE *out = *___stdoutp; fprintf(out, ...).
-// By pointing these to real Linux FILE*, all stdio works natively.
 static mut REAL_STDIN: *mut libc::FILE = std::ptr::null_mut();
 static mut REAL_STDOUT: *mut libc::FILE = std::ptr::null_mut();
 static mut REAL_STDERR: *mut libc::FILE = std::ptr::null_mut();
@@ -206,12 +201,6 @@ unsafe fn setup_darwin_stdio() {
 }
 
 /// Generate an executable trampoline that wraps a libc function pointer:
-///   save argument registers
-///   call grafted_selector_allow()   ; per-thread ALLOW
-///   restore argument registers
-///   jmp <target_fn>                 ; tail call
-/// Returns the trampoline's address. All trampolines are allocated from
-/// a single mmap'd executable page pool.
 fn gen_trampoline(target: u64) -> u64 {
     use std::sync::Mutex;
     struct PoolPtr(*mut u8);
@@ -240,15 +229,13 @@ fn gen_trampoline(target: u64) -> u64 {
     *offset += TRAMP_SIZE;
 
     // Per-thread ALLOW trampoline: call grafted_selector_allow() then jmp to target.
-    // Saves/restores all argument registers so the libc function sees correct args.
-    // 7 pushes for 16-byte stack alignment before the call.
     let afn = (grafted_loader::executor::grafted_selector_allow as *const () as u64).to_le_bytes();
     let tgt = target.to_le_bytes();
 
     let mut code = [0u8; 48];
     let mut p = 0;
 
-    // Save argument registers (7 pushes = 56 bytes → aligns stack for call)
+    // Save argument registers (7 pushes = 56 bytes -> aligns stack for call)
     code[p] = 0x50; p += 1;                       // push rax (al = SSE arg count for variadics)
     code[p] = 0x57; p += 1;                       // push rdi
     code[p] = 0x56; p += 1;                       // push rsi
@@ -271,7 +258,7 @@ fn gen_trampoline(target: u64) -> u64 {
     code[p] = 0x5f; p += 1;                       // pop rdi
     code[p] = 0x58; p += 1;                       // pop rax
 
-    // jmp target (tail call — perfect stack preservation)
+    // jmp target (tail call - perfect stack preservation)
     code[p] = 0x49; code[p+1] = 0xbb; p += 2;    // movabs r11, imm64
     code[p..p+8].copy_from_slice(&tgt); p += 8;
     code[p] = 0x41; code[p+1] = 0xff; code[p+2] = 0xe3; p += 3; // jmp r11
@@ -443,7 +430,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_yn", yn);
     reg!("___exp10", shim_exp10);
 
-    // Float variants — declared in our extern block, not in libc crate
+    // Float variants - declared in our extern block, not in libc crate
     reg_libc!("_sqrtf", sqrtf);
     reg_libc!("_sqrt", sqrt);
     reg_libc!("_floorf", floorf);
@@ -466,7 +453,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_truncf", truncf);
     reg_libc!("_trunc", trunc);
 
-    // Fortified functions — _chk variants have extra args, we forward to the base
+    // Fortified functions - _chk variants have extra args, we forward to the base
     reg_libc!("___snprintf_chk", __snprintf_chk);
     reg_libc!("___sprintf_chk", __sprintf_chk);
     reg_libc!("___vsnprintf_chk", __vsnprintf_chk);
@@ -475,7 +462,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg!("___memcpy_chk", shim_memcpy_chk);
     reg!("___memmove_chk", shim_memmove_chk);
 
-    // OS locks (zig malloc uses these) — stub as no-ops for single-threaded
+    // OS locks (zig malloc uses these) - stub as no-ops for single-threaded
     reg!("_os_unfair_lock_lock", shim_noop);
     reg!("_os_unfair_lock_unlock", shim_noop);
 
@@ -514,14 +501,14 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_timegm", timegm);
     reg_libc!("_fdopen", libc::fdopen);
 
-    // $DARWIN_EXTSN and $INODE64 variants — same as base on Linux
+    // $DARWIN_EXTSN and $INODE64 variants - same as base on Linux
     reg_libc!("_fopen$DARWIN_EXTSN", libc::fopen);
     reg_libc!("_fdopen$DARWIN_EXTSN", libc::fdopen);
     reg_libc!("_realpath$DARWIN_EXTSN", libc::realpath);
     reg_libc!("_stat$INODE64", libc::stat);
     reg_libc!("_fstat$INODE64", libc::fstat);
 
-    // pthread — custom wrappers that toggle selector AND handle Darwin/Linux key size mismatch
+    // pthread - custom wrappers that toggle selector AND handle Darwin/Linux key size mismatch
     reg!("_pthread_create", shim_pthread_create);
     reg!("_pthread_join", shim_pthread_join);
     reg!("_pthread_getspecific", shim_pthread_getspecific);
@@ -546,13 +533,13 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     s.insert("_NXArgc".into(), (&raw const NXARGC) as u64);
     s.insert("_NXArgv".into(), (&raw const NXARGV) as u64);
 
-    // _NSGet* functions — return pointers to the global CRT variables
+    // _NSGet* functions - return pointers to the global CRT variables
     reg!("__NSGetArgc", shim_nsgetargc);
     reg!("__NSGetArgv", shim_nsgetargv);
     reg!("__NSGetEnviron", shim_nsgetenviron);
     reg!("__NSGetExecutablePath", shim_nsgetexecutablepath);
 
-    // C++ exception unwinding — stub out for Rust panic=abort builds
+    // C++ exception unwinding - stub out for Rust panic=abort builds
     reg!("__Unwind_Backtrace", shim_noop);
     reg!("__Unwind_GetIP", shim_noop);
     reg!("__Unwind_GetRegionStart", shim_noop);
@@ -627,7 +614,7 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_select$1050", libc::select);
     reg_libc!("_pselect", libc::pselect);
 
-    // stat — Darwin struct layout differs from Linux; use wrappers that translate
+    // stat - Darwin struct layout differs from Linux; use wrappers that translate
     reg!("_stat", shim_stat);
     reg!("_fstat", shim_fstat);
     reg!("_lstat", shim_lstat);
@@ -726,14 +713,14 @@ pub fn default_registry() -> HashMap<String, HashMap<String, u64>> {
     reg_libc!("_posix_spawn_file_actions_destroy", libc::posix_spawn_file_actions_destroy);
     reg_libc!("_posix_spawn_file_actions_adddup2", libc::posix_spawn_file_actions_adddup2);
 
-    // Grand Central Dispatch — minimal stubs using POSIX semaphores
+    // Grand Central Dispatch - minimal stubs using POSIX semaphores
     reg!("_dispatch_semaphore_create", shim_dispatch_semaphore_create);
     reg!("_dispatch_semaphore_signal", shim_dispatch_semaphore_signal);
     reg!("_dispatch_semaphore_wait", shim_dispatch_semaphore_wait);
     reg!("_dispatch_time", shim_dispatch_time);
     reg!("_dispatch_release", shim_noop);
 
-    // TLS bootstrap — Darwin Thread Local Variables
+    // TLS bootstrap - Darwin Thread Local Variables
     reg!("__tlv_bootstrap", shim_tlv_bootstrap_asm);
     reg!("__tlv_atexit", shim_noop);
 
@@ -908,9 +895,6 @@ macro_rules! linux_syscall {
 // ---- Shim implementations ----
 
 // Vararg ABI bridge: if caller set al=0 (no XMM args, Darwin style with
-// doubles in integer regs), copy rcx/r8/r9 → xmm0/1/2.
-// If al>0 (caller already set XMM), leave them alone.
-// Then set al=8 so glibc reads from XMM save area.
 #[unsafe(naked)]
 unsafe extern "C" fn shim_snprintf_vararg_fix() {
     std::arch::naked_asm!(
@@ -943,15 +927,13 @@ unsafe extern "C" fn shim_objc_msg_send_super2(
     super_: *mut u8, _sel: *mut u8,
 ) -> *mut u8 { unsafe {
     // Return the receiver for super.init() patterns, null for everything else.
-    // Full super dispatch requires proper superclass chain which binary class
-    // metadata doesn't provide after Darwin→Linux layout translation.
     if super_.is_null() { return std::ptr::null_mut(); }
     let receiver = *(super_ as *const *mut u8);
-    receiver // Return self — common pattern for [super init]
+    receiver // Return self - common pattern for [super init]
 }}
 unsafe extern "C" fn shim_issetugid() -> i32 { 0 } // not setuid
 
-// kqueue/kevent — BSD-only, emulate with epoll
+// kqueue/kevent - BSD-only, emulate with epoll
 unsafe extern "C" fn shim_kqueue() -> i32 {
     selector_allow();
     let fd = unsafe { libc::epoll_create1(0) };
@@ -1009,10 +991,7 @@ unsafe extern "C" fn shim_pthread_cond_timedwait_relative_np(
     ret
 }
 
-// Darwin's ___maskrune(c, mask) — character classification.
-// Returns mask & runetype[c]. We implement using Linux libc's is* functions.
-// Darwin mask bits: _A=0x100, _C=0x200, _D=0x400, _L=0x2000, _P=0x10000,
-// _S=0x4000, _U=0x8000, _X=0x10000, _B=0x20000, _R=0x40000
+// Darwin's ___maskrune(c, mask) - character classification.
 unsafe extern "C" fn shim_maskrune(c: i32, mask: u64) -> i32 {
     let mut result: u64 = 0;
     let uc = c as u32;
@@ -1031,7 +1010,7 @@ unsafe extern "C" fn shim_maskrune(c: i32, mask: u64) -> i32 {
     (result & mask) as i32
 }
 
-// __snprintf_chk(buf, maxlen, flag, real_maxlen, fmt, ...) → snprintf(buf, maxlen, fmt, ...)
+// __snprintf_chk(buf, maxlen, flag, real_maxlen, fmt, ...) -> snprintf(buf, maxlen, fmt, ...)
 // We ignore flag and real_maxlen, just forward to host snprintf
 unsafe extern "C" fn shim_snprintf_chk(
     buf: *mut i8, maxlen: usize, _flag: i32, _real_maxlen: usize,
@@ -1043,14 +1022,14 @@ unsafe extern "C" fn shim_snprintf_chk(
     ret
 }
 
-// __memcpy_chk(dst, src, len, dst_len) → memcpy(dst, src, len)
+// __memcpy_chk(dst, src, len, dst_len) -> memcpy(dst, src, len)
 unsafe extern "C" fn shim_memcpy_chk(
     dst: *mut libc::c_void, src: *const libc::c_void, len: usize, _dst_len: usize,
 ) -> *mut libc::c_void {
     unsafe { libc::memcpy(dst, src, len) }
 }
 
-// __sprintf_chk(buf, flag, maxlen, fmt, ...) → sprintf(buf, fmt, ...)
+// __sprintf_chk(buf, flag, maxlen, fmt, ...) -> sprintf(buf, fmt, ...)
 unsafe extern "C" fn shim_sprintf_chk(
     buf: *mut i8, _flag: i32, _maxlen: usize,
     fmt: *const i8, a1: u64, a2: u64, a3: u64, a4: u64,
@@ -1061,7 +1040,7 @@ unsafe extern "C" fn shim_sprintf_chk(
     ret
 }
 
-// __memmove_chk(dst, src, len, dst_len) → memmove(dst, src, len)
+// __memmove_chk(dst, src, len, dst_len) -> memmove(dst, src, len)
 unsafe extern "C" fn shim_memmove_chk(
     dst: *mut libc::c_void, src: *const libc::c_void, len: usize, _dst_len: usize,
 ) -> *mut libc::c_void {
@@ -1082,9 +1061,7 @@ unsafe extern "C" fn shim_abort() -> ! {
     unsafe { libc::_exit(134) };
 }
 
-// pthread TLS — Darwin uses 64-bit pthread_key_t, Linux uses 32-bit.
-// We bridge by zero-extending the key slot and toggling SUD selector
-// around libc calls (which use futex internally).
+// pthread TLS - Darwin uses 64-bit pthread_key_t, Linux uses 32-bit.
 unsafe extern "C" fn shim_pthread_key_create(key_out: *mut u64, dtor: Option<unsafe extern "C" fn(*mut libc::c_void)>) -> i32 {
     // Zero the 8-byte Darwin slot (Linux writes only 4 bytes for pthread_key_t)
     unsafe { *key_out = 0 };
@@ -1114,7 +1091,7 @@ unsafe impl Send for ThreadStartCtx {}
 extern "C" fn thread_start_wrapper(ctx_ptr: *mut libc::c_void) -> *mut libc::c_void {
     let ctx = unsafe { Box::from_raw(ctx_ptr as *mut ThreadStartCtx) };
     // Allocate a per-thread SUD selector byte and install SUD with correct range.
-    // Each thread gets its own selector → no races with other threads.
+    // Each thread gets its own selector -> no races with other threads.
     let sel_ptr = grafted_loader::executor::alloc_thread_selector();
     grafted_loader::executor::setup_thread_sud(sel_ptr);
     (ctx.real_start)(ctx.real_arg)
@@ -1142,8 +1119,6 @@ unsafe extern "C" fn shim_pthread_join(thread: libc::pthread_t, retval: *mut *mu
     ret
 }
 // Darwin PTHREAD_ONCE_INIT = {0x30B1BCBA, 0} (16 bytes).
-// Linux PTHREAD_ONCE_INIT = 0 (4 bytes).
-// We detect the Darwin magic and reset to Linux's 0 before calling.
 const DARWIN_PTHREAD_ONCE_INIT: u32 = 0x30B1BCBA;
 
 unsafe extern "C" fn shim_pthread_once(once: *mut libc::pthread_once_t, init: extern "C" fn()) -> i32 {
@@ -1209,10 +1184,8 @@ unsafe extern "C" fn shim_read(fd: i32, buf: *mut u8, count: usize) -> i64 {
 }
 
 // Darwin open() flags differ from Linux:
-//   Darwin O_CREAT=0x200, O_TRUNC=0x400, O_EXCL=0x800, O_APPEND=0x8, O_NONBLOCK=0x4
-//   Linux  O_CREAT=0x40,  O_TRUNC=0x200, O_EXCL=0x80,  O_APPEND=0x400, O_NONBLOCK=0x800
 fn translate_open_flags(darwin: i32) -> i32 {
-    let mut linux = darwin & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2 — same on both
+    let mut linux = darwin & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2 - same on both
     if darwin & 0x0008 != 0 { linux |= 0x0400; } // O_APPEND
     if darwin & 0x0004 != 0 { linux |= 0x0800; } // O_NONBLOCK
     if darwin & 0x0200 != 0 { linux |= 0x0040; } // O_CREAT
@@ -1230,14 +1203,11 @@ unsafe extern "C" fn shim_open(path: *const i8, flags: i32, mode: i32) -> i64 {
 }
 
 // Darwin vs Linux addrinfo: ai_canonname and ai_addr are swapped.
-// Darwin: {flags, family, socktype, protocol, addrlen, *canonname, *addr, *next}
-// Linux:  {flags, family, socktype, protocol, addrlen, *addr, *canonname, *next}
-// We call Linux getaddrinfo then swap the two pointer fields in each result node.
 unsafe extern "C" fn shim_getaddrinfo(
     node: *const i8, service: *const i8,
     hints: *const libc::addrinfo, res: *mut *mut libc::addrinfo,
 ) -> i32 {
-    // If hints is non-null, it's in Darwin layout — but the first 5 fields (flags..addrlen)
+    // If hints is non-null, it's in Darwin layout - but the first 5 fields (flags..addrlen)
     // are the same. The pointer fields in hints are typically NULL, so no swap needed.
     selector_allow();
     let ret = unsafe { libc::getaddrinfo(node, service, hints, res) };
@@ -1250,8 +1220,6 @@ unsafe extern "C" fn shim_getaddrinfo(
                 let addr = (*cur).ai_addr;
                 let canon = (*cur).ai_canonname;
                 // Swap: Darwin binary reads offset 24 as canonname, offset 32 as addr
-                // Linux wrote addr at 24, canonname at 32
-                // By swapping, Darwin binary finds addr at its expected offset 32
                 (*cur).ai_addr = canon as *mut libc::sockaddr;
                 (*cur).ai_canonname = addr as *mut i8;
                 cur = (*cur).ai_next;
@@ -1287,7 +1255,7 @@ unsafe extern "C" fn shim_openat(dirfd: i32, path: *const i8, flags: i32, mode: 
     ret
 }
 
-// Darwin struct stat (x86_64) — 144 bytes
+// Darwin struct stat (x86_64) - 144 bytes
 // Linux fills a different layout; we translate field by field.
 #[repr(C)]
 struct DarwinStat {
@@ -1410,12 +1378,8 @@ unsafe extern "C" fn shim_getegid() -> i32 {
 }
 
 // Darwin mmap flags differ from Linux:
-// Darwin MAP_ANON=0x1000, Linux MAP_ANON=0x20
-// Darwin MAP_PRIVATE=0x02, Linux MAP_PRIVATE=0x02 (same)
-// Darwin MAP_FIXED=0x10, Linux MAP_FIXED=0x10 (same)
-// Darwin MAP_NORESERVE=0x40, Linux MAP_NORESERVE=0x4000
 fn translate_mmap_flags(darwin: i32) -> i32 {
-    let mut linux = darwin & 0x1F; // MAP_SHARED(1), MAP_PRIVATE(2), MAP_FIXED(0x10) — same
+    let mut linux = darwin & 0x1F; // MAP_SHARED(1), MAP_PRIVATE(2), MAP_FIXED(0x10) - same
     if darwin & 0x1000 != 0 { linux |= 0x20; } // MAP_ANON
     if darwin & 0x0040 != 0 { linux |= 0x4000; } // MAP_NORESERVE
     linux
@@ -1424,7 +1388,7 @@ fn translate_mmap_flags(darwin: i32) -> i32 {
 unsafe extern "C" fn shim_mmap(addr: u64, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> u64 {
     let linux_flags = translate_mmap_flags(flags);
 
-    // Guard page (PROT_NONE + MAP_FIXED + MAP_ANON) — fake success
+    // Guard page (PROT_NONE + MAP_FIXED + MAP_ANON) - fake success
     if prot == 0 && linux_flags & 0x30 == 0x30 {
         selector_allow();
         unsafe { libc::write(2, b"GUARD_FAKE\n".as_ptr() as *const _, 11) };
@@ -1468,7 +1432,7 @@ unsafe extern "C" fn shim_munmap(addr: u64, len: usize) -> i32 {
 }
 
 unsafe extern "C" fn shim_mprotect(addr: u64, len: usize, prot: i32) -> i32 {
-    // PROT_NONE = guard page request — always fake success.
+    // PROT_NONE = guard page request - always fake success.
     if prot == 0 { return 0; }
     selector_allow();
     let ret = unsafe { libc::mprotect(addr as *mut _, len, prot) };
@@ -1477,8 +1441,6 @@ unsafe extern "C" fn shim_mprotect(addr: u64, len: usize, prot: i32) -> i32 {
 }
 
 // Darwin sigaction struct translation
-// Darwin: { handler(8), sa_mask(4), sa_flags(4) } = 16 bytes
-// Linux:  { handler(8), sa_flags(8), sa_restorer(8), sa_mask(128) } = 152 bytes
 #[repr(C)]
 struct DarwinSigaction {
     sa_handler: u64,
@@ -1552,7 +1514,7 @@ unsafe extern "C" fn shim_sigaction(sig: i32, act: *const DarwinSigaction, oldac
     ret
 }
 
-// sigaltstack stub — prevents Rust from failing during stack overflow handler setup
+// sigaltstack stub - prevents Rust from failing during stack overflow handler setup
 unsafe extern "C" fn shim_sigaltstack_noop(_ss: *const libc::stack_t, _oss: *mut libc::stack_t) -> i32 {
     if !_oss.is_null() {
         unsafe {
@@ -1564,7 +1526,7 @@ unsafe extern "C" fn shim_sigaltstack_noop(_ss: *const libc::stack_t, _oss: *mut
     0
 }
 
-// Old stat shims removed — replaced by DarwinStat translation wrappers above
+// Old stat shims removed - replaced by DarwinStat translation wrappers above
 
 unsafe extern "C" fn shim_puts(s: *const i8) -> i32 {
     selector_allow();
@@ -1605,14 +1567,6 @@ unsafe extern "C" fn shim_nsgetexecutablepath(buf: *mut i8, bufsize: *mut u32) -
 }
 
 // Darwin TLV (Thread Local Variables) bootstrap.
-// All TLV descriptors in an image share ONE pthread key. The key is stored
-// in each descriptor at offset 8. On first call, we create the key and
-// allocate a large block. Each TLV variable lives at its own offset within the block.
-//
-// IMPORTANT: Apple's __tlv_bootstrap is a tiny leaf function that only clobbers rax.
-// The compiler relies on this and does NOT save caller-saved registers around the call.
-// Our Rust implementation calls libc functions (clobbering rcx/rdx/rsi/r8-r11), so we
-// wrap it with an assembly shim that preserves all caller-saved registers except rax.
 static TLV_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static TLV_KEY_INIT: std::sync::Once = std::sync::Once::new();
 
@@ -1693,11 +1647,6 @@ unsafe extern "C" fn shim_tlv_bootstrap(descriptor: *mut u64) -> *mut u8 {
 }
 
 // Mach stubs for Rust std
-// sysctl — translate Darwin MIBs to Linux values
-// Go runtime uses: CTL_HW(6)+HW_NCPU(3), CTL_HW(6)+HW_PAGESIZE(7), CTL_HW(6)+HW_MEMSIZE(24)
-// readdir — Darwin dirent has different layout from Linux.
-// For simplicity, call Linux readdir and translate the result pointer.
-// Darwin dirent64: d_ino(u64), d_seekoff(u64), d_reclen(u16), d_namlen(u16), d_type(u8), d_name[1024]
 #[repr(C)]
 struct DarwinDirent {
     d_ino: u64,
@@ -1734,7 +1683,7 @@ unsafe extern "C" fn shim_readdir(dirp: *mut libc::DIR) -> *mut DarwinDirent {
     buf as *mut DarwinDirent
 }
 
-// Mach time — use Linux clock_gettime(CLOCK_MONOTONIC) as nanoseconds.
+// Mach time - use Linux clock_gettime(CLOCK_MONOTONIC) as nanoseconds.
 unsafe extern "C" fn shim_mach_absolute_time() -> u64 {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     selector_allow();
@@ -1802,7 +1751,7 @@ unsafe extern "C" fn shim_sysctl(
     // CTL_KERN = 1
     if mib0 == 1 {
         match mib1 {
-            14 => { // KERN_MAXPROC — just return something
+            14 => { // KERN_MAXPROC - just return something
                 if !oldp.is_null() && !oldlenp.is_null() {
                     let len = unsafe { *oldlenp };
                     if len >= 4 { unsafe { *(oldp as *mut i32) = 2048; *oldlenp = 4; } }
@@ -1812,7 +1761,7 @@ unsafe extern "C" fn shim_sysctl(
             _ => {}
         }
     }
-    // Unknown MIB — return success with no data (Go handles this)
+    // Unknown MIB - return success with no data (Go handles this)
     0
 }
 
@@ -1848,7 +1797,7 @@ unsafe extern "C" fn shim_sysctlbyname(
             }
             0
         }
-        _ => 0 // unknown — return success
+        _ => 0 // unknown - return success
     }
 }
 
@@ -1917,12 +1866,12 @@ unsafe extern "C" fn shim_mach_msg(
     unsafe { crate::mach_ipc::mach_msg(msg, option, send_size, rcv_size, rcv_name, timeout, notify) }
 }
 
-// mach_vm_protect(task, addr, size, set_max, prot) → kern_return_t
+// mach_vm_protect(task, addr, size, set_max, prot) -> kern_return_t
 // Translate Darwin VM_PROT to Linux PROT and call mprotect
 unsafe extern "C" fn shim_mach_vm_protect(
     _task: u32, addr: u64, size: u64, _set_max: i32, prot: i32,
 ) -> i32 {
-    // Darwin VM_PROT: VM_PROT_READ=1, VM_PROT_WRITE=2, VM_PROT_EXECUTE=4 — same as Linux PROT_*
+    // Darwin VM_PROT: VM_PROT_READ=1, VM_PROT_WRITE=2, VM_PROT_EXECUTE=4 - same as Linux PROT_*
     let aligned_addr = addr & !0xFFF;
     let aligned_size = ((addr + size + 0xFFF) & !0xFFF) - aligned_addr;
     selector_allow();
@@ -1931,17 +1880,14 @@ unsafe extern "C" fn shim_mach_vm_protect(
     if ret == 0 { 0 } else { 1 } // KERN_SUCCESS=0, KERN_FAILURE=1
 }
 
-// vm_protect — older Mach API, same args but 32-bit size
+// vm_protect - older Mach API, same args but 32-bit size
 unsafe extern "C" fn shim_vm_protect(
     _task: u32, addr: u64, size: u32, _set_max: i32, prot: i32,
 ) -> i32 {
     unsafe { shim_mach_vm_protect(_task, addr, size as u64, _set_max, prot) }
 }
 
-// Darwin pthread_get_stack{addr,size}_np — return stack bounds.
-// Darwin: stackaddr = TOP of stack (highest address), size = total size.
-// Rust computes guard page as: stackaddr - stacksize + guard_size.
-// We must ensure this yields a valid address BELOW our current rsp.
+// Darwin pthread_get_stack{addr,size}_np - return stack bounds.
 static STACK_BASE_VAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STACK_SIZE_VAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(8 * 1024 * 1024);
 
@@ -1977,7 +1923,7 @@ unsafe extern "C" fn shim_pthread_setname_np(name: *const i8) -> i32 {
     ret
 }
 
-// GCD dispatch_semaphore — minimal implementation using POSIX semaphores
+// GCD dispatch_semaphore - minimal implementation using POSIX semaphores
 // Darwin dispatch_semaphore_t is an opaque pointer. We use a box'd sem_t.
 unsafe extern "C" fn shim_dispatch_semaphore_create(value: i64) -> *mut libc::sem_t {
     let sem = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<libc::sem_t>() }));
@@ -2001,7 +1947,7 @@ unsafe extern "C" fn shim_dispatch_semaphore_wait(sem: *mut libc::sem_t, timeout
     selector_block();
     ret as i64
 }
-// dispatch_time(DISPATCH_TIME_NOW, nsec) → absolute time. We return nsec as-is.
+// dispatch_time(DISPATCH_TIME_NOW, nsec) -> absolute time. We return nsec as-is.
 unsafe extern "C" fn shim_dispatch_time(when: u64, delta: i64) -> u64 {
     when.wrapping_add(delta as u64)
 }

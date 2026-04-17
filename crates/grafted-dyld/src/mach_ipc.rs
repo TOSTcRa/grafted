@@ -1,14 +1,4 @@
-//! Mach IPC emulation — in-process port namespace, message queues, and port management.
-//!
-//! Darwin's Mach IPC is the foundation for nearly all system services: launchd,
-//! WindowServer, IOKit, XPC, and Core Foundation's CFRunLoop. This module provides
-//! a userspace emulation of the Mach port namespace and messaging primitives.
-//!
-//! Architecture:
-//! - One global `PortSpace` per process (Darwin tasks have one IPC space each)
-//! - Ports have receive rights (one holder) and send rights (ref-counted)
-//! - Special ports are pre-allocated: task_self, thread_self, host, bootstrap
-//! - `mach_msg` delivers messages through in-process queues (no kernel needed)
+//! Mach IPC emulation - in-process port namespace, message queues, and port management.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -288,36 +278,33 @@ fn port_space() -> &'static Mutex<PortSpace> {
 
 // ---- Public API (called from shims) ----
 
-/// mach_port_allocate(task, right, &name) → kern_return_t
+/// mach_port_allocate(task, right, &name) -> kern_return_t
 pub fn port_allocate(right: u32) -> Result<u32, i32> {
     port_space().lock().unwrap().allocate(right)
 }
 
-/// mach_port_deallocate(task, name) → kern_return_t
+/// mach_port_deallocate(task, name) -> kern_return_t
 pub fn port_deallocate(name: u32) -> i32 {
     port_space().lock().unwrap().deallocate(name)
 }
 
-/// mach_port_insert_right(task, name, poly, polyPoly) → kern_return_t
+/// mach_port_insert_right(task, name, poly, polyPoly) -> kern_return_t
 pub fn port_insert_right(name: u32, poly: u32, poly_type: u32) -> i32 {
     port_space().lock().unwrap().insert_right(name, poly, poly_type)
 }
 
-/// mach_port_mod_refs(task, name, right, delta) → kern_return_t
+/// mach_port_mod_refs(task, name, right, delta) -> kern_return_t
 pub fn port_mod_refs(name: u32, right: u32, delta: i32) -> i32 {
     port_space().lock().unwrap().mod_refs(name, right, delta)
 }
 
-/// mach_port_type(task, name, &ptype) → kern_return_t
+/// mach_port_type(task, name, &ptype) -> kern_return_t
 pub fn port_type(name: u32) -> (i32, u32) {
     let ptype = port_space().lock().unwrap().port_type(name);
     if ptype == 0 { (KERN_INVALID_NAME, 0) } else { (KERN_SUCCESS, ptype) }
 }
 
-/// mach_msg — send and/or receive a message.
-///
-/// This is the core Mach IPC primitive. `msg` points to a mach_msg_header_t
-/// followed by inline body data.
+/// mach_msg - send and/or receive a message.
 pub unsafe fn mach_msg(
     msg: *mut MachMsgHeader,
     option: i32,
@@ -395,7 +382,7 @@ pub unsafe fn mach_msg(
                 if option & MACH_RCV_TIMEOUT != 0 {
                     return MACH_RCV_TIMED_OUT;
                 }
-                // No message available — for now, return timed out
+                // No message available - for now, return timed out
                 // (real implementation would block)
                 return MACH_RCV_TIMED_OUT;
             }

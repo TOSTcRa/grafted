@@ -25,8 +25,6 @@ unsafe extern "C" fn vwt_enum_tag(_: *const u8, _: u32, _: *const u8) -> u32 { 0
 unsafe extern "C" fn vwt_store_enum_tag(_: *mut u8, _: u32, _: u32, _: *const u8) {}
 
 /// Soft stub: returns a valid Swift metadata pointer with a proper VWT.
-/// The VWT has valid function pointers and size/stride/flags so that
-/// code reading metadata[-1]→VWT[0x40] (size) doesn't crash.
 unsafe extern "C" fn shim_unresolved_soft() -> *mut u8 {
     static STUB_META: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
     let mut ptr = STUB_META.load(std::sync::atomic::Ordering::Acquire);
@@ -58,7 +56,7 @@ unsafe extern "C" fn shim_unresolved_soft() -> *mut u8 {
         unsafe {
             // metadata[-1] = VWT pointer
             *((meta_ptr as *mut u64).sub(1)) = vwt as u64;
-            // metadata[0] = kind (1 = struct, simple kind — NOT 0x200 which triggers
+            // metadata[0] = kind (1 = struct, simple kind - NOT 0x200 which triggers
             // descriptor-based checks in swift_checkMetadataState)
             *(meta_ptr as *mut u64) = 1;
         }
@@ -201,7 +199,7 @@ impl Linker {
                 target_ptr.write(addr);
             };
 
-            log::debug!("bound {dylib}::{symbol} → {addr:#x} at {:#x}", import.address);
+            log::debug!("bound {dylib}::{symbol} -> {addr:#x} at {:#x}", import.address);
             bound += 1;
         }
 
@@ -210,9 +208,6 @@ impl Linker {
     }
 
     /// Resolve __nl_symbol_ptr entries for binaries that use non-lazy symbol pointers
-    /// (e.g., Go binaries). Uses the indirect symbol table to map each nl_symbol_ptr
-    /// entry to the correct symbol. Go's linker sometimes doesn't set indirectsymoff/
-    /// nindirectsyms in LC_DYSYMTAB but still places the data after the symbol table.
     pub fn bind_nl_symbol_ptrs(&self, binary: &MachOBinary) -> Result<usize, LinkError> {
         let macho = MachO::parse(&binary.data, 0)
             .map_err(|e| LinkError::Parse(e.to_string()))?;
@@ -259,11 +254,6 @@ impl Linker {
         };
 
         // For __symbol_stub1, indirect entries start at index 0.
-        // For __nl_symbol_ptr, indirect entries start at nl_reserved1.
-        // The stub entries (0..nl_reserved1) and nl_ptr entries (nl_reserved1..)
-        // use the SAME indirect table. stub[k] uses nl_ptr[k], and
-        // indirect[k] gives the symbol for stub[k].
-        // So nl_ptr[k] should contain the resolved address for symbol at indirect[k].
 
         let symbols: Vec<_> = macho.symbols().collect();
         let mut bound = 0;
@@ -305,7 +295,7 @@ impl Linker {
                 (target_addr as *mut u64).write(addr);
             }
 
-            log::debug!("nl_sym[{k}] {name} → {addr:#x} at {target_addr:#x}");
+            log::debug!("nl_sym[{k}] {name} -> {addr:#x} at {target_addr:#x}");
             bound += 1;
         }
 
@@ -352,7 +342,7 @@ impl Linker {
     /// Run initializers for all loaded libraries, then the main binary.
     pub fn run_all_initializers(&self, main_binary: &MachOBinary) -> Result<(), LinkError> {
         // ObjC class_data fixup is handled by swift_metadata_translate.rs.
-        // Skip slid dylibs (vmaddr=0) — their pointers reference pre-slide addresses.
+        // Skip slid dylibs (vmaddr=0) - their pointers reference pre-slide addresses.
         for lib in self.loaded_libraries.values() {
             let text_vmaddr = lib.segments.iter().find(|s| s.name == "__TEXT").map(|s| s.vmaddr).unwrap_or(0);
             if text_vmaddr > 0 {
@@ -362,8 +352,6 @@ impl Linker {
             }
         }
         // Register ObjC classes from the main binary (names only, skip method parsing).
-        // This runs BEFORE translate_swift_metadata so class_data_bits at +32 is still valid.
-        // Method dispatch for main binary classes is handled by grafted_lookup_method.
         if let Err(e) = self.register_objc_class_names(main_binary) {
             log::debug!("ObjC class names for main binary: {}", e);
         }
@@ -416,7 +404,7 @@ impl Linker {
                                 log::info!("    data_ptr={:p} (raw={:#x})", data_ptr, raw_data_ptr);
 
                                 // class_ro_t layout: flags(4) + instanceStart(4) + instanceSize(4) +
-                                // reserved(4) + ivarLayout(8) + name(8) → name is at +24
+                                // reserved(4) + ivarLayout(8) + name(8) -> name is at +24
                                 let class_name_ptr = std::ptr::read_unaligned((data_ptr as *const u8).add(24) as *const *const i8);
                                 
                                 let class_name = if !class_name_ptr.is_null() {
@@ -634,8 +622,6 @@ impl Linker {
         }
 
         // Auto-generate stub ObjC classes for _OBJC_CLASS_$_ and _OBJC_METACLASS_$_ symbols.
-        // Darwin binaries reference classes by these symbols; we create minimal stubs
-        // registered with our ObjC runtime so objc_msgSend can dispatch to them.
         if let Some(class_name) = symbol.strip_prefix("_OBJC_CLASS_$_") {
             let cls = auto_create_objc_class(class_name);
             if !cls.is_null() {
@@ -643,21 +629,21 @@ impl Linker {
             }
         }
         if let Some(class_name) = symbol.strip_prefix("_OBJC_METACLASS_$_") {
-            // Metaclass — for simplicity, return the same class pointer
+            // Metaclass - for simplicity, return the same class pointer
             let cls = auto_create_objc_class(class_name);
             if !cls.is_null() {
                 return Ok(cls as u64);
             }
         }
 
-        // Try dlsym as last resort — Swift runtime libraries are loaded with RTLD_GLOBAL,
+        // Try dlsym as last resort - Swift runtime libraries are loaded with RTLD_GLOBAL,
         // so Foundation/Observation/etc. symbols are in the global symbol table.
         if symbol.starts_with("_$s") || symbol.starts_with("$s") || symbol.starts_with("_swift_") {
             let clean = symbol.strip_prefix('_').unwrap_or(symbol);
             let c_name = std::ffi::CString::new(clean).unwrap();
             let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
             if !addr.is_null() {
-                log::debug!("dlsym fallback resolved: {symbol} → {:#x}", addr as u64);
+                log::debug!("dlsym fallback resolved: {symbol} -> {:#x}", addr as u64);
                 return Ok(addr as u64);
             }
         }
@@ -716,7 +702,7 @@ fn auto_create_objc_class(name: &str) -> grafted_objc::types::Class {
     use std::sync::Mutex;
     use std::collections::HashMap as HMap;
 
-    // Class pointers are process-lifetime allocations — safe to share across threads.
+    // Class pointers are process-lifetime allocations - safe to share across threads.
     struct SendClass(HMap<String, grafted_objc::types::Class>);
     unsafe impl Send for SendClass {}
     static CLASS_CACHE: Mutex<Option<SendClass>> = Mutex::new(None);
@@ -732,7 +718,7 @@ fn auto_create_objc_class(name: &str) -> grafted_objc::types::Class {
     let c_name = std::ffi::CString::new(name).unwrap_or_default();
     let existing = grafted_objc::objc_getClass(c_name.as_ptr());
     if !existing.is_null() {
-        log::debug!("auto_create_objc_class: reusing registered class {} → {:p}", name, existing);
+        log::debug!("auto_create_objc_class: reusing registered class {} -> {:p}", name, existing);
         map.insert(name.to_string(), existing);
         return existing;
     }
