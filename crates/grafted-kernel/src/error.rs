@@ -8,6 +8,6 @@ pub enum KernelError {
     #[error("ioctl failed: {0}")]
     Ioctl(#[from] nix::Error),
 
-    #[error("kernel module not loaded — run `sudo insmod grafted-kmod.ko`")]
+    #[error("kernel module not loaded - run `sudo insmod grafted-kmod.ko`")]
     ModuleNotLoaded,
 }

@@ -1,6 +1,4 @@
 //! ioctl definitions for communicating with /dev/grafted.
-//!
-//! These must match the definitions in grafted-kmod/c/grafted_ioctl.h.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
@@ -9,7 +7,7 @@ use crate::error::KernelError;
 
 const GRAFTED_DEVICE: &str = "/dev/grafted";
 
-// ioctl magic number — 'G' for Grafted
+// ioctl magic number - 'G' for Grafted
 const GRAFTED_IOC_MAGIC: u8 = b'G';
 
 // ioctl command numbers

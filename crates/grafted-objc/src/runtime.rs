@@ -99,11 +99,6 @@ pub extern "C" fn grafted_lookup_method(receiver: id, selector: SEL) -> IMP {
     }
 
     // Try exact pointer match first (fast path), then string-based fallback.
-    // Binary selectors come from __objc_selrefs (binary data) while our
-    // registered selectors come from sel_registerName (heap) — different pointers
-    // for the same string. We need string comparison as fallback.
-    // Check receiver itself (class method dispatch) and receiver.isa (instance dispatch).
-    // Guard against bad isa pointers from binary objects with translated metadata.
     let isa = unsafe { (*receiver).isa };
     let isa_addr = isa as usize;
     let safe_isa = if isa_addr > 0x1000 && isa_addr < 0x800000000000 { isa } else { std::ptr::null_mut() };
@@ -122,8 +117,6 @@ pub extern "C" fn grafted_lookup_method(receiver: id, selector: SEL) -> IMP {
     }
 
     // The binary may use its own selector pointer (from __objc_selrefs) which differs
-    // from our sel_registerName pointer. Look up the selector string in our registry.
-    // Only do this if the selector pointer looks like a valid string address.
     let sel_addr = selector as usize;
     if sel_addr > 0x1000 {
         // Check if this selector string already exists in SELECTOR_REGISTRY
@@ -204,8 +197,6 @@ unsafe extern "C" fn grafted_returns_null(_self: id, _sel: SEL) -> *mut u8 { std
 unsafe extern "C" fn grafted_returns_zero(_self: id, _sel: SEL) -> u64 { 0 }
 
 // objc_msgSend implementation in naked assembly.
-// Must save argument registers, call grafted_lookup_method, restore registers,
-// and tail-call (jmp) to the returned IMP (in rax).
 global_asm!(r#"
     .global objc_msgSend
     .type objc_msgSend, @function

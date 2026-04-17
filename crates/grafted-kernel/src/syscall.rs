@@ -1,5 +1,4 @@
 //! Darwin BSD syscalls use the convention: rax = 0x2000000 | unix_syscall_nr.
-//! This module strips the class bits and maps Darwin syscall numbers to Linux.
 
 /// Darwin syscall class bits (top byte of rax).
 pub const DARWIN_SYSCALL_CLASS_MASK: u64 = 0xFF00_0000;
@@ -10,9 +9,9 @@ pub const DARWIN_SYSCALL_NUMBER_MASK: u64 = 0x00FF_FFFF;
 /// Result of classifying a Darwin syscall.
 #[derive(Debug, Clone, Copy)]
 pub enum DarwinSyscall {
-    /// BSD/UNIX syscall — can be translated to Linux equivalent.
+    /// BSD/UNIX syscall - can be translated to Linux equivalent.
     Unix { darwin_nr: u32, linux_nr: i64 },
-    /// Mach trap — needs kernel module handling.
+    /// Mach trap - needs kernel module handling.
     MachTrap { trap_nr: u32 },
     /// Unknown or unsupported syscall class.
     Unknown { raw: u64 },
@@ -39,57 +38,52 @@ pub fn translate(raw_syscall: u64) -> DarwinSyscall {
 /// Map a Darwin BSD syscall number to a Linux syscall number.
 /// Returns -1 for unimplemented syscalls.
 fn darwin_unix_to_linux(darwin_nr: u32) -> i64 {
-    // Darwin BSD → Linux x86_64 syscall number mapping.
-    // Only the syscalls we've actually encountered are mapped here.
-    // Add new entries as real binaries demand them.
+    // Darwin BSD -> Linux x86_64 syscall number mapping.
     match darwin_nr {
         // Process lifecycle
-        1 => 60,    // exit → exit
-        2 => 57,    // fork → fork
-        7 => 61,    // wait4 → wait4
-        20 => 39,   // getpid → getpid
+        1 => 60,    // exit -> exit
+        2 => 57,    // fork -> fork
+        7 => 61,    // wait4 -> wait4
+        20 => 39,   // getpid -> getpid
 
         // File I/O
-        3 => 0,     // read → read
-        4 => 1,     // write → write
-        5 => 2,     // open → open
-        6 => 3,     // close → close
+        3 => 0,     // read -> read
+        4 => 1,     // write -> write
+        5 => 2,     // open -> open
+        6 => 3,     // close -> close
 
         // File operations
-        10 => 87,   // unlink → unlink
-        15 => 90,   // chmod → chmod
-        16 => 93,   // chown → chown
+        10 => 87,   // unlink -> unlink
+        15 => 90,   // chmod -> chmod
+        16 => 93,   // chown -> chown
 
         // Memory
-        197 => 9,   // mmap → mmap
-        73 => 11,   // munmap → munmap
-        74 => 10,   // mprotect → mprotect
+        197 => 9,   // mmap -> mmap
+        73 => 11,   // munmap -> munmap
+        74 => 10,   // mprotect -> mprotect
 
         // Signals
-        46 => 13,   // sigaction → rt_sigaction
-        48 => 62,   // kill → kill
-        13 => 13,   // fchdir → fchdir (also catches unprefixed rt_sigaction)
+        46 => 13,   // sigaction -> rt_sigaction
+        48 => 62,   // kill -> kill
+        13 => 13,   // fchdir -> fchdir (also catches unprefixed rt_sigaction)
 
         // Directory
-        59 => 84,   // execve → ... (complex, not 1:1)
-        338 => 59,  // posix_spawn → (no direct equivalent, map to execve for now)
+        59 => 84,   // execve -> ... (complex, not 1:1)
+        338 => 59,  // posix_spawn -> (no direct equivalent, map to execve for now)
 
         // Time
-        116 => 96,  // gettimeofday → gettimeofday
+        116 => 96,  // gettimeofday -> gettimeofday
 
         // Identity
-        24 => 102,  // getuid → getuid
-        25 => 104,  // geteuid → geteuid
-        43 => 103,  // getegid → getegid
-        47 => 107,  // getgid → getgid
+        24 => 102,  // getuid -> getuid
+        25 => 104,  // geteuid -> geteuid
+        43 => 103,  // getegid -> getegid
+        47 => 107,  // getgid -> getgid
 
         // Socket (numbers differ significantly)
-        // Darwin socket calls are in the 97-137 range
-        // Linux socket calls are 41-55
-        // TODO: map individually as needed
 
         // ioctl
-        54 => 16,   // ioctl → ioctl
+        54 => 16,   // ioctl -> ioctl
 
         // Unimplemented
         _ => -1,

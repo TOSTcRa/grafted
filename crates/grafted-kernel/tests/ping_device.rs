@@ -1,5 +1,4 @@
-//! Integration test — pings /dev/grafted and checks the module responds.
-//! Requires the kernel module to be loaded.
+//! Integration test - pings /dev/grafted and checks the module responds.
 
 use grafted_kernel::ioctl::GraftedDevice;
 

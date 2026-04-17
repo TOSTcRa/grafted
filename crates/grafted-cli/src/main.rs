@@ -5,7 +5,7 @@ use clap::Parser;
 
 use grafted_loader::MachOBinary;
 
-/// Grafted — run Darwin binaries on Linux.
+/// Grafted - run Darwin binaries on Linux.
 #[derive(Parser, Debug)]
 #[command(name = "grafted", version, about)]
 struct Args {
@@ -121,7 +121,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
 
-        // Translate Swift metadata layout (Mach-O → Linux compatible)
+        // Translate Swift metadata layout (Mach-O -> Linux compatible)
         // Must run AFTER fixups and ObjC registration but BEFORE register_swift_sections.
         grafted_frameworks::swift_metadata_translate::translate_swift_metadata(&binary.data, binary.slide);
 
@@ -129,7 +129,7 @@ fn main() -> ExitCode {
         grafted_frameworks::swift_sections::register_swift_sections(&binary.data, binary.slide);
 
         // Install safe retain/release hooks via Swift runtime's own hook mechanism.
-        // Must run AFTER Swift runtime is loaded (by framework_registry → swift_symbols).
+        // Must run AFTER Swift runtime is loaded (by framework_registry -> swift_symbols).
         grafted_frameworks::registry::install_swift_retain_hooks();
     }
 
