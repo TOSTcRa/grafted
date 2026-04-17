@@ -1,11 +1,8 @@
-//! Framework symbol registry — maps Darwin framework paths to our implementations.
-//!
-//! When a Darwin binary loads `/System/Library/Frameworks/AppKit.framework/...`,
-//! the linker calls `framework_symbols()` to get our implementation addresses.
+//! Framework symbol registry - maps Darwin framework paths to our implementations.
 
 use std::collections::HashMap;
 
-/// Returns a map: framework_path → { symbol_name → address }.
+/// Returns a map: framework_path -> { symbol_name -> address }.
 /// The linker merges these into its symbol registry.
 static REAL_GET_TYPE_FN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -55,8 +52,6 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
     );
 
     // Swift runtime: try loading real libswiftCore.so from Linux Swift toolchain.
-    // If available, ALL Swift metadata/dispatch/memory functions work natively.
-    // Fall back to stubs if not found.
     let real_swift = crate::swift_runtime::swift_symbols();
     if let Some(&addr) = real_swift.get("_swift_getTypeByMangledNameInContext2") {
         log::info!("FOUND REAL SWIFT FN: {:x}", addr);
@@ -75,10 +70,6 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
         let mut merged = stubs_only.clone();
         merged.extend(real_swift);
         // With the metadata translation layer (swift_metadata_translate.rs),
-        // all class metadata has valid layout. Let the real runtime handle
-        // everything. Only keep conformsToProtocol stub as fallback
-        // (protocol conformance scanning doesn't work across Mach-O/ELF boundary).
-        // Set GRAFTED_SWIFT_STUBS=1 to restore all stubs for debugging.
         if std::env::var("GRAFTED_SWIFT_STUBS").is_ok() {
             log::info!("GRAFTED_SWIFT_STUBS: keeping all metadata stubs");
             for sym_name in [
@@ -95,13 +86,7 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
                 }
             }
         } else {
-            // Only swift_conformsToProtocol stays as stub — it scans ALL
-            // loaded images for protocol conformances, which spins when
-            // it finds conformance records referencing types from incomplete
-            // framework stubs. All other metadata functions use the real runtime.
-            // These functions involve cross-image protocol/witness scanning
-            // that spins on incomplete framework conformances.
-            // getGenericMetadata also fails when conformance checks are stubbed.
+            // Only swift_conformsToProtocol stays as stub - it scans ALL
             for sym_name in [
                 "_swift_conformsToProtocol", "swift_conformsToProtocol",
                 "_swift_getWitnessTable", "swift_getWitnessTable",
@@ -164,7 +149,7 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
         "/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices",
     ] {
         if let Some(entry) = reg.get_mut::<str>(fw) {
-            // Swift symbols fill gaps — don't overwrite framework-specific stubs
+            // Swift symbols fill gaps - don't overwrite framework-specific stubs
             for (k, v) in &swift_syms {
                 entry.entry(k.clone()).or_insert(*v);
             }
@@ -178,18 +163,25 @@ pub fn framework_registry() -> HashMap<String, HashMap<String, u64>> {
     reg.insert("/usr/lib/libSystem.B.dylib".into(), system_extras());
     reg.insert("self".into(), system_extras());
 
-    // SwiftUI — use our compiled shim (shims/libSwiftUI.so) symbols if available,
+    // SwiftUI - use our compiled shim (shims/libSwiftUI.so) symbols if available,
     // otherwise fall back to stubs.
     {
         let mut swiftui = HashMap::new();
         // Start with stub defaults
         swiftui.insert("_$s7SwiftUI3AppPAAE4mainyyFZ".into(),
             crate::appkit::application::NSApplicationMain as *const () as u64);
-        swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVMa".into(), swift_noop_ptr as *const () as u64);
-        swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVMn".into(), swift_noop_ptr as *const () as u64);
+        swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVMa".into(), swift_metadata_accessor_stub as *const () as u64);
+        swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVMn".into(), swift_metadata_accessor_stub as *const () as u64);
         swiftui.insert("_$s7SwiftUI28NSApplicationDelegateAdaptorVyACyxGxmcfC".into(), swift_noop_ptr as *const () as u64);
+        // SwiftUI core type metadata accessors - fix for RAX=0x0 crash at 0x10006fcd1
+        swiftui.insert("_$s7SwiftUI18LocalizedStringKeyVMa".into(), swift_metadata_accessor_stub as *const () as u64);
+        swiftui.insert("_$s7SwiftUI18LocalizedStringKeyVMn".into(), swift_metadata_accessor_stub as *const () as u64);
+        swiftui.insert("_$s7SwiftUI4TextVMa".into(), swift_metadata_accessor_stub as *const () as u64);
+        swiftui.insert("_$s7SwiftUI4TextVMn".into(), swift_metadata_accessor_stub as *const () as u64);
+        swiftui.insert("_$s7SwiftUI4ViewPMa".into(), swift_metadata_accessor_stub as *const () as u64);
+        swiftui.insert("_$s7SwiftUI4ViewPMn".into(), swift_metadata_accessor_stub as *const () as u64);
         // Override with REAL shim symbols (from compiled libSwiftUI.so)
-        // These include App.main() that calls body getter → creates real windows
+        // These include App.main() that calls body getter -> creates real windows
         for (k, v) in &swift_syms {
             if k.contains("SwiftUI") {
                 // Intercept symbols that require String ABI translation
@@ -330,9 +322,22 @@ fn core_foundation_symbols() -> HashMap<String, u64> {
         runloop::kCFRunLoopDefaultMode.as_ptr() as u64);
     s.insert("_kCFRunLoopCommonModes".into(),
         runloop::kCFRunLoopCommonModes.as_ptr() as u64);
-    // RunLoop observers (stub)
-    sym!(s, "_CFRunLoopAddObserver", swift_noop);
-    sym!(s, "_CFRunLoopRemoveObserver", swift_noop);
+    // Nested-mode constants (Step 1). Point _NSEventTrackingRunLoopMode /
+    s.insert("_NSEventTrackingRunLoopMode".into(),
+        runloop::NSEventTrackingRunLoopMode.as_ptr() as u64);
+    s.insert("_NSModalPanelRunLoopMode".into(),
+        runloop::NSModalPanelRunLoopMode.as_ptr() as u64);
+    s.insert("_UITrackingRunLoopMode".into(),
+        runloop::UITrackingRunLoopMode.as_ptr() as u64);
+    // Observer functions (real implementations; Step 1 replaced the previous stubs)
+    sym!(s, "_CFRunLoopObserverCreate", runloop::CFRunLoopObserverCreate);
+    sym!(s, "_CFRunLoopAddObserver", runloop::CFRunLoopAddObserver);
+    sym!(s, "_CFRunLoopRemoveObserver", runloop::CFRunLoopRemoveObserver);
+    sym!(s, "_CFRunLoopContainsSource", runloop::CFRunLoopContainsSource);
+    sym!(s, "_CFRunLoopRemoveTimer", runloop::CFRunLoopRemoveTimer);
+    sym!(s, "_CFRunLoopAddCommonMode", runloop::CFRunLoopAddCommonMode);
+    sym!(s, "_CFRunLoopCopyCurrentMode", runloop::CFRunLoopCopyCurrentMode);
+    // Handler-block variant is unimplemented (requires block support)
     sym!(s, "_CFRunLoopObserverCreateWithHandler", swift_noop_ptr);
     // NS constants also imported via CoreFoundation
     s.insert("_NSDefaultRunLoopMode".into(), runloop::kCFRunLoopDefaultMode.as_ptr() as u64);
@@ -445,8 +450,8 @@ fn appkit_symbols() -> HashMap<String, u64> {
     for name in [
         "_NSAboutPanelOptionCredits",
         "_NSApplicationDidChangeScreenParametersNotification",
-        "_NSDefaultRunLoopMode",
-        "_NSEventTrackingRunLoopMode",
+        // _NSDefaultRunLoopMode / _NSEventTrackingRunLoopMode / _NSModalPanelRunLoopMode
+        // registered above with real runloop mode pointers (see Step 1).
         "_NSFontAttributeName",
         "_NSForegroundColorAttributeName",
         "_NSKeyValueChangeIndexesKey",
@@ -496,7 +501,9 @@ fn foundation_symbols() -> HashMap<String, u64> {
     s.extend(core_foundation_symbols());
     // NS global constant strings
     for name in [
-        "_NSDefaultRunLoopMode", "_NSURLFileSizeKey",
+        // _NSDefaultRunLoopMode is bound to the real runloop default-mode pointer
+        // inside core_foundation_symbols(); do NOT overwrite it here.
+        "_NSURLFileSizeKey",
         "_NSKeyValueChangeIndexesKey", "_NSKeyValueChangeKindKey",
         "_NSKeyValueChangeNewKey", "_NSKeyValueChangeNotificationIsPriorKey",
         "_NSKeyValueChangeOldKey",
@@ -609,7 +616,7 @@ fn core_services_symbols() -> HashMap<String, u64> {
 
 fn swift_runtime_symbols() -> HashMap<String, u64> {
     let mut s = HashMap::new();
-    // Swift runtime entry points — stubs that prevent crashes
+    // Swift runtime entry points - stubs that prevent crashes
     // Real Swift apps need these to initialize the runtime
     sym!(s, "_swift_retain", swift_retain);
     sym!(s, "_swift_release", swift_release);
@@ -766,7 +773,7 @@ fn swift_runtime_symbols() -> HashMap<String, u64> {
 
 fn libcxx_symbols() -> HashMap<String, u64> {
     let mut s = HashMap::new();
-    // libc++ ABI — minimal stubs
+    // libc++ ABI - minimal stubs
     sym!(s, "___cxa_atexit", swift_noop);
     sym!(s, "___cxa_guard_acquire", cxa_guard_acquire);
     sym!(s, "___cxa_guard_release", swift_noop);
@@ -806,9 +813,38 @@ unsafe extern "C" fn swift_once(predicate: *mut isize, fn_ptr: unsafe extern "C"
 }
 unsafe extern "C" fn swift_noop() {}
 unsafe extern "C" fn swift_noop_ptr(p: *mut u8) -> *mut u8 { p }
+
+/// Proper metadata accessor stub that returns valid metadata pointer instead of MetadataRequest
+unsafe extern "C" fn swift_metadata_accessor_stub(_request: u64) -> *const u8 {
+    // Create a minimal valid metadata structure
+    // Swift metadata starts with a kind field (u64) and value witness table pointer
+    static mut STUB_METADATA: [u64; 16] = [0; 16];
+    static INIT_ONCE: std::sync::Once = std::sync::Once::new();
+
+    INIT_ONCE.call_once(|| unsafe {
+        // Set metadata kind to Class (1)
+        STUB_METADATA[0] = 1;
+        // Set VWT pointer to a proper VWT stub (not null!)
+        STUB_METADATA[1] = safe_vwt_ptr() as u64;
+        // Initialize other fields to safe defaults
+        for i in 2..16 {
+            STUB_METADATA[i] = 0;
+        }
+    });
+
+    unsafe { std::ptr::addr_of!(STUB_METADATA) as *const u8 }
+}
+
 unsafe extern "C" fn swift_noop_false() -> i32 { 0 }
 unsafe extern "C" fn swift_noop_true() -> i32 { 1 }
 unsafe extern "C" fn noop_ptr() -> *mut u8 { std::ptr::null_mut() }
+
+// Simple static dummy value (non-null address)
+static DUMMY_VWT: u64 = 0x1000;
+
+unsafe extern "C" fn safe_vwt_ptr() -> *const u8 {
+    &DUMMY_VWT as *const u64 as *const u8
+}
 unsafe extern "C" fn swift_deleted_method() {
     let msg = b"grafted: swift_deletedMethodError\n";
     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
@@ -816,8 +852,6 @@ unsafe extern "C" fn swift_deleted_method() {
 }
 unsafe extern "C" fn swift_check_metadata(metadata: *mut u8, _request: usize) -> MetadataResponse {
     // During lifecycle: ALWAYS return our stub metadata (with valid VWT, size=8).
-    // The binary reads VWT.size after this call and does `subq %rax,%rsp`.
-    // If VWT.size is garbage (0x211 or a pointer), it blows the stack.
     if LIFECYCLE_PATCHES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return MetadataResponse { metadata: shim_unresolved_soft_metadata(), state: 0 };
     }
@@ -862,16 +896,11 @@ unsafe extern "C" fn safe_getAssociatedTypeWitness(
 }
 
 /// No-op witness function: returns stub object with String-safe fields.
-/// Witness table entries are protocol requirements. Callers may treat the
-/// result as a String, so we return an object with empty String patterns
-/// rather than raw metadata (which gets misinterpreted as native String).
 unsafe extern "C" fn witness_noop(_obj: *mut u8, _wt: *mut u8) -> *mut u8 {
     safe_return_stub_object(std::ptr::null_mut(), std::ptr::null_mut())
 }
 
 /// Get a valid stub witness table filled with no-op function pointers.
-/// Witness tables contain function pointers (protocol requirements), so entries
-/// must be callable. Each entry is a no-op that returns its first argument.
 fn get_stub_witness_table() -> *mut u8 {
     static STUB_WT: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
     let wt = STUB_WT.load(std::sync::atomic::Ordering::Acquire);
@@ -887,7 +916,17 @@ fn get_stub_witness_table() -> *mut u8 {
 }
 
 /// No-op function for patching init functions that corrupt our stub metadata.
-unsafe extern "C" fn safe_noop_return() {}
+unsafe extern "C" fn safe_noop_return() {
+    unsafe {
+        std::arch::asm!(
+            "xor eax, eax",
+            "mov rdx, 0xE000000000000000",
+            out("rax") _,
+            out("rdx") _,
+            options(nomem, nostack)
+        );
+    }
+}
 /// Return a stub that works BOTH as metadata (VWT at [-1]) AND as a
 /// heap object (String-safe fields at positive offsets).
 unsafe extern "C" fn safe_return_stub_object(_a: *mut u8, _b: *mut u8) -> *mut u8 {
@@ -914,15 +953,22 @@ unsafe extern "C" fn safe_return_stub_object(_a: *mut u8, _b: *mut u8) -> *mut u
     }
     let obj = obj_ptr as *mut u8;
     STUB_OBJ.store(obj, std::sync::atomic::Ordering::Release);
+    // Set rdx to empty-String discriminator for callers expecting 16-byte returns
+    unsafe { std::arch::asm!("mov rdx, 0xE000000000000000", out("rdx") _, options(nomem, nostack, preserves_flags)); }
     obj
 }
-/// Return stub metadata (not null — null metadata causes VWT[-1] crashes)
+/// Return stub metadata (not null - null metadata causes VWT[-1] crashes)
 unsafe extern "C" fn safe_return_null(_a: *mut u8, _b: *mut u8) -> *mut u8 {
+    unsafe { std::arch::asm!("mov rdx, 0xE000000000000000", out("rdx") _, options(nomem, nostack, preserves_flags)); }
     shim_unresolved_soft_metadata()
 }
 /// Return false (0)
-unsafe extern "C" fn safe_return_false(_a: *mut u8, _b: *mut u8) -> i32 { 0 }
+unsafe extern "C" fn safe_return_false(_a: *mut u8, _b: *mut u8) -> i32 {
+    unsafe { std::arch::asm!("mov rdx, 0xE000000000000000", out("rdx") _, options(nomem, nostack, preserves_flags)); }
+    0
+}
 unsafe extern "C" fn safe_return_stub_metadata(_a: *mut u8, _b: usize, _c: *mut u8, _d: *mut u8) -> *mut u8 {
+    unsafe { std::arch::asm!("mov rdx, 0xE000000000000000", out("rdx") _, options(nomem, nostack, preserves_flags)); }
     shim_unresolved_soft_metadata()
 }
 
@@ -931,21 +977,19 @@ unsafe extern "C" fn safe_return_stub_metadata(_a: *mut u8, _b: usize, _c: *mut 
 unsafe extern "C" fn swift_once_lifecycle(predicate: *mut isize, fn_ptr: unsafe extern "C" fn(*mut u8), ctx: *mut u8) {
     if !predicate.is_null() && unsafe { *predicate } == 0 {
         unsafe { *predicate = -1 };
-        // Try calling the callback — if it crashes, skip it
+        // Try calling the callback - if it crashes, skip it
         unsafe extern "C" { fn grafted_try_call(f: unsafe extern "C" fn(*mut u8, *mut u8), a: *mut u8, b: *mut u8) -> bool; }
         // Wrap the single-arg fn_ptr as a two-arg call (second arg unused)
         type TwoArgFn = unsafe extern "C" fn(*mut u8, *mut u8);
         let f: TwoArgFn = std::mem::transmute(fn_ptr as *const ());
         let ok = unsafe { grafted_try_call(f, ctx, std::ptr::null_mut()) };
         if !ok {
-            log::debug!("swift_once callback crashed — skipped");
+            log::debug!("swift_once callback crashed - skipped");
         }
     }
 }
 
 /// Safe swift_conformsToProtocol: returns stub witness table instead of NULL.
-/// Returning NULL causes downstream code to crash when using the result
-/// as a witness table (e.g., Dictionary.allocate needs Hashable conformance).
 unsafe extern "C" fn safe_conformsToProtocol(
     _type: *const u8,
     _protocol: *const u8,
@@ -1058,7 +1102,7 @@ unsafe fn patch_function(name: &str, replacement: *const u8) {
 
     // Restore page protection
     libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
-    log::info!("Patched {} → {:#x}", name, replacement as u64);
+    log::info!("Patched {} -> {:#x}", name, replacement as u64);
 }
 
 /// Get/create the universal stub metadata pointer (with VWT, descriptor, etc.)
@@ -1099,7 +1143,7 @@ pub static LIFECYCLE_PATCHES_ACTIVE: std::sync::atomic::AtomicBool =
 unsafe extern "C" fn smart_checkMetadataState(metadata: *mut u8, request: usize) -> MetadataResponse {
     let addr = metadata as usize;
 
-    // During lifecycle: ALWAYS return Complete. Never call the real function —
+    // During lifecycle: ALWAYS return Complete. Never call the real function -
     // it triggers recursive metadata resolution that stack-overflows.
     if LIFECYCLE_PATCHES_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         if addr <= 0x1000 || addr >= 0x800000000000 {
@@ -1118,12 +1162,12 @@ unsafe extern "C" fn smart_checkMetadataState(metadata: *mut u8, request: usize)
         type RealFn = unsafe extern "C" fn(*mut u8, usize) -> MetadataResponse;
         let f: RealFn = std::mem::transmute(trampoline);
         let resp = f(metadata, request);
-        // Validate VWT after the real function — swift_initStructMetadata may
+        // Validate VWT after the real function - swift_initStructMetadata may
         // have corrupted metadata[-1] with computed garbage (e.g., 0x211).
         if !resp.metadata.is_null() && (resp.metadata as usize) > 0x1000 {
             let vwt = *((resp.metadata as *const u64).sub(1));
             if vwt < 0x10000 {
-                // VWT is garbage — replace with our universal VWT
+                // VWT is garbage - replace with our universal VWT
                 let stub = shim_unresolved_soft_metadata();
                 let good_vwt = *((stub as *const u64).sub(1));
                 *((resp.metadata as *mut u64).sub(1)) = good_vwt;
@@ -1148,9 +1192,7 @@ unsafe extern "C" fn swift_task_create(
 unsafe extern "C" fn swift_task_alloc(size: usize) -> *mut u8 {
     unsafe { libc::malloc(size) as *mut u8 }
 }
-/// swift_getSingletonMetadata(request, descriptor) → (metadata, state)
-/// The metadata accessor calls this to create/get singleton type metadata.
-/// We create a minimal metadata struct from the descriptor.
+/// swift_getSingletonMetadata(request, descriptor) -> (metadata, state)
 unsafe extern "C" fn swift_get_singleton_metadata(
     _request: usize,
     descriptor: *const u8,
@@ -1170,30 +1212,30 @@ unsafe extern "C" fn swift_get_singleton_metadata(
     }
 
     // Allocate a realistic metadata struct with value witness table.
-    // Swift metadata layout:
-    //   metadata[-1] = pointer to value witness table (VWT)
-    //   metadata[0]  = kind (1=struct, 0=class, 2=enum)
-    //   metadata[1]  = nominal type descriptor
-    //
-    // The VWT contains size, alignment, stride, and function pointers
-    // for copy/destroy/etc.
 
     // First allocate a minimal VWT
     let vwt = unsafe { libc::calloc(1, 256) } as *mut u64;
     unsafe {
         // VWT layout (see swift/ABI/ValueWitness.def):
-        // [0]: initializeBufferWithCopyOfBuffer
-        // [1]: destroy
-        // [2]: initializeWithCopy
-        // [3]: assignWithCopy
-        // [4]: initializeWithTake
-        // [5]: assignWithTake
-        // [6]: getEnumTagSinglePayload
-        // [7]: storeEnumTagSinglePayload
-        // [8]: size (in bytes)
-        // [9]: stride
-        // [10]: flags (alignment - 1 in lower bits, other flags in upper)
-        // [11]: extraInhabitantCount
+
+        // VWT functions with correct Swift ABI signatures
+        unsafe extern "C" fn vwt_initcopy(dest: *mut u8, src: *mut u8, _meta: *const u8) -> *mut u8 {
+            std::ptr::copy_nonoverlapping(src, dest, 8);
+            dest
+        }
+        unsafe extern "C" fn vwt_destroy(_: *mut u8, _: *const u8) {}
+        unsafe extern "C" fn vwt_enum_tag(_: *const u8, _: u32, _: *const u8) -> u32 { 0 }
+        unsafe extern "C" fn vwt_store_enum_tag(_: *mut u8, _: u32, _: u32, _: *const u8) {}
+
+        // Populate VWT slots 0-7 with correct function pointers
+        *vwt.add(0) = vwt_initcopy as *const () as u64;  // initializeBufferWithCopyOfBuffer
+        *vwt.add(1) = vwt_destroy as *const () as u64;   // destroy
+        *vwt.add(2) = vwt_initcopy as *const () as u64;  // initializeWithCopy
+        *vwt.add(3) = vwt_initcopy as *const () as u64;  // assignWithCopy
+        *vwt.add(4) = vwt_initcopy as *const () as u64;  // initializeWithTake
+        *vwt.add(5) = vwt_initcopy as *const () as u64;  // assignWithTake
+        *vwt.add(6) = vwt_enum_tag as *const () as u64;  // getEnumTagSinglePayload
+        *vwt.add(7) = vwt_store_enum_tag as *const () as u64; // storeEnumTagSinglePayload
         *vwt.add(8) = 8;     // size = 8 bytes
         *vwt.add(9) = 8;     // stride = 8 bytes
         *vwt.add(10) = 7;    // flags: alignment=8 (alignment-1 = 7)
@@ -1242,7 +1284,7 @@ unsafe extern "C" fn swift_get_singleton_metadata(
         }
     }
     let ptr = metadata as *mut u8;
-    log::info!("swift_getSingletonMetadata: descriptor={:#x} → metadata={:p}", key, ptr);
+    log::info!("swift_getSingletonMetadata: descriptor={:#x} -> metadata={:p}", key, ptr);
     map.insert(key, ptr);
     ptr
 }
@@ -1260,17 +1302,24 @@ unsafe extern "C" fn swift_get_generic_metadata_stub(
 
     // Create a minimal VWT at metadata[-1]
     let vwt = unsafe { libc::calloc(1, 256) } as *mut u64;
-    unsafe extern "C" fn dummy_vwt_func(arg: *mut u8) -> *mut u8 { arg }
-    let dummy = dummy_vwt_func as *const () as u64;
     unsafe {
-        *vwt.add(0) = dummy; // initializeBufferWithCopyOfBuffer
-        *vwt.add(1) = dummy; // destroy
-        *vwt.add(2) = dummy; // initializeWithCopy
-        *vwt.add(3) = dummy; // assignWithCopy
-        *vwt.add(4) = dummy; // initializeWithTake
-        *vwt.add(5) = dummy; // assignWithTake
-        *vwt.add(6) = dummy; // getEnumTagSinglePayload
-        *vwt.add(7) = dummy; // storeEnumTagSinglePayload
+        // VWT functions with correct Swift ABI signatures
+        unsafe extern "C" fn vwt_initcopy(dest: *mut u8, src: *mut u8, _meta: *const u8) -> *mut u8 {
+            std::ptr::copy_nonoverlapping(src, dest, 8);
+            dest
+        }
+        unsafe extern "C" fn vwt_destroy(_: *mut u8, _: *const u8) {}
+        unsafe extern "C" fn vwt_enum_tag(_: *const u8, _: u32, _: *const u8) -> u32 { 0 }
+        unsafe extern "C" fn vwt_store_enum_tag(_: *mut u8, _: u32, _: u32, _: *const u8) {}
+
+        *vwt.add(0) = vwt_initcopy as *const () as u64; // initializeBufferWithCopyOfBuffer
+        *vwt.add(1) = vwt_destroy as *const () as u64; // destroy
+        *vwt.add(2) = vwt_initcopy as *const () as u64; // initializeWithCopy
+        *vwt.add(3) = vwt_initcopy as *const () as u64; // assignWithCopy
+        *vwt.add(4) = vwt_initcopy as *const () as u64; // initializeWithTake
+        *vwt.add(5) = vwt_initcopy as *const () as u64; // assignWithTake
+        *vwt.add(6) = vwt_enum_tag as *const () as u64; // getEnumTagSinglePayload
+        *vwt.add(7) = vwt_store_enum_tag as *const () as u64; // storeEnumTagSinglePayload
         *vwt.add(8) = 8;     // size
         *vwt.add(9) = 8;     // stride
         *vwt.add(10) = 7;    // flags (alignment-1)
@@ -1287,9 +1336,7 @@ unsafe extern "C" fn swift_get_generic_metadata_stub(
 
 unsafe extern "C" fn swift_isa_mask_val() -> u64 { 0x0000_7FFF_FFFF_FFF8 }
 
-/// swift_getTypeByMangledNameInContext — look up Swift type metadata.
-/// Returns a minimal valid metadata struct so callers don't get NULL.
-/// The metadata is cached per mangled name string.
+/// swift_getTypeByMangledNameInContext - look up Swift type metadata.
 unsafe extern "C" fn swift_get_type_by_mangled_name(
     mangled_name: *const u8,
     mangled_name_length: usize,
@@ -1300,8 +1347,6 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
     use std::sync::Mutex;
 
     // Try the REAL Swift runtime function if available, but only for names
-    // that don't contain Mach-O symbolic references (bytes 0x01-0x1F).
-    // Symbolic refs point into Mach-O sections the Linux runtime can't resolve.
     type RealFn = unsafe extern "C" fn(*const u8, usize, *const u8, *const *const u8) -> *mut u8;
     let real_addr = REAL_GET_TYPE_FN.load(std::sync::atomic::Ordering::SeqCst);
     if real_addr != 0 && !mangled_name.is_null() {
@@ -1311,18 +1356,25 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
             let b = unsafe { *mangled_name.add(i) };
             b >= 0x01 && b <= 0x1F
         });
+        if has_symbolic_ref {
+            log::warn!("swift_getTypeByMangledNameInContext: detected symbolic references in name (len={}), rejecting", len);
+        }
         if !has_symbolic_ref {
             let real_fn: RealFn = unsafe { std::mem::transmute(real_addr) };
             let real_meta = unsafe { real_fn(mangled_name, mangled_name_length, generic_env, generic_args) };
             if !real_meta.is_null() {
                 return real_meta;
             }
+        } else {
+            log::info!("swift_getTypeByMangledNameInContext: symbolic refs detected, proceeding to fallback path");
         }
     }
 
     struct SendPtr(HashMap<Vec<u8>, *mut u8>);
     unsafe impl Send for SendPtr {}
     static CACHE: Mutex<Option<SendPtr>> = Mutex::new(None);
+
+    log::debug!("swift_getTypeByMangledNameInContext: entering fallback cache logic");
 
     // Extract mangled name for caching
     let key = if !mangled_name.is_null() && mangled_name_length > 0 {
@@ -1339,6 +1391,26 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
         vec![0]
     };
 
+    // Reject symbolic references and corrupted names in fallback path too
+    if key.len() > 0 {
+        let has_symbolic_ref = key.iter().any(|&b| b >= 0x01 && b <= 0x1F);
+        let has_mostly_control_chars = key.iter().filter(|&&b| b < 32 && b != 0).count() > key.len() / 3;
+
+        if has_symbolic_ref {
+            let name_str = String::from_utf8_lossy(&key).into_owned();
+            log::info!("swift_getTypeByMangledNameInContext fallback: creating SwiftUI-compatible metadata for symbolic refs '{}' (len={})",
+                      name_str, key.len());
+            // Create SwiftUI-specific metadata for symbolic references
+            return unsafe { create_swiftui_compatible_metadata() };
+        } else if key.len() > 4 && has_mostly_control_chars {
+            let name_str = String::from_utf8_lossy(&key).into_owned();
+            log::warn!("swift_getTypeByMangledNameInContext fallback: corrupted name '{}' (len={})",
+                      name_str, key.len());
+            log::warn!("  raw bytes: {:?}", &key[..key.len().min(20)]);
+            // For truly corrupted names, provide generic metadata
+        }
+    }
+
     let mut cache = CACHE.lock().unwrap();
     let map = &mut cache.get_or_insert_with(|| SendPtr(HashMap::new())).0;
 
@@ -1347,24 +1419,29 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
     }
 
     // Create a minimal valid metadata struct:
-    // We allocate enough for callers to read fields without crashing.
-    // The VWT must be placed at `metadata[-1]` (which is `metadata_ptr - 8`).
     let raw = unsafe { libc::calloc(1, 512) } as *mut u64;
     let metadata = unsafe { raw.add(8) }; // Leave space for negative offsets
 
     // Create a minimal VWT at metadata[-1]
     let vwt = unsafe { libc::calloc(1, 256) } as *mut u64;
-    unsafe extern "C" fn dummy_vwt_func(arg: *mut u8) -> *mut u8 { arg }
-    let dummy = dummy_vwt_func as *const () as u64;
     unsafe {
-        *vwt.add(0) = dummy; // initializeBufferWithCopyOfBuffer
-        *vwt.add(1) = dummy; // destroy
-        *vwt.add(2) = dummy; // initializeWithCopy
-        *vwt.add(3) = dummy; // assignWithCopy
-        *vwt.add(4) = dummy; // initializeWithTake
-        *vwt.add(5) = dummy; // assignWithTake
-        *vwt.add(6) = dummy; // getEnumTagSinglePayload
-        *vwt.add(7) = dummy; // storeEnumTagSinglePayload
+        // VWT functions with correct Swift ABI signatures
+        unsafe extern "C" fn vwt_initcopy(dest: *mut u8, src: *mut u8, _meta: *const u8) -> *mut u8 {
+            std::ptr::copy_nonoverlapping(src, dest, 8);
+            dest
+        }
+        unsafe extern "C" fn vwt_destroy(_: *mut u8, _: *const u8) {}
+        unsafe extern "C" fn vwt_enum_tag(_: *const u8, _: u32, _: *const u8) -> u32 { 0 }
+        unsafe extern "C" fn vwt_store_enum_tag(_: *mut u8, _: u32, _: u32, _: *const u8) {}
+
+        *vwt.add(0) = vwt_initcopy as *const () as u64; // initializeBufferWithCopyOfBuffer
+        *vwt.add(1) = vwt_destroy as *const () as u64; // destroy
+        *vwt.add(2) = vwt_initcopy as *const () as u64; // initializeWithCopy
+        *vwt.add(3) = vwt_initcopy as *const () as u64; // assignWithCopy
+        *vwt.add(4) = vwt_initcopy as *const () as u64; // initializeWithTake
+        *vwt.add(5) = vwt_initcopy as *const () as u64; // assignWithTake
+        *vwt.add(6) = vwt_enum_tag as *const () as u64; // getEnumTagSinglePayload
+        *vwt.add(7) = vwt_store_enum_tag as *const () as u64; // storeEnumTagSinglePayload
         *vwt.add(8) = 8;     // size
         *vwt.add(9) = 8;     // stride
         *vwt.add(10) = 7;    // flags (alignment-1)
@@ -1372,6 +1449,12 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
 
     unsafe {
         let dummy_descriptor = libc::calloc(1, 256) as *mut u64;
+        // Initialize descriptor with basic required fields for SwiftUI types
+        *dummy_descriptor.add(0) = 0x80000010; // flags: struct, generic
+        *dummy_descriptor.add(1) = 0;          // parent (none)
+        *dummy_descriptor.add(2) = 8;          // name length
+        *dummy_descriptor.add(3) = 8;          // num fields
+        *dummy_descriptor.add(4) = 0;          // field offset vector offset
         *metadata.sub(1) = vwt as u64;               // VWT at [-1]
         *metadata = 0x200;                            // kind: struct metadata
         *metadata.add(1) = dummy_descriptor as u64;   // descriptor pointer (non-null)
@@ -1383,10 +1466,84 @@ unsafe extern "C" fn swift_get_type_by_mangled_name(
 
     let ptr = metadata as *mut u8;
     let name_str = String::from_utf8_lossy(&key).into_owned();
-    log::info!("swift_getTypeByMangledNameInContext fallback: '{}' → {:p}", name_str, ptr);
+    log::info!("swift_getTypeByMangledNameInContext fallback: '{}' -> {:p}", name_str, ptr);
     map.insert(key, ptr);
     ptr
 }
+
+/// Create SwiftUI-compatible metadata for symbolic references that can't be resolved
+unsafe fn create_swiftui_compatible_metadata() -> *mut u8 {
+    use std::sync::{Mutex, Once};
+
+    static SWIFTUI_CACHE: Mutex<Option<usize>> = Mutex::new(None);
+    static INIT_ONCE: Once = Once::new();
+    static mut CACHED_METADATA: usize = 0;
+
+    INIT_ONCE.call_once(|| {
+        let metadata_ptr = unsafe { create_swiftui_metadata_internal() };
+        unsafe { CACHED_METADATA = metadata_ptr as usize; }
+        *SWIFTUI_CACHE.lock().unwrap() = Some(metadata_ptr as usize);
+    });
+
+    unsafe { CACHED_METADATA as *mut u8 }
+}
+
+unsafe fn create_swiftui_metadata_internal() -> *mut u8 {
+
+    // Allocate metadata with proper SwiftUI structure
+    let raw = unsafe { libc::calloc(1, 1024) } as *mut u64;
+    let metadata = unsafe { raw.add(8) }; // Leave space for VWT at [-1]
+
+    // Create SwiftUI-compatible VWT
+    let vwt = unsafe { libc::calloc(1, 512) } as *mut u64;
+    unsafe {
+        // SwiftUI-specific VWT functions
+        unsafe extern "C" fn swiftui_copy(dest: *mut u8, src: *mut u8, _meta: *const u8) -> *mut u8 {
+            unsafe { std::ptr::copy_nonoverlapping(src, dest, 16) }; // SwiftUI often uses 16-byte values
+            dest
+        }
+        unsafe extern "C" fn swiftui_destroy(_obj: *mut u8, _meta: *const u8) {}
+        unsafe extern "C" fn swiftui_enum_tag(_obj: *const u8, _cases: u32, _meta: *const u8) -> u32 { 0 }
+
+        *vwt.add(0) = swiftui_copy as *const () as u64;     // initializeBufferWithCopyOfBuffer
+        *vwt.add(1) = swiftui_destroy as *const () as u64;  // destroy
+        *vwt.add(2) = swiftui_copy as *const () as u64;     // initializeWithCopy
+        *vwt.add(3) = swiftui_copy as *const () as u64;     // assignWithCopy
+        *vwt.add(4) = swiftui_copy as *const () as u64;     // initializeWithTake
+        *vwt.add(5) = swiftui_copy as *const () as u64;     // assignWithTake
+        *vwt.add(6) = swiftui_enum_tag as *const () as u64; // getEnumTagSinglePayload
+        *vwt.add(7) = swiftui_enum_tag as *const () as u64; // storeEnumTagSinglePayload
+        *vwt.add(8) = 16;    // size (SwiftUI types often 16 bytes)
+        *vwt.add(9) = 16;    // stride
+        *vwt.add(10) = 15;   // flags (alignment-1 for 16-byte alignment)
+    }
+
+    // Create SwiftUI-compatible type descriptor
+    let descriptor = unsafe { libc::calloc(1, 512) } as *mut u64;
+    unsafe {
+        *descriptor.add(0) = 0x80000050;  // flags: struct, generic, has VWT
+        *descriptor.add(1) = 0;           // parent (none)
+        *descriptor.add(2) = 8;           // name length
+        *descriptor.add(3) = 1;           // num fields
+        *descriptor.add(4) = 48;          // field offset vector offset
+
+        // Add field offset vector at descriptor[12] (offset 48)
+        *descriptor.add(12) = 0;          // field 0 at offset 0
+    }
+
+    unsafe {
+        *metadata.sub(1) = vwt as u64;                    // VWT at [-1]
+        *metadata.add(0) = 0x200;                         // kind: struct metadata
+        *metadata.add(1) = descriptor as u64;             // type descriptor
+        *metadata.add(2) = metadata as u64;               // generic argument (self-reference)
+        *metadata.add(3) = safe_vwt_ptr() as u64;         // additional VWT pointer for compatibility
+    }
+
+    let result = metadata as *mut u8;
+    log::info!("Created SwiftUI-compatible metadata at {:p}", result);
+    result
+}
+
 unsafe extern "C" fn swift_slow_alloc(size: usize, align: usize) -> *mut u8 {
     unsafe { libc::memalign(align.max(1), size) as *mut u8 }
 }
@@ -1395,8 +1552,6 @@ unsafe extern "C" fn swift_slow_dealloc(ptr: *mut u8, _size: usize, _align: usiz
 }
 
 /// Install safe swift_retain/release hooks via the Swift runtime's own hook mechanism.
-/// libswiftCore.so has writable function pointer variables (_swift_retain, etc.)
-/// that swift_retain_n/release_n check before calling the default impl.
 pub fn install_swift_retain_hooks() {
     unsafe {
         // Hook retain/release via Swift's writable function pointer variables
@@ -1409,19 +1564,16 @@ pub fn install_swift_retain_hooks() {
             let ptr = libc::dlsym(libc::RTLD_DEFAULT, var_name.as_ptr() as *const i8);
             if !ptr.is_null() {
                 *(ptr as *mut u64) = hook_fn;
-                log::info!("Swift hook: {} → {:#x}", &var_name[..var_name.len()-1], hook_fn);
+                log::info!("Swift hook: {} -> {:#x}", &var_name[..var_name.len()-1], hook_fn);
             }
         }
 
-        // Re-install our SIGSEGV handler — the Swift runtime may have overridden it
+        // Re-install our SIGSEGV handler - the Swift runtime may have overridden it
         // with its own crash handler during initialization.
         unsafe extern "C" { fn grafted_reinstall_sigsegv_handler(); }
         unsafe { grafted_reinstall_sigsegv_handler(); }
 
         // NOTE: Binary patches for swift_checkMetadataState, swift_getAssociatedTypeWitness
-        // etc. are applied TEMPORARILY by apply_lifecycle_patches() / restore_lifecycle_patches()
-        // only during applicationDidFinishLaunching. Permanent patches break the body getter.
-        // Save original bytes for the functions we'll patch temporarily.
         save_original_bytes();
     }
 }
@@ -1439,20 +1591,27 @@ unsafe impl Sync for PatchSite {}
 static PATCH_SITES: std::sync::Mutex<Vec<PatchSite>> = std::sync::Mutex::new(Vec::new());
 
 fn save_original_bytes() {
-    let funcs: &[(&str, usize, *const u8)] = &[
+    let legacy = std::env::var("GRAFTED_LEGACY_PATCHES").map(|v| v == "1").unwrap_or(false);
+
+    // Permanent ABI-boundary stubs - these are necessary regardless of
+    let permanent: &[(&str, usize, *const u8)] = &[
+        ("swift_conformsToProtocol", 12, safe_conformsToProtocol as *const u8),
+        ("swift_conformsToProtocol2", 12, safe_conformsToProtocol as *const u8),
+        ("swift_conformsToProtocolCommon", 12, safe_conformsToProtocol as *const u8),
+        ("swift_getWitnessTable", 12, swift_get_witness_table_stub as *const u8),
+        ("swift_initStructMetadata", 12, safe_noop_return as *const u8),
+        ("swift_initStructMetadataWithLayoutString", 12, safe_noop_return as *const u8),
+    ];
+
+    // Legacy defensive crashes-avoidance patches. Added empirically over
+    let legacy_funcs: &[(&str, usize, *const u8)] = &[
         ("swift_checkMetadataState", 12, smart_checkMetadataState as *const u8),
         ("swift_getAssociatedTypeWitness", 12, safe_getAssociatedTypeWitness as *const u8),
         ("swift_getAssociatedConformanceWitness", 12, safe_getAssociatedConformanceWitness as *const u8),
         ("swift_getAssociatedTypeWitnessRelative", 12, safe_getAssociatedTypeWitness as *const u8),
         ("swift_getAssociatedConformanceWitnessRelative", 12, safe_getAssociatedConformanceWitness as *const u8),
-        ("swift_conformsToProtocol", 12, safe_conformsToProtocol as *const u8),
-        ("swift_conformsToProtocol2", 12, safe_conformsToProtocol as *const u8),
-        ("swift_conformsToProtocolCommon", 12, safe_conformsToProtocol as *const u8),
-        ("swift_getWitnessTable", 12, swift_get_witness_table_stub as *const u8),
         ("swift_getGenericMetadata", 12, swift_get_generic_metadata_stub as *const u8),
         ("swift_getSingletonMetadata", 12, swift_get_generic_metadata_stub as *const u8),
-        ("swift_initStructMetadata", 12, safe_noop_return as *const u8),
-        ("swift_initStructMetadataWithLayoutString", 12, safe_noop_return as *const u8),
         ("swift_allocateGenericValueMetadata", 12, swift_get_generic_metadata_stub as *const u8),
         ("swift_allocateGenericClassMetadata", 12, swift_get_generic_metadata_stub as *const u8),
         ("swift_getKeyPath", 12, safe_return_stub_object as *const u8),
@@ -1477,12 +1636,21 @@ fn save_original_bytes() {
         ("_swift_stdlib_reportFatalError", 12, safe_noop_return as *const u8),
         ("_swift_stdlib_reportFatalErrorInFile", 12, safe_noop_return as *const u8),
         ("swift_unexpectedError", 12, safe_noop_return as *const u8),
-        // swift_once: use the normal stub (calls callback directly).
-        // swift_once_lifecycle with nested grafted_try_call corrupts
-        // the outer RECOVERY_ACTIVE flag. Let callbacks run — crashes
-        // are handled by our other patches (String._nativeCopy etc.)
         ("swift_once", 12, swift_once as *const u8),
     ];
+
+    // Merge per legacy flag. `funcs` drives the rest of this function, including
+    let funcs: Vec<(&str, usize, *const u8)> = if legacy {
+        permanent.iter().chain(legacy_funcs.iter()).copied().collect()
+    } else {
+        permanent.iter().copied().collect()
+    };
+    let funcs: &[(&str, usize, *const u8)] = &funcs;
+    log::info!(
+        "NSNotificationCenter: applying {} lifecycle patches ({}legacy mode)",
+        funcs.len(),
+        if legacy { "" } else { "non-" },
+    );
 
     let mut sites = PATCH_SITES.lock().unwrap();
     for &(name, size, replacement) in funcs {
@@ -1495,35 +1663,33 @@ fn save_original_bytes() {
         log::info!("Saved {} bytes from {} at {:p}", size, name, addr);
     }
 
+    // The remaining local-offset / _nativeCopy / Slow-variant patches are
+    if !legacy {
+        return;
+    }
+
     // Patch local (non-exported) C++ functions by offset from known exported symbols.
     {
         let c_name = std::ffi::CString::new("swift_getGenericMetadata").unwrap();
         let base = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
         if !base.is_null() {
-            // GenericCacheEntry::doInitialization at swift_getGenericMetadata + 0xEE10
             let do_init = unsafe { base.add(0xEE10) };
             let mut original = [0u8; 32];
             unsafe { std::ptr::copy_nonoverlapping(do_init, original.as_mut_ptr(), 12); }
             sites.push(PatchSite { addr: do_init, original, size: 12, replacement: safe_return_stub_object as *const u8 });
-            log::info!("Saved 12 bytes from GenericCacheEntry::doInitialization at {:p}", do_init);
 
-            // swift::threading::fatal at swift_getGenericMetadata + 0x3DD40
             let threading_fatal = unsafe { base.add(0x3DD40) };
             let mut orig2 = [0u8; 32];
             unsafe { std::ptr::copy_nonoverlapping(threading_fatal, orig2.as_mut_ptr(), 12); }
             sites.push(PatchSite { addr: threading_fatal, original: orig2, size: 12, replacement: safe_noop_return as *const u8 });
 
-            // GenericCacheEntry::awaitSatisfyingState at +0xE9B0
-            // Waits for metadata to reach complete state — hangs/aborts on stubs
             let await_state = unsafe { base.add(0xE9B0) };
             let mut orig3 = [0u8; 32];
             unsafe { std::ptr::copy_nonoverlapping(await_state, orig3.as_mut_ptr(), 12); }
             sites.push(PatchSite { addr: await_state, original: orig3, size: 12, replacement: safe_return_stub_object as *const u8 });
-            log::info!("Saved local patches: doInit, threading::fatal, awaitState");
+            log::info!("Saved local patches: doInit, threading::fatal, awaitState (legacy)");
         }
     }
-    // Patch String._nativeCopy which crashes on null String buffer.
-    // Local symbol at _copyUTF16CodeUnits + 0x50.
     {
         let c_name = std::ffi::CString::new("$sSS19_copyUTF16CodeUnits4into5rangeySrys6UInt16VG_SnySiGtF").unwrap();
         let base = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
@@ -1532,10 +1698,8 @@ fn save_original_bytes() {
             let mut orig = [0u8; 32];
             unsafe { std::ptr::copy_nonoverlapping(native_copy, orig.as_mut_ptr(), 12); }
             sites.push(PatchSite { addr: native_copy, original: orig, size: 12, replacement: safe_noop_return as *const u8 });
-            log::info!("Saved 12 bytes from String._nativeCopy at {:p}", native_copy);
         }
     }
-    // Also patch _nativeCopy in ALL loaded copies by scanning /proc/self/maps
     {
         let mut bases: Vec<usize> = Vec::new();
         if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
@@ -1549,23 +1713,24 @@ fn save_original_bytes() {
                 }
             }
         }
-        let target_off = 0x29e8d0usize; // _nativeCopy file offset
+        let target_off = 0x29e8d0usize;
         for &base in &bases {
             let addr = (base + target_off) as *mut u8;
             unsafe { patch_function_at(addr, safe_noop_return as *const u8) };
-            log::info!("Patched _nativeCopy at {:#x} (base {:#x})", addr as u64, base);
         }
     }
 
-    // Also save the Slow variants (+0x30 from the fast function)
-    for &(name, _size, replacement) in &funcs[1..3] { // getAssociatedType/Conformance
-        let c_name = std::ffi::CString::new(name).unwrap();
-        let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
-        if addr.is_null() { continue; }
-        let slow = unsafe { addr.add(0x30) };
-        let mut original = [0u8; 32];
-        unsafe { std::ptr::copy_nonoverlapping(slow, original.as_mut_ptr(), 12); }
-        sites.push(PatchSite { addr: slow, original, size: 12, replacement: replacement as *const u8 });
+    // Slow variants (+0x30) of the associated type/conformance getters.
+    if funcs.len() >= 3 {
+        for &(name, _size, replacement) in &funcs[7..9] {  // 6 permanent + idx 1..3 of legacy = getAssocType/Conf
+            let c_name = std::ffi::CString::new(name).unwrap();
+            let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) } as *mut u8;
+            if addr.is_null() { continue; }
+            let slow = unsafe { addr.add(0x30) };
+            let mut original = [0u8; 32];
+            unsafe { std::ptr::copy_nonoverlapping(slow, original.as_mut_ptr(), 12); }
+            sites.push(PatchSite { addr: slow, original, size: 12, replacement: replacement as *const u8 });
+        }
     }
 
     // Also build trampolines for the smart functions that need to call originals
@@ -1589,123 +1754,9 @@ fn save_original_bytes() {
     }
 }
 
-/// Patch specific crashing instructions in the Maccy binary.
-/// These are compiler-generated helpers that read VWT from metadata that may
-/// have corrupted VWT pointers after Darwin→Linux translation.
+/// Step 0.B: DELETED. The previous implementation did three things:
 pub fn patch_binary_crash_sites() {
-    let stub_meta = shim_unresolved_soft_metadata();
-    let good_vwt = unsafe { *((stub_meta as *const u64).sub(1)) };
-
-    // === UNIFIED VWT FIX ===
-    // Scan ALL metadata in the binary's data segments and repair corrupted
-    // VWT pointers. swift_initStructMetadata writes garbage (0x211 etc.) to
-    // metadata[-1] during body getter. Fix them ALL in one pass.
-    let mut fixed_vwt = 0u32;
-    for addr in (0x100100000u64..0x100160000u64).step_by(8) {
-        let ptr = addr as *const u64;
-        let val = unsafe { std::ptr::read_volatile(ptr) };
-        if val >= 0x200 && val <= 0x202 {
-            let vwt = unsafe { std::ptr::read_volatile(ptr.sub(1)) };
-            if vwt > 0 && vwt < 0x100000 {
-                let vwt_addr = (addr - 8) as *mut u64;
-                let page = (vwt_addr as usize & !0xFFF) as *mut libc::c_void;
-                unsafe {
-                    libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE);
-                    std::ptr::write_volatile(vwt_addr, good_vwt);
-                    libc::mprotect(page, 8192, libc::PROT_READ);
-                }
-                fixed_vwt += 1;
-            }
-        }
-    }
-    if fixed_vwt > 0 {
-        log::info!("Unified VWT fix: repaired {} corrupted VWT pointers in binary data", fixed_vwt);
-    }
-
-    // === INDIVIDUAL PATCHES for heap-allocated metadata ===
-    // The VWT corruption at 0x211 happens in HEAP metadata created by
-    // swift_initStructMetadata during the body getter. These can't be found
-    // by scanning binary data segments. Patch the binary INSTRUCTIONS that
-    // read from these metadata to use our good_vwt instead.
-
-    // Function at 0x1000e41e0: replace VWT loads with good_vwt pointer
-    for &load_addr in &[0x1000e4280u64, 0x1000e42d2u64] {
-        let target = load_addr as *mut u8;
-        let page = (target as usize & !0xFFF) as *mut libc::c_void;
-        unsafe {
-            if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                *target = 0x48; *target.add(1) = 0xB8; // mov rax, imm64
-                std::ptr::write_unaligned(target.add(2) as *mut u64, good_vwt);
-                *target.add(10) = 0x90; // nop
-                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
-            }
-        }
-    }
-    // Site 3: load size=8 directly (next instruction expects size not pointer)
-    {
-        let target = 0x1000e432e as *mut u8;
-        let page = (target as usize & !0xFFF) as *mut libc::c_void;
-        unsafe {
-            if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                *target = 0xB8; *target.add(1) = 8; // mov eax, 8
-                *target.add(2) = 0; *target.add(3) = 0; *target.add(4) = 0;
-                for k in 5..12 { *target.add(k) = 0x90; }
-                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
-            }
-        }
-    }
-    // VWT.size to rcx + VWT flags read + NOP indirect calls + NOP type init call
-    for &(addr, len, b0, b1) in &[
-        (0x1000e435bu64, 4u64, 0x6au8, 0x08u8),  // push 8; pop rcx; nop
-        (0x100010827u64, 7, 0x31, 0xC9),          // xor ecx,ecx; nops
-    ] {
-        let target = addr as *mut u8;
-        let page = (target as usize & !0xFFF) as *mut libc::c_void;
-        unsafe {
-            if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                *target = b0; *target.add(1) = b1;
-                if len == 4 { *target.add(2) = 0x59; *target.add(3) = 0x90; }
-                else { for k in 2..(len as usize) { *target.add(k) = 0x90; } }
-                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
-            }
-        }
-    }
-    // NOP VWT load+call in helper at 0x100010714 (9 bytes: load VWT + mov + callq)
-    // Also NOP indirect VWT function calls + problematic type init call
-    for &(addr, len) in &[
-        (0x100010714u64, 9u64), // VWT load + callq *(%rax) in helper
-        (0x1000e43f2u64, 3),    // callq *0x10(%rax)
-        (0x1000e446du64, 3),    // callq *0x8(%rax)
-    ] {
-        let target = addr as *mut u8;
-        let page = (target as usize & !0xFFF) as *mut libc::c_void;
-        unsafe {
-            if libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) == 0 {
-                for k in 0..(len as usize) { *target.add(k) = 0x90; }
-                libc::mprotect(page, 8192, libc::PROT_READ | libc::PROT_EXEC);
-            }
-        }
-    }
-    // Patch _nativeCopy in ALL loaded libswiftCore.so copies at PATCH TIME
-    // (second copy loads during body getter, not present at startup)
-    {
-        let mut patched = 0;
-        if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
-            for line in maps.lines() {
-                if line.contains("libswiftCore.so") && line.contains("r-xp") {
-                    if let Some(addr_str) = line.split('-').next() {
-                        if let Ok(base) = usize::from_str_radix(addr_str.trim(), 16) {
-                            let addr = (base + 0x29e8d0) as *mut u8;
-                            unsafe { patch_function_at(addr, safe_noop_return as *const u8) };
-                            patched += 1;
-                        }
-                    }
-                }
-            }
-        }
-        log::info!("Patched _nativeCopy in {} libswiftCore.so copies", patched);
-    }
-    log::info!("Applied unified VWT scan + binary patches");
+    // Intentionally empty. See docstring above.
 }
 
 /// Apply binary patches temporarily (before applicationDidFinishLaunching).
@@ -1769,15 +1820,12 @@ unsafe extern "C" fn swift_get_witness_table_stub(_a: *mut u8, _b: *mut u8, _c: 
 }
 
 // All retain/release are no-ops. This prevents crashes on stub objects
-// at the cost of memory leaks (acceptable for a compatibility layer).
 unsafe extern "C" fn safe_swift_retain(object: *mut u8) -> *mut u8 { object }
 unsafe extern "C" fn safe_swift_retain_n(object: *mut u8, _n: u32) -> *mut u8 { object }
 unsafe extern "C" fn safe_swift_release(_object: *mut u8) {}
 unsafe extern "C" fn safe_swift_release_n(_object: *mut u8, _n: u32) {}
 
 /// Safe swift_retain/release overrides via ELF symbol interposition.
-/// Check if the object has valid-looking refcounts before delegating to the real runtime.
-/// This prevents crashes when the binary retains stub/zeroed objects.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn swift_retain(object: *mut u8) -> *mut u8 {
     if object.is_null() { return object; }
@@ -1863,24 +1911,17 @@ pub unsafe extern "C" fn swift_release_n(object: *mut u8, n: u32) {
 }
 
 /// Override swift_allocateWitnessTablePack via ELF symbol interposition.
-/// This is exported as #[no_mangle] so the main binary's symbol takes
-/// precedence over libswiftCore.so's internal calls via PLT.
-/// Returns a pointer to an array of valid stub witness table pointers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn swift_allocateWitnessTablePack(
     _descriptor: *const u8,
     _pattern_args: *const *const u8,
 ) -> *mut *const u8 {
     // Return an array of stub pointers. The caller reads N entries from
-    // this array (N = number of witness tables in the pack). Each entry
-    // should be a valid witness table pointer. Use our universal stub.
     static STUB_PACK: std::sync::atomic::AtomicPtr<*const u8> =
         std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
     let mut pack = STUB_PACK.load(std::sync::atomic::Ordering::Acquire);
     if pack.is_null() {
         // Allocate an array of 32 stub witness table pointers.
-        // Each must point to a valid-looking witness table (non-null entries)
-        // so swift_getAssociatedTypeWitness doesn't null-deref.
         let arr = unsafe { libc::calloc(32, 8) } as *mut *const u8;
         let stub_wt = get_stub_witness_table();
         for i in 0..32 {
@@ -1934,14 +1975,14 @@ static SWIFT_EMPTY_ARRAY: [u64; 4] = [0, 1, 0, 0]; // refcount=1, count=0
 static SWIFT_EMPTY_DICT: [u64; 8] = [0; 8];
 static SWIFT_EMPTY_SET: [u64; 8] = [0; 8];
 
-// NS constant strings (dummy pointers — real apps compare by pointer identity)
+// NS constant strings (dummy pointers - real apps compare by pointer identity)
 static NS_CONSTANT_STRINGS: [u64; 2] = [0; 2];
 
 // ---- Additional stubs ----
 
 unsafe extern "C" fn block_copy(block: *mut u8) -> *mut u8 {
     if block.is_null() { return std::ptr::null_mut(); }
-    // Simple: just return the block (stack blocks get "promoted" to heap — we skip that)
+    // Simple: just return the block (stack blocks get "promoted" to heap - we skip that)
     block
 }
 
